@@ -596,6 +596,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
             onTestRadioVoicePackage = viewModel::testRadioVoicePackage,
             onTestRadioBulletin = viewModel::testRadioBulletin,
+            onTestAndroidVoice = viewModel::testAndroidVoiceBulletin,
         )
 
         pendingDeleteSong?.let { song ->
@@ -748,6 +749,7 @@ private fun SettingsDrawer(
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
     onTestRadioVoicePackage: () -> Unit,
     onTestRadioBulletin: () -> Unit,
+    onTestAndroidVoice: () -> Unit,
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -838,6 +840,7 @@ private fun SettingsDrawer(
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
                             onTestVoicePackage = onTestRadioVoicePackage,
                             onTestRadioBulletin = onTestRadioBulletin,
+                            onTestAndroidVoice = onTestAndroidVoice,
                         )
                     }
                 }
@@ -943,6 +946,7 @@ private fun RadioBulletinSettingsPanel(
     onSetVoiceEnabled: (Boolean) -> Unit,
     onTestVoicePackage: () -> Unit,
     onTestRadioBulletin: () -> Unit,
+    onTestAndroidVoice: () -> Unit,
 ) {
     val settings = radioBulletins.settings
     Column(
@@ -1149,6 +1153,21 @@ private fun RadioBulletinSettingsPanel(
                     }
                 }
             }
+        }
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = onTestAndroidVoice,
+            enabled = !radioVoice.isTestingAndroidVoice,
+        ) {
+            if (radioVoice.isTestingAndroidVoice) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.onPrimary,
+                )
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (radioVoice.isTestingAndroidVoice) "Testando..." else "Testar voz do Android")
         }
         Text(
             text = "Por seguranca, pacote importado nao liga sozinho. Se algo falhar, deixe desligado e a radio usa a voz do Android.",

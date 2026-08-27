@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.os.ResultReceiver
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
@@ -130,6 +131,7 @@ data class RadioVoiceUiState(
     val isImporting: Boolean = false,
     val isTesting: Boolean = false,
     val isTestingBulletin: Boolean = false,
+    val isTestingAndroidVoice: Boolean = false,
     val isEnabled: Boolean = false,
     val packageName: String = "Voz local",
     val engine: String = "",
@@ -433,6 +435,114 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
     }
+
+    fun testAndroidVoiceBulletin() {
+        radioVoiceState.value = radioVoiceState.value.copy(
+            isTestingAndroidVoice = true,
+            message = "Testando voz do Android (bate-bola)...",
+        )
+        setupTextToSpeech(getApplication())
+        viewModelScope.launch {
+            var attempts = 0
+            while (!ttsReady && attempts < TTS_READY_WAIT_STEPS) {
+                attempts += 1
+                delay(TTS_READY_WAIT_INTERVAL_MS)
+            }
+            val tts = textToSpeech
+            if (!ttsReady || tts == null) {
+                radioVoiceState.value = radioVoiceState.value.copy(
+                    isTestingAndroidVoice = false,
+                    message = "Voz do Android nao iniciou.",
+                )
+                return@launch
+            }
+            val offlineVoices = tts.voices.orEmpty()
+                .filter { it.locale.language == "pt" && !it.isNetworkConnectionRequired }
+                .sortedBy { it.name }
+            Log.d(TAG_RADIO_VOICE, "android tts voices pt (offline)=${offlineVoices.map { it.name }}")
+            val femaleVoice = offlineVoices.getOrNull(0) ?: tts.voice
+            val maleVoice = offlineVoices.getOrNull(1) ?: tts.voice
+
+            val lines = listOf(
+                RadioSpeaker.Female to "Noticia rapida: cientistas brasileiros desenvolveram uma tecnica de reciclagem " +
+                    "de plastico usando bacterias marinhas.",
+                RadioSpeaker.Male to "O estudo foi publicado essa semana e promete reduzir o descarte de garrafas " +
+                    "PET em ate setenta por cento nos proximos anos.",
+                RadioSpeaker.Female to "Fica a dica, e agora voltamos para a nossa programação normal.",
+            )
+            val startedAt = System.currentTimeMillis()
+            val ok = speakAndroidDialogue(tts, lines, femaleVoice, maleVoice)
+            val elapsed = System.currentTimeMillis() - startedAt
+            radioVoiceState.value = radioVoiceState.value.copy(
+                isTestingAndroidVoice = false,
+                message = if (ok) {
+                    "Voz do Android OK em ${"%.1f".format(elapsed / 1000.0)}s (2 locutores, " +
+                        "${if (offlineVoices.size >= 2) "vozes distintas" else "mesma voz, tom diferente"})."
+                } else {
+                    "Voz do Android nao respondeu em ${ANDROID_VOICE_TEST_TIMEOUT_MS / 1000}s."
+                },
+            )
+        }
+    }
+
+    private fun productionUtteranceListener(): UtteranceProgressListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) = Unit
+
+        override fun onDone(utteranceId: String?) {
+            finishNewsBreak()
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) {
+            finishNewsBreak()
+        }
+    }
+
+    private suspend fun speakAndroidDialogue(
+        tts: TextToSpeech,
+        lines: List<Pair<RadioSpeaker, String>>,
+        femaleVoice: Voice?,
+        maleVoice: Voice?,
+    ): Boolean = withTimeoutOrNull(ANDROID_VOICE_TEST_TIMEOUT_MS) {
+        suspendCancellableCoroutine { continuation ->
+            var index = 0
+            fun speakNext() {
+                if (index >= lines.size) {
+                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
+                    if (continuation.isActive) continuation.resume(true)
+                    return
+                }
+                val (speaker, text) = lines[index]
+                val voice = if (speaker == RadioSpeaker.Female) femaleVoice else maleVoice
+                voice?.let { runCatching { tts.voice = it } }
+                tts.setPitch(if (speaker == RadioSpeaker.Female) 1.05f else 0.82f)
+                tts.setSpeechRate(0.98f)
+                val utteranceId = "android_dialogue_${index++}"
+                val accepted = runCatching {
+                    tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+                }.getOrDefault(TextToSpeech.ERROR)
+                if (accepted != TextToSpeech.SUCCESS) {
+                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
+                    if (continuation.isActive) continuation.resume(false)
+                }
+            }
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) = Unit
+                override fun onDone(utteranceId: String?) = speakNext()
+
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
+                    if (continuation.isActive) continuation.resume(false)
+                }
+            })
+            continuation.invokeOnCancellation {
+                runCatching { tts.stop() }
+                tts.setOnUtteranceProgressListener(productionUtteranceListener())
+            }
+            speakNext()
+        }
+    } ?: false
 
     private fun updateRadioBulletinSettings(settings: RadioBulletinSettings) {
         radioPrefs.edit()
@@ -1175,18 +1285,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 textToSpeech?.setPitch(0.88f)
             }
         }.apply {
-            setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
-
-                override fun onDone(utteranceId: String?) {
-                    finishNewsBreak()
-                }
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    finishNewsBreak()
-                }
-            })
+            setOnUtteranceProgressListener(productionUtteranceListener())
         }
     }
 
@@ -1649,6 +1748,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val BULLETIN_PREP_TIMEOUT_MS = 160_000L
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
+        const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
 
