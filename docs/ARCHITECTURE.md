@@ -4,8 +4,8 @@
 > Toda mudança estrutural mantém as funcionalidades existentes e é feita incrementalmente.
 > O app já funciona e está em uso diário. Nada de "clean architecture deluxe" que mate a rádio no processo.
 
-App Android pessoal de música local que simula uma **rádio FM**: fila de músicas intercalada com
-abertura falada (data, hora, clima) e boletins de notícia narrados por locutores virtuais
+App Android pessoal de música local que simula uma **rádio FM**: fila de músicas com
+abertura em vinheta gravada e boletins de notícia narrados por locutores virtuais
 (TTS 100% offline).
 
 Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [TTS](TTS.md) · [STATE_MACHINE](STATE_MACHINE.md) · [DECISIONS](DECISIONS.md) · [TODO](TODO.md)
@@ -113,6 +113,14 @@ ViewModel ── startService(Intent + texts/speakers + ResultReceiver) ──�
 ```
 
 Detalhes completos: [TTS.md](TTS.md).
+
+### Vinhetas de abertura da rádio
+
+Arquivos gravados em `app/src/main/res/raw/` (`radio_intro.mp3` + um complemento por
+rádio, ex. `vinheta_grunge.wav`) tocados via `MediaPlayer.create()` antes da primeira
+música de uma sessão nova. Mapa rádio → complemento:
+`LocalTuneViewModel.VINHETA_BY_RADIO_KEY`. Ver [RADIO_PIPELINE.md](RADIO_PIPELINE.md) e
+[`vinhetas/README.md`](../vinhetas/README.md).
 
 ## Persistência (mapa rápido)
 

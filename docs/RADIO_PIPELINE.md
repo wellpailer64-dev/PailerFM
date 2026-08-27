@@ -34,7 +34,11 @@ playRadioSession()                          [LocalTuneViewModel]
   │    ├─ setupTextToSpeech()               (fallback; ver TTS.md)
   │    └─ carrega boletins em background:
   │         RadioBulletinRepository.loadScripts()
-  └─ controller.setMediaItems + prepare + play()   (toca na hora, sem abertura falada)
+  ├─ controller.setMediaItems + prepare      (autoPlay=false se vai tocar vinheta)
+  └─ playRadioVinhetas(radioName)            (só quando startIndex == 0, entrada nova)
+        ├─ playVinhetaResource(R.raw.radio_intro)
+        ├─ complemento por rádio (VINHETA_BY_RADIO_KEY[normalizeRadioKey(radioName)]), se houver
+        └─ finishVinhetas() → controller.play()
 
         ▼  (sessão rodando)
 onMediaItemTransition(reason = AUTO)        [Player.Listener]
@@ -51,10 +55,12 @@ onMediaItemTransition(reason = AUTO)        [Player.Listener]
 Gatilho importante: boletins só contam em transição **AUTO** (música acabou sozinha).
 Skip manual não conta nem cancela nada — ver races R3/R6 em [STATE_MACHINE.md](STATE_MACHINE.md).
 
-> **Abertura falada removida (26/08/2026 — ADR-010):** a rádio não fala mais
-> data/hora/clima nem "Você está na Rádio X" antes da primeira música. Plano futuro:
-> vinhetas gravadas (pasta [`vinhetas/`](../vinhetas/) na raiz do projeto) no lugar da
-> abertura — ainda não integradas ao app.
+> **Abertura falada → vinhetas gravadas (26/08/2026 — ADR-010, ADR-011):** a rádio não
+> fala mais data/hora/clima. No lugar, toca uma vinheta gravada
+> (`app/src/main/res/raw/radio_intro.mp3` + complemento específico da rádio, se houver —
+> mapa completo em [`vinhetas/README.md`](../vinhetas/README.md)) e só então entra a
+> música. Só acontece na entrada nova (`startIndex == 0`, botão "Entrar"); pular pra uma
+> faixa específica da sessão ao vivo não replay a vinheta.
 
 ## Fontes de notícia
 
@@ -98,9 +104,12 @@ do pacote sintetiza aquela linha (ver [TTS.md](TTS.md)).
 
 ## Quem manda no áudio durante um anúncio
 
-- Música: pausada explicitamente antes da fala (`player.pause()`), retomada depois;
-- Anúncio local (sherpa): `MediaPlayer` dedicado (`announcementPlayer`), um por vez
-  (release do anterior antes do novo);
-- Anúncio fallback: TTS do sistema com `QUEUE_FLUSH`;
+- Música: pausada explicitamente antes da fala (`player.pause()`), retomada depois —
+  no caso da vinheta de entrada, a música nem começa (`autoPlay=false`) até ela acabar;
+- Anúncio local (sherpa) e vinhetas gravadas dividem o mesmo `MediaPlayer` dedicado
+  (`announcementPlayer`) e o mesmo watchdog de 90 s — um por vez, release do anterior
+  antes do novo;
+- Anúncio fallback (boletim sem sherpa): TTS do sistema com `QUEUE_FLUSH`; vinhetas não
+  têm fallback de TTS — se o `MediaPlayer` falhar, pula direto pra música;
 - Widgets/notificação continuam operando o player de música normalmente — é daí que
   nascem as races de "música por cima da locução" (R2 em [STATE_MACHINE.md](STATE_MACHINE.md)).

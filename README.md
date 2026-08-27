@@ -1,8 +1,8 @@
 # Pailer Player
 
 Player Android pessoal para musicas locais que simula uma **radio FM**: fila de musicas
-intercalada com abertura falada (data, hora, temperatura) e boletins de noticias narrados
-por locutores virtuais, com TTS 100% offline.
+com abertura em vinheta gravada e boletins de noticias narrados por locutores virtuais,
+com TTS 100% offline.
 
 Feito em Kotlin, Jetpack Compose e Media3/ExoPlayer.
 
@@ -19,7 +19,9 @@ Feito em Kotlin, Jetpack Compose e Media3/ExoPlayer.
 
 ### Modo Radio
 - Radios derivadas da biblioteca (perfil Grunge, radios por genero, Rádio recente) com
-  fila que evita repetir a sessao anterior; toca direto, sem abertura falada.
+  fila que evita repetir a sessao anterior.
+- Abertura com vinheta gravada (intro comum + complemento por genero, sem narracao
+  falada) antes da primeira musica de cada entrada na radio.
 - Boletins de noticia entre as musicas (RSS do g1), em modo manchete ou dialogo entre
   locutora e locutor, com duracao configuravel.
 - Vozes locais offline via sherpa-onnx (VITS/Piper/Kokoro/Supertonic) rodando em processo

@@ -150,3 +150,23 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   gravadas (`vinhetas/` na raiz do projeto) no lugar da abertura falada, não trazer a
   narração de volta.
 
+## ADR-011 — Vinhetas gravadas no lugar da abertura falada
+
+- **Contexto:** ADR-010 removeu a narração de data/hora/clima mas deixou a rádio sem
+  nenhuma abertura. O usuário gravou uma intro comum a todas as rádios (`radio_intro`) e
+  complementos por gênero, com nomes pensados pra reaproveitar entre rádios próximas
+  (ex.: um complemento só de indie/psicodélico serve pras duas rádios).
+- **Decisão:** arquivos movidos para `app/src/main/res/raw/` (nomes normalizados pra
+  `snake_case`, obrigatório pra resource do Android) e tocados por
+  `playRadioVinhetas()`/`playVinhetaResource()` em `LocalTuneViewModel.kt`: intro comum →
+  complemento da rádio (`VINHETA_BY_RADIO_KEY`, chave = nome da rádio normalizado por
+  `normalizeRadioKey()`) → `controller.play()`. Reusa o mesmo `announcementPlayer` e o
+  mesmo watchdog de 90 s dos boletins de notícia (campo `pendingVinheta`, paralelo ao
+  `speakingNews`). Só dispara em entrada nova (`startIndex == 0`); pular pra uma faixa da
+  sessão ao vivo não repete a vinheta. Rádio sem complemento mapeado toca só a intro.
+- **Motivo:** manter a "personalidade de rádio FM" sem TTS nem dependência de rede;
+  arquivos pequenos (~100-190 KB cada, ~1 MB total), custo de APK desprezível.
+- **Não mudar sem:** se o usuário mandar vinhetas novas ou pedir pra trocar o mapeamento,
+  atualizar `VINHETA_BY_RADIO_KEY` E `vinhetas/README.md` juntos — são a mesma fonte de
+  verdade, não deixar um sem o outro.
+

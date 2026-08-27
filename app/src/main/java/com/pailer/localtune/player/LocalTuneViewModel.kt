@@ -25,6 +25,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
+import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.DuplicateArtistGroup
@@ -166,6 +167,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var speakingNews = false
     private var currentNewsHeadline = ""
     private var resumeAfterNews = false
+    private var pendingVinheta = false
     private var announcementPlayer: MediaPlayer? = null
     private var announcementToken = 0
     private var announcementWatchdogJob: Job? = null
@@ -1105,14 +1107,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun playRadioSession(songs: List<LocalSong>, radioName: String, startIndex: Int = 0) {
         startRadioNewsMode(radioName)
+        val playVinhetas = startIndex == 0
         playSongs(
             songs = songs,
             startIndex = startIndex,
             keepRadioNews = true,
             source = "Rádio $radioName",
             radioName = radioName,
-            autoPlay = true,
+            autoPlay = !playVinhetas,
         )
+        if (playVinhetas) {
+            playRadioVinhetas(radioName)
+        }
     }
 
     fun continuePlayback(songs: List<LocalSong>) {
@@ -1195,6 +1201,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
+        pendingVinheta = false
         activeRadioName = radioName
         playbackSource = "Rádio $radioName"
 
@@ -1213,11 +1220,62 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
+        pendingVinheta = false
         activeRadioName = ""
         announcementPlayer?.release()
         announcementPlayer = null
         textToSpeech?.stop()
     }
+
+    private fun playRadioVinhetas(radioName: String) {
+        pendingVinheta = true
+        val complementRes = VINHETA_BY_RADIO_KEY[normalizeRadioKey(radioName)]
+        playVinhetaResource(R.raw.radio_intro) {
+            if (!pendingVinheta || activeRadioName != radioName) return@playVinhetaResource
+            if (complementRes != null) {
+                playVinhetaResource(complementRes) { finishVinhetas(radioName) }
+            } else {
+                finishVinhetas(radioName)
+            }
+        }
+    }
+
+    private fun finishVinhetas(radioName: String) {
+        if (!pendingVinheta || activeRadioName != radioName) return
+        pendingVinheta = false
+        viewModelScope.launch {
+            controller?.play()
+            controller?.let { updatePlayerState(it) }
+        }
+    }
+
+    private fun playVinhetaResource(resId: Int, onFinished: () -> Unit) {
+        announcementPlayer?.release()
+        announcementPlayer = null
+        val player = runCatching {
+            MediaPlayer.create(getApplication(), resId)
+        }.getOrNull()
+        if (player == null) {
+            onFinished()
+            return
+        }
+        player.setOnCompletionListener {
+            it.release()
+            if (announcementPlayer === it) announcementPlayer = null
+            onFinished()
+        }
+        player.setOnErrorListener { errored, _, _ ->
+            errored.release()
+            if (announcementPlayer === errored) announcementPlayer = null
+            onFinished()
+            true
+        }
+        announcementPlayer = player
+        armAnnouncementWatchdog()
+        player.start()
+    }
+
+    private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
     private fun prepareUpcomingBulletin() {
         if (!radioVoiceState.value.isEnabled || newsBulletins.isEmpty()) return
@@ -1300,12 +1358,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         announcementWatchdogJob = viewModelScope.launch {
             delay(ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS)
             if (token != announcementToken) return@launch
-            if (!speakingNews) return@launch
+            if (!speakingNews && !pendingVinheta) return@launch
             Log.w(TAG_RADIO_VOICE, "announcement watchdog fired - forcing playback resume")
             runCatching { announcementPlayer?.release() }
             announcementPlayer = null
             runCatching { textToSpeech?.stop() }
-            finishNewsBreak()
+            if (pendingVinheta) finishVinhetas(activeRadioName) else finishNewsBreak()
         }
     }
 
@@ -1585,5 +1643,21 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
+
+        // Chave = nome da radio normalizado (lowercase, so letras/digitos) — ver
+        // normalizeRadioKey(). Nomes vem de MusicLibraryRepository (GENRE_DISPLAY_NAMES e
+        // RADIO_PROFILES). "Indie" e "Indie / psicodelico" dividem o mesmo complemento, assim
+        // como "Punk" e "Post-punk / cold wave" — a pedido do usuario ao gravar as vinhetas.
+        val VINHETA_BY_RADIO_KEY: Map<String, Int> = mapOf(
+            "grunge" to R.raw.vinheta_grunge,
+            "rock" to R.raw.vinheta_rock,
+            "punk" to R.raw.vinheta_punk_coldwave,
+            "postpunkcoldwave" to R.raw.vinheta_punk_coldwave,
+            "indie" to R.raw.vinheta_indie_psicodelico,
+            "indiepsicodelico" to R.raw.vinheta_indie_psicodelico,
+            "mpb" to R.raw.vinheta_mpb,
+            "hiphoprap" to R.raw.vinheta_hip_hop,
+            "rapnacional" to R.raw.vinheta_rap,
+        )
     }
 }
