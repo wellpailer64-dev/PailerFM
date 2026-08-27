@@ -1230,9 +1230,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun playRadioVinhetas(radioName: String) {
         pendingVinheta = true
         val complementRes = VINHETA_BY_RADIO_KEY[normalizeRadioKey(radioName)]
+        Log.d(TAG_RADIO_VOICE, "vinheta: intro para '$radioName' (complemento=${complementRes != null})")
         playVinhetaResource(R.raw.radio_intro) {
             if (!pendingVinheta || activeRadioName != radioName) return@playVinhetaResource
             if (complementRes != null) {
+                Log.d(TAG_RADIO_VOICE, "vinheta: complemento para '$radioName'")
                 playVinhetaResource(complementRes) { finishVinhetas(radioName) }
             } else {
                 finishVinhetas(radioName)
@@ -1243,6 +1245,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun finishVinhetas(radioName: String) {
         if (!pendingVinheta || activeRadioName != radioName) return
         pendingVinheta = false
+        Log.d(TAG_RADIO_VOICE, "vinheta: fim, dando play em '$radioName'")
         viewModelScope.launch {
             controller?.play()
             controller?.let { updatePlayerState(it) }
@@ -1256,6 +1259,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             MediaPlayer.create(getApplication(), resId)
         }.getOrNull()
         if (player == null) {
+            Log.w(TAG_RADIO_VOICE, "vinheta: falhou ao criar MediaPlayer pro recurso $resId - pulando")
             onFinished()
             return
         }

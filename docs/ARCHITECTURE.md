@@ -8,7 +8,7 @@ App Android pessoal de música local que simula uma **rádio FM**: fila de músi
 abertura em vinheta gravada e boletins de notícia narrados por locutores virtuais
 (TTS 100% offline).
 
-Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [TTS](TTS.md) · [STATE_MACHINE](STATE_MACHINE.md) · [DECISIONS](DECISIONS.md) · [TODO](TODO.md)
+Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [TTS](TTS.md) · [STATE_MACHINE](STATE_MACHINE.md) · [DECISIONS](DECISIONS.md) · [TODO](TODO.md) · [RELEASE](RELEASE.md)
 
 ## Stack
 

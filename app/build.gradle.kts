@@ -1,6 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// keystore.properties + keystore/pailer-release.jks (fora do git, ver .gitignore) ficam
+// prontos pra uma assinatura de release "de verdade" no dia que fizer sentido publicar
+// (ex.: Play Store). Ate la, a build release assina com a mesma chave de debug (ver
+// buildTypes.release abaixo) de proposito, pra instalar por cima da build debug ja em
+// uso sem pedir desinstalar e perder dados locais. Ver docs/RELEASE.md.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
 }
 
 android {
@@ -16,6 +30,28 @@ android {
 
         ndk {
             abiFilters += "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            // Chave de debug de proposito (nao a "release" acima) — ver comentario no topo
+            // do arquivo. Trocar pra signingConfigs.getByName("release") exige desinstalar
+            // o app do aparelho antes do proximo install (assinatura muda).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

@@ -9,3 +9,6 @@
 .externalNativeBuild/
 .cxx/
 *.hprof
+/keystore.properties
+*.jks
+*.keystore

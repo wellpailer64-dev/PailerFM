@@ -170,3 +170,23 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   atualizar `VINHETA_BY_RADIO_KEY` E `vinhetas/README.md` juntos — são a mesma fonte de
   verdade, não deixar um sem o outro.
 
+## ADR-012 — Build release assinada com a chave de debug (de propósito)
+
+- **Contexto:** o app já estava instalado no aparelho de testes (assinado com a chave de
+  debug automática) desde 21/08/2026, com dados reais acumulados (favoritos, histórico,
+  overrides de metadados, pacote de vozes TTS de ~45 MB importado). Ao configurar
+  `signingConfigs`/`buildTypes.release` pela primeira vez, gerei uma chave de release
+  dedicada (`keystore/pailer-release.jks`, prática padrão pra apps distribuídos) — mas
+  isso trocaria a assinatura e exigiria desinstalar o app antes do primeiro
+  `adb install` release, apagando os dados acima. Usuário perguntou por quê e pediu pra
+  evitar.
+- **Decisão:** `buildTypes.release.signingConfig` usa
+  `signingConfigs.getByName("debug")` — a mesma chave que a build debug sempre usou.
+  `keystore.properties` + `keystore/pailer-release.jks` continuam existindo, prontos e
+  **sem uso**, só pro dia (se algum dia) o app for publicado de verdade.
+- **Motivo:** app pessoal, nunca vai pra Play Store hoje; instalar por cima sem perder
+  dados vale mais que seguir a convenção de assinatura dedicada.
+- **Não mudar sem:** avisar antes — trocar pra `signingConfigs.getByName("release")`
+  exige desinstalar o app do aparelho (perde dados locais) no primeiro install seguinte.
+  Ver [RELEASE.md](RELEASE.md).
+

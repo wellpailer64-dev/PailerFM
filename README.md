@@ -47,6 +47,7 @@ Documentacao tecnica completa em [`docs/`](docs/):
 | [STATE_MACHINE.md](docs/STATE_MACHINE.md) | estados do boletim, races conhecidas e contrato alvo |
 | [DECISIONS.md](docs/DECISIONS.md) | ADRs — decisoes e por que nao desfaze-las |
 | [TODO.md](docs/TODO.md) | divida tecnica priorizada |
+| [RELEASE.md](docs/RELEASE.md) | build, instalacao via ADB e como investigar problema no aparelho |
 
 > Regra do projeto: preservar o comportamento atual antes de refatorar. Mudancas
 > estruturais sao incrementais e nunca quebram funcionalidades existentes.
@@ -56,13 +57,10 @@ Documentacao tecnica completa em [`docs/`](docs/):
 Abra esta pasta no Android Studio ou rode:
 
 ```powershell
-gradle assembleDebug
+gradle assembleDebug     # ou assembleRelease
 ```
 
-O APK debug fica em:
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-Para uma versao assinada de uso diario, crie uma signing config release no Android Studio.
+APK debug em `app/build/outputs/apk/debug/app-debug.apk`; release em
+`app/build/outputs/apk/release/app-release.apk` (assinada, instalavel direto via
+`adb install`). Fluxo completo de build+instalacao+debug no aparelho, incluindo por que
+a build release usa a chave de debug de proposito: [docs/RELEASE.md](docs/RELEASE.md).
