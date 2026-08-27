@@ -69,5 +69,7 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 ## Backlog sem prioridade
 
 - CI simples (build debug a cada push) quando houver repo remoto
-- Versionar projeto canônico em git (raiz `Pailer FM\Pailer FM`) — snapshots
-  `Pailer-Player-source-package-*` continuam como backup manual
+- ~~Versionar projeto canônico em git~~ — feito em 26/08/2026 (repo local em
+  `Pailer FM\Pailer FM`, primeiro commit `4020d07`). Snapshots antigos
+  `Pailer-Player-source-package-*` movidos para `_archive/backups-manuais/`
+  na raiz do workspace; sem repo remoto ainda, então continuam como backup extra.
