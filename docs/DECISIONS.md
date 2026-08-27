@@ -190,3 +190,42 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   exige desinstalar o app do aparelho (perde dados locais) no primeiro install seguinte.
   Ver [RELEASE.md](RELEASE.md).
 
+## ADR-013 — Pacote de voz Kokoro (Dora/Alex) + timeout de boletim maior
+
+- **Contexto:** as vozes Piper (Dii/Faber) soavam "fracas, sem personalidade" (feedback
+  direto do usuário). Kokoro (StyleTTS2, 82M parâmetros) é um motor bem maior e mais
+  natural, já suportado pelo código (`LocalRadioVoiceEngine`/`OfflineTtsKokoroModelConfig`)
+  mas nunca usado. Os releases oficiais do sherpa-onnx (`kokoro-multi-lang-v1_1`, o mais
+  recente) **não têm vozes em português** — só o `kokoro-multi-lang-v1_0`
+  (53 speakers) tem `pf_dora`/`pm_alex`/`pm_santa` (IDs 42/43/44), confirmado lendo os
+  metadados do `model.onnx` diretamente (a documentação do sherpa-onnx e buscas na web
+  davam informação inconsistente sobre isso).
+- **Decisão:**
+  1. Modelo fp32 original (326 MB) quantizado pra int8 localmente
+     (`onnxruntime.quantization.quantize_dynamic`, script descartável — não versionado)
+     → 114 MB, metadados (`id2speaker` etc.) reaplicados manualmente após quantizar
+     (a quantização não preserva `metadata_props`). Testado localmente com o pacote
+     Python `sherpa-onnx` antes de ir pro aparelho (áudio não-degenerado, RMS/pico
+     normais) — trust but verify antes de gastar um ciclo de build+install.
+  2. Pacote final (`voices.bin` + `tokens.txt` + `espeak-ng-data/`, sem os léxicos/dict
+     de inglês/chinês — desnecessários pro caminho espeak do pt-br) embalado como
+     `manifest.json` (`engine: kokoro`, `femaleSpeakerId: 42`, `maleSpeakerId: 43`,
+     `speed: 0.92`) + zip, ~160 MB. Fonte fica em `voice-models/kokoro/` no workspace
+     (fora do git — grande demais, reproduzível a partir do script).
+  3. `BULLETIN_PREP_TIMEOUT_MS`: 120s → **160s**. Medido em campo (26/08/2026, Moto
+     edge 40): diálogo de 3 falas fem→masc→fem, duração "Curta" (~300 caracteres) leva
+     **~152s** com Kokoro (~9-10s de load por locutor sem cache entre requests, ver
+     ADR-003, + ~2 chars/s de geração) — bem mais lento que o Piper (~60-65s pro mesmo
+     diálogo). 120s cortava o boletim quase no fim (usuário viu isso acontecer:
+     "ficou 120s e voltou sem resposta"); 160s deu folga de ~8s.
+- **Motivo:** o usuário ouviu o teste de frase única e aprovou a voz
+  ("a voz parece boa"). Kokoro fica ativado.
+- **Não mudar sem:** ciente de que 160s cobre confortavelmente só a duração "Curta" —
+  "Normal" (~440 caracteres) e "Longa" (~630) provavelmente ainda estouram o prep e
+  caem pra voz do Android no boletim ao vivo (o caminho de emergência,
+  `LOCAL_VOICE_TIMEOUT_MS` = 12s, continua baixo de propósito — subir esse deixaria a
+  música pausada em silêncio por muito tempo durante o uso real, pior que cair pro
+  Android). Se precisar de Normal/Longa confiável com Kokoro, a solução certa é
+  serializar + cachear engine entre requests (P0 do [TODO.md](TODO.md)), não só subir
+  timeout de novo.
+

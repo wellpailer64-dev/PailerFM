@@ -1122,7 +1122,7 @@ private fun RadioBulletinSettingsPanel(
                                 )
                                 Spacer(Modifier.width(8.dp))
                             }
-                            Text(if (radioVoice.isTesting) "Testando..." else "Testar voz")
+                            Text(if (radioVoice.isTesting) "Testando..." else "Testar ${radioVoice.packageName}")
                         }
                     }
                 }

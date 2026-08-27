@@ -1639,10 +1639,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val LOCAL_VOICE_TIMEOUT_MS = 12_000L
         // Pre-geracao roda em segundo plano durante a musica anterior ao boletim (minutos
         // disponiveis), entao pode esperar bem mais que o timeout usado na hora H do boletim.
-        // Medido em campo: dialogo de 3 falas (fem->masc->fem) leva ~60-65s porque cada troca
-        // de locutor recarrega um engine sherpa inteiro do disco (~16-18s cada); 45s cortava o
-        // processo poucos segundos antes de terminar.
-        const val BULLETIN_PREP_TIMEOUT_MS = 120_000L
+        // Medido em campo com Piper (vits-dual): dialogo de 3 falas (fem->masc->fem) leva
+        // ~60-65s porque cada troca de locutor recarrega um engine sherpa inteiro do disco
+        // (~16-18s cada); 45s cortava o processo poucos segundos antes de terminar.
+        // Medido em campo com Kokoro (26/08/2026, Duracao Curta ~300 caracteres): ~152s
+        // (~9-10s de load por locutor + ~2 chars/s de geracao) — modelo maior, sem cache
+        // entre requests (ver TTS.md). 120s cortava o boletim quase no fim; 160s da folga
+        // pequena so pra Curta — Normal/Longa com Kokoro provavelmente ainda estouram.
+        const val BULLETIN_PREP_TIMEOUT_MS = 160_000L
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"

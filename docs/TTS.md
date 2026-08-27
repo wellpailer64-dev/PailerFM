@@ -81,6 +81,45 @@ filesDir/radio_voice_package/
 | `kokoro` | `kokoro`: model, voices, tokens (+ dataDir/lexicon/dictDir opcionais) | speaker id por locutor |
 | `supertonic` | `supertonic`: durationPredictor, textEncoder, vectorEstimator, vocoder, ttsJson, unicodeIndexer, voiceStyle | voiceStyle por locutor |
 
+### Pacote ativo hoje: Kokoro (Dora/Alex) — ADR-013
+
+Trocado do Piper vits-dual pro Kokoro em 26/08/2026 (voz aprovada pelo usuário depois de
+ouvir no aparelho). Manifest real:
+
+```json
+{
+  "name": "Kokoro",
+  "engine": "kokoro",
+  "femaleSpeaker": "Dora",
+  "maleSpeaker": "Alex",
+  "femaleSpeakerId": 42,
+  "maleSpeakerId": 43,
+  "speed": 0.92,
+  "kokoro": {
+    "model": "model.int8.onnx",
+    "voices": "voices.bin",
+    "tokens": "tokens.txt",
+    "dataDir": "espeak-ng-data",
+    "lang": "pt-br",
+    "lengthScale": 1.0
+  }
+}
+```
+
+- Origem: `kokoro-multi-lang-v1_0` do sherpa-onnx (não o `v1_1`, que **não** tem vozes
+  pt-BR — ver ADR-013), modelo quantizado pra int8 localmente (326 MB → 114 MB).
+- `pm_santa` (ID 44) é a terceira voz masculina do mesmo pacote, não usada — trocar
+  `maleSpeakerId` pra 44 se quiser tentar outra voz sem precisar reimportar nada.
+- **Muito mais lento que o Piper**: ~9-10s pra carregar cada locutor (sem cache entre
+  requests, ADR-003) + ~2 caracteres/s de geração. Um diálogo "Curta" (3 falas,
+  ~300 caracteres) leva ~150s — por isso `BULLETIN_PREP_TIMEOUT_MS` subiu pra 160s.
+  Durações Normal/Longa tendem a estourar esse prazo e cair pra voz do Android no
+  boletim ao vivo.
+- Fonte/script de build do pacote: `voice-models/kokoro/` no workspace (fora do git,
+  grande demais — reconstrutível: baixar `kokoro-multi-lang-v1_0.tar.bz2`, quantizar,
+  reempacotar só com `model.int8.onnx` + `voices.bin` + `tokens.txt` +
+  `espeak-ng-data/` + este `manifest.json`).
+
 ### Validações no import (`RadioVoicePackageRepository.importPackage`)
 
 1. Descompacta em `filesDir/radio_voice_import/` (temporário);
