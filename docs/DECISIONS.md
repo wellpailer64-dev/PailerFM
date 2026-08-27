@@ -130,4 +130,23 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   (`MusicPlaybackService`, tag `PailerPlaybackDiag`: `isPlaying`, `playWhenReady` + motivo,
   `playbackState`, erros do player, `onDestroy`/`onTaskRemoved`) para capturar evidência
   real via `adb logcat` na próxima ocorrência antes de tentar mais uma correção às cegas.
+- **Atualização (26/08/2026):** a abertura falada (e a flag `pendingRadioIntro` citada
+  acima) foi removida — ver ADR-010. O watchdog agora só guarda `speakingNews`
+  (boletins); a lógica de "que anúncio estava tocando" ficou mais simples.
+
+## ADR-010 — Abertura falada da rádio removida (data/hora/clima)
+
+- **Contexto:** `speakRadioIntro()` falava data, hora, temperatura (open-meteo) e "Você
+  está na Rádio X" antes de tocar a primeira música. Em uso diário real o dono do app
+  achou que atrapalhava mais do que ajudava.
+- **Decisão:** removidos `speakRadioIntro`, `finishRadioIntro`, `buildRadioIntroText`,
+  a flag `pendingRadioIntro` e o `WeatherRepository` (ficou sem nenhum outro uso). A
+  rádio agora dá `play()` imediatamente ao entrar (`playRadioSession` com
+  `autoPlay = true`), sem esperar TTS/rede. Boletins de notícia entre as músicas
+  continuam normalmente — não foram tocados.
+- **Motivo:** pedido direto do usuário; a narração de clima/hora não agregava e ainda
+  dependia de rede (open-meteo) e do TTS legado ficar pronto (~1,8 s de espera).
+- **Não mudar sem:** confirmar com o usuário — o plano é substituir por vinhetas
+  gravadas (`vinhetas/` na raiz do projeto) no lugar da abertura falada, não trazer a
+  narração de volta.
 

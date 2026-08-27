@@ -29,18 +29,12 @@ Usuário toca numa Rádio
         ▼
 playRadioSession()                          [LocalTuneViewModel]
   ├─ radioSessionFrom() → fila anti-repetição
-  ├─ controller.setMediaItems + prepare     (não dá play ainda)
   ├─ startRadioNewsMode(radioName)
   │    ├─ zera contadores/flags do boletim
   │    ├─ setupTextToSpeech()               (fallback; ver TTS.md)
   │    └─ carrega boletins em background:
   │         RadioBulletinRepository.loadScripts()
-  └─ speakRadioIntro(radioName, firstSong)
-        ├─ espera TTS legado ficar pronto (máx ~1,8 s)   ⚠ mesmo com sherpa ativo
-        ├─ clima: open-meteo São Paulo (timeout 2,5 s, falha silenciosa)
-        ├─ monta texto: data/hora + temperatura + "Você está na Rádio X" + 1ª música
-        ├─ síntese local (sherpa) OU TTS do sistema
-        └─ finishRadioIntro() → controller.play()
+  └─ controller.setMediaItems + prepare + play()   (toca na hora, sem abertura falada)
 
         ▼  (sessão rodando)
 onMediaItemTransition(reason = AUTO)        [Player.Listener]
@@ -56,6 +50,11 @@ onMediaItemTransition(reason = AUTO)        [Player.Listener]
 
 Gatilho importante: boletins só contam em transição **AUTO** (música acabou sozinha).
 Skip manual não conta nem cancela nada — ver races R3/R6 em [STATE_MACHINE.md](STATE_MACHINE.md).
+
+> **Abertura falada removida (26/08/2026 — ADR-010):** a rádio não fala mais
+> data/hora/clima nem "Você está na Rádio X" antes da primeira música. Plano futuro:
+> vinhetas gravadas (pasta [`vinhetas/`](../vinhetas/) na raiz do projeto) no lugar da
+> abertura — ainda não integradas ao app.
 
 ## Fontes de notícia
 

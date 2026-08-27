@@ -40,7 +40,6 @@ app/src/main/java/com/pailer/localtune/
 │   ├── MusicLibraryRepository.kt    # MediaStore + cache JSON + rádios + overrides de metadado
 │   ├── RadioBulletin.kt             # roteiros de boletim + writers (fallback / LLM opcional)
 │   ├── NewsBulletinRepository.kt    # manchetes via RSS (g1)
-│   ├── WeatherRepository.kt         # temperatura atual (open-meteo, São Paulo)
 │   ├── RadioVoicePackageRepository.kt # pacote .zip de vozes: import, validação, manifest
 │   └── AlbumGenreSuggestionRepository.kt
 └── widget/

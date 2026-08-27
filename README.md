@@ -19,8 +19,7 @@ Feito em Kotlin, Jetpack Compose e Media3/ExoPlayer.
 
 ### Modo Radio
 - Radios derivadas da biblioteca (perfil Grunge, radios por genero, Rádio recente) com
-  fila que evita repetir a sessao anterior.
-- Abertura falada: data/hora + temperatura (open-meteo) + primeira faixa.
+  fila que evita repetir a sessao anterior; toca direto, sem abertura falada.
 - Boletins de noticia entre as musicas (RSS do g1), em modo manchete ou dialogo entre
   locutora e locutor, com duracao configuravel.
 - Vozes locais offline via sherpa-onnx (VITS/Piper/Kokoro/Supertonic) rodando em processo

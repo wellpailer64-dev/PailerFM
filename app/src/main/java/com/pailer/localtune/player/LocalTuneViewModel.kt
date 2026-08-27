@@ -43,7 +43,6 @@ import com.pailer.localtune.data.RadioScriptLine
 import com.pailer.localtune.data.RadioScriptSource
 import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageRepository
-import com.pailer.localtune.data.WeatherRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -52,8 +51,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.random.Random
@@ -151,7 +148,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val repository = MusicLibraryRepository(application)
     private val bulletinRepository = RadioBulletinRepository(application)
     private val voicePackageRepository = RadioVoicePackageRepository(application)
-    private val weatherRepository = WeatherRepository()
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
@@ -170,7 +166,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var speakingNews = false
     private var currentNewsHeadline = ""
     private var resumeAfterNews = false
-    private var pendingRadioIntro = false
     private var announcementPlayer: MediaPlayer? = null
     private var announcementToken = 0
     private var announcementWatchdogJob: Job? = null
@@ -1110,18 +1105,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun playRadioSession(songs: List<LocalSong>, radioName: String, startIndex: Int = 0) {
         startRadioNewsMode(radioName)
-        val introEnabled = startIndex == 0
         playSongs(
             songs = songs,
             startIndex = startIndex,
             keepRadioNews = true,
             source = "Rádio $radioName",
             radioName = radioName,
-            autoPlay = !introEnabled,
+            autoPlay = true,
         )
-        if (introEnabled) {
-            speakRadioIntro(radioName = radioName, firstSong = songs.firstOrNull())
-        }
     }
 
     fun continuePlayback(songs: List<LocalSong>) {
@@ -1182,20 +1173,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 override fun onStart(utteranceId: String?) = Unit
 
                 override fun onDone(utteranceId: String?) {
-                    if (utteranceId == RADIO_INTRO_UTTERANCE_ID) {
-                        finishRadioIntro()
-                    } else {
-                        finishNewsBreak()
-                    }
+                    finishNewsBreak()
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                    if (utteranceId == RADIO_INTRO_UTTERANCE_ID) {
-                        finishRadioIntro()
-                    } else {
-                        finishNewsBreak()
-                    }
+                    finishNewsBreak()
                 }
             })
         }
@@ -1212,7 +1195,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
-        pendingRadioIntro = false
         activeRadioName = radioName
         playbackSource = "Rádio $radioName"
 
@@ -1223,87 +1205,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun speakRadioIntro(radioName: String, firstSong: LocalSong?) {
-        if (firstSong == null) {
-            controller?.play()
-            return
-        }
-        pendingRadioIntro = true
-        currentNewsHeadline = "Abrindo Radio $radioName"
-        controller?.let { updatePlayerState(it) }
-        viewModelScope.launch {
-            var attempts = 0
-            while (!ttsReady && attempts < TTS_READY_WAIT_STEPS) {
-                attempts += 1
-                delay(TTS_READY_WAIT_INTERVAL_MS)
-            }
-            if (!ttsReady || activeRadioName != radioName || !pendingRadioIntro) {
-                finishRadioIntro()
-                return@launch
-            }
-            val weather = weatherRepository.currentSaoPauloWeather()
-            val intro = buildRadioIntroText(radioName = radioName, firstSong = firstSong, weather = weather)
-            currentNewsHeadline = intro
-            controller?.let { updatePlayerState(it) }
-            val localScript = intro.toSingleLineScript()
-            val localFile = if (radioVoiceState.value.isEnabled) {
-                synthesizeLocalVoiceSafely(localScript)
-            } else {
-                null
-            }
-            if (!pendingRadioIntro || activeRadioName != radioName) return@launch
-            if (localFile != null) {
-                playAnnouncementFile(localFile) { finishRadioIntro() }
-                armAnnouncementWatchdog()
-                return@launch
-            }
-            val tts = textToSpeech
-            val accepted = if (tts != null && ttsReady) {
-                runCatching {
-                    tts.speak(intro, TextToSpeech.QUEUE_FLUSH, null, RADIO_INTRO_UTTERANCE_ID)
-                }.getOrDefault(TextToSpeech.ERROR)
-            } else {
-                TextToSpeech.ERROR
-            }
-            if (accepted != TextToSpeech.SUCCESS) {
-                Log.w(TAG_RADIO_VOICE, "tts fallback rejected intro - starting playback")
-                finishRadioIntro()
-            } else {
-                armAnnouncementWatchdog()
-            }
-        }
-    }
-
-    private fun finishRadioIntro() {
-        if (!pendingRadioIntro) return
-        pendingRadioIntro = false
-        currentNewsHeadline = ""
-        viewModelScope.launch {
-            controller?.play()
-            controller?.let { updatePlayerState(it) }
-        }
-    }
-
-    private fun buildRadioIntroText(
-        radioName: String,
-        firstSong: LocalSong,
-        weather: com.pailer.localtune.data.LocalWeather?,
-    ): String {
-        val now = ZonedDateTime.now()
-        val date = now.format(DateTimeFormatter.ofPattern("EEEE 'dia' d", RADIO_LOCALE)).replaceFirstChar {
-            if (it.isLowerCase()) it.titlecase(RADIO_LOCALE) else it.toString()
-        }
-        val time = now.format(DateTimeFormatter.ofPattern("HH'h'mm", RADIO_LOCALE))
-        val weatherText = weather?.let { " e faz ${it.temperatureCelsius} graus em Sao Paulo" }.orEmpty()
-        val artist = firstSong.artist.takeIf { it.isNotBlank() && it != "Desconhecido" }
-        val songText = if (artist != null) {
-            "${firstSong.title}, de $artist"
-        } else {
-            firstSong.title
-        }
-        return "$date, sao $time$weatherText. Voce esta na Radio $radioName. Fique agora com $songText."
-    }
-
     private fun stopRadioNewsMode() {
         radioNewsEnabled = false
         completedRadioSongs = 0
@@ -1312,7 +1213,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
-        pendingRadioIntro = false
         activeRadioName = ""
         announcementPlayer?.release()
         announcementPlayer = null
@@ -1400,12 +1300,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         announcementWatchdogJob = viewModelScope.launch {
             delay(ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS)
             if (token != announcementToken) return@launch
-            if (!speakingNews && !pendingRadioIntro) return@launch
+            if (!speakingNews) return@launch
             Log.w(TAG_RADIO_VOICE, "announcement watchdog fired - forcing playback resume")
             runCatching { announcementPlayer?.release() }
             announcementPlayer = null
             runCatching { textToSpeech?.stop() }
-            if (pendingRadioIntro) finishRadioIntro() else finishNewsBreak()
+            finishNewsBreak()
         }
     }
 
@@ -1684,8 +1584,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
-        val RADIO_LOCALE: Locale = Locale("pt", "BR")
-        const val RADIO_INTRO_UTTERANCE_ID = "pailer_player_radio_intro"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
     }
 }

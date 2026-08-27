@@ -433,6 +433,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         settingsPage = SettingsPage.Main
                         showSettings = true
                     },
+                    showSearch = selectedTab != LibraryTab.Playlists,
                 )
 
                 val openedAlbum = selectedAlbum
@@ -656,6 +657,7 @@ private fun LibraryHeader(
     isLoading: Boolean,
     onQueryChange: (String) -> Unit,
     onSettings: () -> Unit,
+    showSearch: Boolean = true,
 ) {
     Column(Modifier.padding(horizontal = 18.dp, vertical = 6.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -689,30 +691,32 @@ private fun LibraryHeader(
                 )
             }
         }
-        TextField(
-            value = query,
-            onValueChange = onQueryChange,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 10.dp),
-            singleLine = true,
-            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-            placeholder = { Text("Buscar musicas, artistas e albuns") },
-            shape = RoundedCornerShape(18.dp),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = MaterialTheme.colorScheme.surface,
-                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                focusedTextColor = MaterialTheme.colorScheme.onBackground,
-                unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
-                cursorColor = MaterialTheme.colorScheme.primary,
-                focusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                unfocusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                focusedIndicatorColor = Color.Transparent,
-                unfocusedIndicatorColor = Color.Transparent,
-            ),
-        )
+        if (showSearch) {
+            TextField(
+                value = query,
+                onValueChange = onQueryChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+                singleLine = true,
+                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                placeholder = { Text("Buscar musicas, artistas e albuns") },
+                shape = RoundedCornerShape(18.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surface,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                    focusedTextColor = MaterialTheme.colorScheme.onBackground,
+                    unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
+                    cursorColor = MaterialTheme.colorScheme.primary,
+                    focusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    unfocusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                ),
+            )
+        }
     }
 }
 
@@ -2552,14 +2556,19 @@ private fun PlaylistsScreen(
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenPlayer: () -> Unit,
 ) {
-    LazyColumn(contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        contentPadding = PaddingValues(18.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
         if (player.activeRadioName.isNotBlank() && player.hasMedia) {
-            item {
+            item(span = { GridItemSpan(maxLineSpan) }) {
                 LiveNowRadioCard(player = player, onClick = onOpenPlayer)
             }
         }
-        items(radios, key = { it.name }) { radio ->
-            RadioRow(radio = radio, onClick = { onOpenRadio(radio) })
+        gridItems(radios, key = { it.name }) { radio ->
+            RadioGridCard(radio = radio, onClick = { onOpenRadio(radio) })
         }
     }
 }
@@ -2991,6 +3000,39 @@ private fun RadioCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifi
             modifier = Modifier
                 .align(Alignment.Center)
                 .size(24.dp),
+        )
+    }
+}
+
+@Composable
+private fun RadioGridCard(radio: LocalRadio, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+    ) {
+        RadioCoverMosaic(
+            songs = radio.coverSongs,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f),
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            radio.name,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            radio.description,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
         )
     }
 }
