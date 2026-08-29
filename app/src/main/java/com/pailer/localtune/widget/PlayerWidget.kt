@@ -16,6 +16,7 @@ import androidx.media3.common.Player
 import com.pailer.localtune.MainActivity
 import com.pailer.localtune.R
 import com.pailer.localtune.player.MusicPlaybackService
+import com.pailer.localtune.util.DayPeriod
 
 class CompactPlayerWidgetProvider : AppWidgetProvider() {
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
@@ -80,8 +81,18 @@ object PlayerWidgetRenderer {
             setOnClickPendingIntent(R.id.widget_next, actionIntent(context, ACTION_NEXT, 11))
             setOnClickPendingIntent(R.id.widget_previous, actionIntent(context, ACTION_PREVIOUS, 12))
 
-            setTextViewText(R.id.widget_title, state.title.ifBlank { "Pailer Player" })
-            setTextViewText(R.id.widget_artist, state.artist.ifBlank { "Escolha uma faixa no app" })
+            val liveLabel = "🔴 AO VIVO · ${state.radioName}"
+            val radioFrame = if (state.isRadio) RadioGifFrameCache.frameFor(context, DayPeriod.current()) else null
+            if (radioFrame != null) {
+                setImageViewBitmap(R.id.widget_bg_image, radioFrame)
+                setViewVisibility(R.id.widget_bg_image, View.VISIBLE)
+                setViewVisibility(R.id.widget_bg_scrim, View.VISIBLE)
+            } else {
+                setViewVisibility(R.id.widget_bg_image, View.GONE)
+                setViewVisibility(R.id.widget_bg_scrim, View.GONE)
+            }
+
+            setTextViewText(R.id.widget_title, state.title.ifBlank { "Pailer FM" })
             setImageViewResource(
                 R.id.widget_play_pause,
                 if (state.isPlaying) R.drawable.ic_widget_pause else R.drawable.ic_widget_play,
@@ -90,7 +101,15 @@ object PlayerWidgetRenderer {
             setProgressBar(R.id.widget_progress, 1000, state.progress, false)
 
             if (layoutId == R.layout.widget_player_large) {
-                setTextViewText(R.id.widget_album, state.album.ifBlank { "Biblioteca local" })
+                setTextViewText(R.id.widget_artist, state.artist.ifBlank { "Biblioteca local" })
+                setTextColor(R.id.widget_artist, LARGE_ARTIST_DEFAULT_COLOR)
+                if (state.isRadio) {
+                    setTextViewText(R.id.widget_album, liveLabel)
+                    setTextColor(R.id.widget_album, LIVE_ACCENT_COLOR)
+                } else {
+                    setTextViewText(R.id.widget_album, state.album.ifBlank { "Biblioteca local" })
+                    setTextColor(R.id.widget_album, LARGE_ALBUM_DEFAULT_COLOR)
+                }
                 setTextViewText(R.id.widget_queue_count, state.queueLabel)
                 setTextViewText(R.id.widget_next_one, state.nextTracks.getOrNull(0).orEmpty())
                 setTextViewText(R.id.widget_next_two, state.nextTracks.getOrNull(1).orEmpty())
@@ -99,6 +118,14 @@ object PlayerWidgetRenderer {
                 setViewVisibility(R.id.widget_next_two, if (state.nextTracks.size > 1) View.VISIBLE else View.GONE)
                 setViewVisibility(R.id.widget_next_three, if (state.nextTracks.size > 2) View.VISIBLE else View.GONE)
                 setViewVisibility(R.id.widget_empty_queue, if (state.nextTracks.isEmpty()) View.VISIBLE else View.GONE)
+            } else {
+                if (state.isRadio) {
+                    setTextViewText(R.id.widget_artist, liveLabel)
+                    setTextColor(R.id.widget_artist, LIVE_ACCENT_COLOR)
+                } else {
+                    setTextViewText(R.id.widget_artist, state.artist.ifBlank { "Escolha uma faixa no app" })
+                    setTextColor(R.id.widget_artist, COMPACT_ARTIST_DEFAULT_COLOR)
+                }
             }
         }
 
@@ -136,6 +163,8 @@ object PlayerWidgetRenderer {
             progress = progress,
             queueLabel = if (mediaItemCount > 0) "${currentMediaItemIndex + 1}/$mediaItemCount" else "0/0",
             nextTracks = nextTracks,
+            isRadio = !metadata?.station.isNullOrBlank(),
+            radioName = metadata?.station?.toString().orEmpty(),
         )
     }
 
@@ -149,6 +178,8 @@ object PlayerWidgetRenderer {
             putInt(KEY_PROGRESS, state.progress)
             putString(KEY_QUEUE, state.queueLabel)
             putString(KEY_NEXT, state.nextTracks.joinToString("\n"))
+            putBoolean(KEY_IS_RADIO, state.isRadio)
+            putString(KEY_RADIO_NAME, state.radioName)
         }
     }
 
@@ -166,6 +197,8 @@ object PlayerWidgetRenderer {
                 ?.split("\n")
                 ?.filter { it.isNotBlank() }
                 ?: emptyList(),
+            isRadio = prefs.getBoolean(KEY_IS_RADIO, false),
+            radioName = prefs.getString(KEY_RADIO_NAME, null).orEmpty(),
         )
     }
 
@@ -194,6 +227,13 @@ object PlayerWidgetRenderer {
     private const val KEY_PROGRESS = "progress"
     private const val KEY_QUEUE = "queue"
     private const val KEY_NEXT = "next"
+    private const val KEY_IS_RADIO = "is_radio"
+    private const val KEY_RADIO_NAME = "radio_name"
+
+    private const val LIVE_ACCENT_COLOR = 0xFFB53A2E.toInt()
+    private const val LARGE_ARTIST_DEFAULT_COLOR = 0xDDFFFFFF.toInt()
+    private const val LARGE_ALBUM_DEFAULT_COLOR = 0x99FFFFFF.toInt()
+    private const val COMPACT_ARTIST_DEFAULT_COLOR = 0xCCFFFFFF.toInt()
 }
 
 internal data class WidgetState(
@@ -205,6 +245,8 @@ internal data class WidgetState(
     val progress: Int = 0,
     val queueLabel: String = "0/0",
     val nextTracks: List<String> = emptyList(),
+    val isRadio: Boolean = false,
+    val radioName: String = "",
 )
 
 object PlayerWidgetActions {

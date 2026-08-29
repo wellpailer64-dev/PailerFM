@@ -42,8 +42,11 @@ app/src/main/java/com/pailer/localtune/
 │   ├── NewsBulletinRepository.kt    # manchetes via RSS (g1)
 │   ├── RadioVoicePackageRepository.kt # pacote .zip de vozes: import, validação, manifest
 │   └── AlbumGenreSuggestionRepository.kt
+├── util/
+│   └── DayPeriod.kt                 # manhã/tarde/noite por hora, compartilhado UI + widget
 └── widget/
     ├── PlayerWidget.kt              # widgets compacto/grande (RemoteViews)
+    ├── RadioGifFrameCache.kt        # extrai 1 frame estático do gif do período (fundo do widget ao vivo)
     └── (providers/receiver/renderer/actions)
 ```
 
