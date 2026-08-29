@@ -15,6 +15,7 @@ data class LocalSong(
     val trackNumber: Int,
     val dateAdded: Long,
     val genre: String,
+    val year: Int = 0,
     val contentUri: Uri,
 ) {
     val artworkUri: Uri?
@@ -24,12 +25,13 @@ data class LocalSong(
             null
         }
 
-    fun toMediaItem(): MediaItem {
+    fun toMediaItem(radioName: String = ""): MediaItem {
         val metadata = MediaMetadata.Builder()
             .setTitle(title)
             .setArtist(artist)
             .setAlbumTitle(album)
             .setArtworkUri(artworkUri)
+            .apply { if (radioName.isNotBlank()) setStation(radioName) }
             .build()
 
         return MediaItem.Builder()
@@ -54,6 +56,12 @@ data class LocalAlbum(
     val key: String = "$id:$title:$artist"
     val dateAdded: Long = songs.maxOfOrNull { it.dateAdded } ?: 0L
     val genre: String = songs.firstOrNull { it.genre.isNotBlank() }?.genre.orEmpty()
+
+    // Compilacoes/albuns montados a mao (varios artistas sob o mesmo nome de album) tem o
+    // mesmo ALBUM_ID no MediaStore, entao content://.../albumart/<id> devolve a MESMA capa
+    // pra todas as faixas mesmo elas tendo capas embutidas diferentes de verdade no arquivo.
+    // Usado pra decidir mosaico (em vez de 1 capa so) e extracao por-faixa via MediaMetadataRetriever.
+    val isVariousArtists: Boolean = songs.map { it.artist }.distinct().size > 1
 }
 
 data class LocalArtist(
@@ -97,9 +105,21 @@ data class TagWriteResult(
     val failedSongCount: Int,
 )
 
+data class ArtworkCandidate(
+    val previewUrl: String,
+    val fullUrl: String,
+    val label: String,
+)
+
 data class LocalRadio(
     val name: String,
     val description: String,
     val songs: List<LocalSong>,
     val coverSongs: List<LocalSong> = songs.distinctBy { it.albumId }.take(4),
+    // Radio criada pelo usuario a partir de um album/artista especifico (ver
+    // MusicLibraryRepository.createRadioFromAlbum/createRadioFromArtist) - diferente das
+    // radios de genero/perfil, essa pode ser excluida. customId identifica a definicao
+    // persistida ("album:<id>:..." ou "artist:<chave>").
+    val isCustom: Boolean = false,
+    val customId: String? = null,
 )

@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Pailer Player</string>
+    <string name="app_name">Pailer FM</string>
     <string name="widget_artwork">Capa atual</string>
     <string name="widget_play_pause">Tocar ou pausar</string>
     <string name="widget_next">Proxima faixa</string>

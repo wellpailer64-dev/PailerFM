@@ -39,7 +39,7 @@ class RadioVoiceSynthesisService : Service() {
             Log.d(TAG, "start synthesis lines=${texts.size} chars=${texts.sumOf { it.length }}")
             val result = runCatching {
                 val script = RadioScript(
-                    story = NewsStory(title = texts.first(), source = "Pailer Player"),
+                    story = NewsStory(title = texts.first(), source = "Pailer FM"),
                     source = RadioScriptSource.Fallback,
                     lines = texts.mapIndexed { index, text ->
                         RadioScriptLine(

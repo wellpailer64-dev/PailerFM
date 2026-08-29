@@ -3,6 +3,9 @@ package com.pailer.localtune.data
 import android.app.PendingIntent
 import android.content.ContentUris
 import android.content.Context
+import android.graphics.BitmapFactory
+import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
@@ -10,9 +13,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.jaudiotagger.audio.AudioFileIO
 import org.jaudiotagger.tag.FieldKey
+import org.jaudiotagger.tag.images.ArtworkFactory
+import org.jaudiotagger.tag.reference.PictureTypes
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.text.Normalizer
 import kotlin.math.abs
 import kotlin.random.Random
@@ -47,6 +55,7 @@ class MusicLibraryRepository(private val context: Context) {
                     .put("trackNumber", song.trackNumber)
                     .put("dateAdded", song.dateAdded)
                     .put("genre", song.genre)
+                    .put("year", song.year)
             )
         }
         cacheFile.writeText(json.toString())
@@ -71,6 +80,7 @@ class MusicLibraryRepository(private val context: Context) {
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.TRACK,
             MediaStore.Audio.Media.DATE_ADDED,
+            MediaStore.Audio.Media.YEAR,
         )
         val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} > ?"
         val selectionArgs = arrayOf("15000")
@@ -86,6 +96,7 @@ class MusicLibraryRepository(private val context: Context) {
                 val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
                 val trackColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TRACK)
                 val dateAddedColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
+                val yearColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.YEAR)
 
                 buildList {
                     while (cursor.moveToNext()) {
@@ -114,6 +125,7 @@ class MusicLibraryRepository(private val context: Context) {
                                 trackNumber = cursor.getInt(trackColumn),
                                 dateAdded = cursor.getLong(dateAddedColumn),
                                 genre = genreOverride?.takeIf { it.isNotBlank() } ?: rawGenre,
+                                year = cursor.getInt(yearColumn),
                                 contentUri = uri,
                             )
                         )
@@ -143,6 +155,7 @@ class MusicLibraryRepository(private val context: Context) {
                             trackNumber = item.optInt("trackNumber"),
                             dateAdded = item.optLong("dateAdded"),
                             genre = item.optString("genre").cleanUnknown(""),
+                            year = item.optInt("year"),
                             contentUri = ContentUris.withAppendedId(collection, id),
                         )
                     )
@@ -186,6 +199,8 @@ class MusicLibraryRepository(private val context: Context) {
         val recent = songs.sortedByDescending { it.dateAdded }.take(RADIO_LIMIT)
         val genreRadios = (precomputedGenreRadios ?: dynamicGenreRadios(songs)).take(MAX_HOME_RADIOS)
         val grungeRadio = radioFromProfile(songs, RADIO_PROFILES.first { it.name == "Grunge" })
+        val anos2000Radio = radioFromProfile(songs, RADIO_PROFILES.first { it.name == "Anos 2000" })
+        val customRadios = customRadiosFrom(songs)
 
         val fallback = LocalRadio(
             name = "Radio recente",
@@ -194,12 +209,170 @@ class MusicLibraryRepository(private val context: Context) {
             coverSongs = previewCovers(recent, "recent"),
         )
 
-        return (listOfNotNull(grungeRadio) + genreRadios + fallback).distinctBy { normalizeLookupKey(it.name) }
+        val hidden = hiddenRadioKeys()
+        return (customRadios + listOfNotNull(grungeRadio, anos2000Radio) + genreRadios + fallback)
+            .distinctBy { normalizeLookupKey(it.name) }
+            .filterNot { normalizeLookupKey(it.name) in hidden }
+    }
+
+    // --- Radios ocultas (perfil/genero/fallback - as personalizadas usam deleteCustomRadio) ---
+    // Radios de perfil/genero nao tem uma "definicao" persistida pra apagar - sao recalculadas
+    // toda vez a partir da biblioteca. "Apagar" uma delas so tira da lista (chave = nome
+    // normalizado, mesmo dominio de normalizeLookupKey usado em toda parte); a logica que gera
+    // a radio e a vinheta por genero (VINHETA_BY_RADIO_KEY em LocalTuneViewModel, chaveada pelo
+    // NOME, nao por essa lista) continuam intactas - se o usuario desocultar, a radio volta com
+    // a vinheta de sempre.
+    fun hiddenRadioKeys(): Set<String> {
+        val json = metadataPrefs.getString(KEY_HIDDEN_RADIOS, null) ?: return emptySet()
+        return runCatching {
+            val array = JSONArray(json)
+            (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
+        }.getOrDefault(emptySet())
+    }
+
+    private fun saveHiddenRadioKeys(keys: Set<String>) {
+        val array = JSONArray()
+        keys.forEach(array::put)
+        metadataPrefs.edit().putString(KEY_HIDDEN_RADIOS, array.toString()).apply()
+    }
+
+    fun hideRadio(radio: LocalRadio) {
+        saveHiddenRadioKeys(hiddenRadioKeys() + normalizeLookupKey(radio.name))
+        // Sessao salva e chaveada pelo nome (ver radioSessionFrom) - limpa junto, mesma logica
+        // do deleteCustomRadio, pra nao deixar historico orfao se a radio for desocultada.
+        metadataPrefs.edit().remove(lastRadioSessionKey(radio.name)).apply()
+    }
+
+    fun unhideAllRadios() {
+        metadataPrefs.edit().remove(KEY_HIDDEN_RADIOS).apply()
+    }
+
+    // --- Radios personalizadas (a partir de album/artista) ---
+    // Persistidas em metadataPrefs (mesmo SharedPreferences de overrides/sessao) como um unico
+    // JSON array - lista pequena, nao precisa de schema versionado como os overrides.
+
+    data class CustomRadioDefinition(val id: String, val name: String, val sourceType: String)
+
+    fun customRadioDefinitions(): List<CustomRadioDefinition> {
+        val json = metadataPrefs.getString(KEY_CUSTOM_RADIOS, null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(json)
+            (0 until array.length()).mapNotNull { index ->
+                val obj = array.optJSONObject(index) ?: return@mapNotNull null
+                val id = obj.optString("id")
+                if (id.isBlank()) return@mapNotNull null
+                CustomRadioDefinition(id = id, name = obj.optString("name"), sourceType = obj.optString("sourceType"))
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveCustomRadioDefinitions(definitions: List<CustomRadioDefinition>) {
+        val array = JSONArray()
+        definitions.forEach { definition ->
+            array.put(
+                JSONObject()
+                    .put("id", definition.id)
+                    .put("name", definition.name)
+                    .put("sourceType", definition.sourceType)
+            )
+        }
+        metadataPrefs.edit().putString(KEY_CUSTOM_RADIOS, array.toString()).apply()
+    }
+
+    fun createRadioFromAlbum(album: LocalAlbum): CustomRadioDefinition {
+        val id = "album:${album.id}"
+        val definition = CustomRadioDefinition(id = id, name = album.title, sourceType = "album")
+        saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
+        return definition
+    }
+
+    fun createRadioFromArtist(artist: LocalArtist): CustomRadioDefinition {
+        val id = "artist:${artist.key}"
+        val definition = CustomRadioDefinition(id = id, name = artist.name, sourceType = "artist")
+        saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
+        return definition
+    }
+
+    // genre.songs vem de dynamicGenreRadios() (groupBy radioGenreKey), entao todas as musicas
+    // ali compartilham a mesma chave - basta recalcular a partir de uma delas pra persistir a
+    // chave interna (que pode diferir do nome de exibicao) sem precisar carregar LocalRadio
+    // com um campo novo so pra isso.
+    fun createRadioFromGenre(genre: LocalRadio): CustomRadioDefinition? {
+        val sample = genre.songs.firstOrNull() ?: return null
+        val genreKey = radioGenreKey(sample, normalizeLookupKey(sample.genre))
+        val id = "genre:$genreKey"
+        val definition = CustomRadioDefinition(id = id, name = genre.name, sourceType = "genre")
+        saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
+        return definition
+    }
+
+    fun deleteCustomRadio(customId: String) {
+        val definitions = customRadioDefinitions()
+        val removed = definitions.firstOrNull { it.id == customId }
+        saveCustomRadioDefinitions(definitions.filterNot { it.id == customId })
+        // Sessao salva e chaveada pelo nome da radio (ver radioSessionFrom) - limpa junto pra
+        // nao deixar historico orfao se o usuario recriar uma radio com o mesmo nome depois.
+        if (removed != null) {
+            metadataPrefs.edit().remove(lastRadioSessionKey(removed.name)).apply()
+        }
+    }
+
+    private fun customRadiosFrom(songs: List<LocalSong>): List<LocalRadio> {
+        val definitions = customRadioDefinitions()
+        if (definitions.isEmpty()) return emptyList()
+        return definitions.mapNotNull { definition ->
+            val matchedSongs = when (definition.sourceType) {
+                "album" -> {
+                    val albumId = definition.id.removePrefix("album:").toLongOrNull()
+                    songs.filter { it.albumId == albumId }
+                        .sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
+                }
+                "artist" -> {
+                    val artistKey = definition.id.removePrefix("artist:")
+                    songs.filter { primaryArtistKey(it.artist) == artistKey }
+                        .sortedBy { it.title.lowercase() }
+                }
+                "genre" -> {
+                    val genreKey = definition.id.removePrefix("genre:")
+                    songs.filter { radioGenreKey(it, normalizeLookupKey(it.genre)) == genreKey }
+                        .sortedBy { it.title.lowercase() }
+                }
+                else -> emptyList()
+            }
+            if (matchedSongs.isEmpty()) return@mapNotNull null
+            LocalRadio(
+                name = definition.name,
+                description = "${matchedSongs.size} faixas - radio personalizada",
+                songs = matchedSongs,
+                coverSongs = previewCovers(matchedSongs, "custom:${definition.id}"),
+                isCustom = true,
+                customId = definition.id,
+            )
+        }
     }
 
     fun allGenreRadios(songs: List<LocalSong>): List<LocalRadio> = dynamicGenreRadios(songs)
 
     fun radioSessionFrom(radio: LocalRadio): List<LocalSong> {
+        // Radio personalizada de album/artista unico e uma lista fechada de poucos artistas de
+        // proposito - o algoritmo de diversidade abaixo foi feito pra pools com muitos artistas
+        // e cortaria uma radio de artista/album unico pra so 5 faixas (radioArtistLimit pra
+        // artistCount=1). Album de um artista so toca na ordem de faixa (sequencia proposital,
+        // tipo album conceitual); album "various artists" (varios artistas sob o mesmo nome de
+        // album - ver LocalAlbum.isVariousArtists) NAO e uma sequencia intencional de verdade,
+        // entao embaralha igual radio de artista. Artista embaralha com anti-repeticao (mesmo
+        // esquema de tentativas + radioSequenceSimilarity do fluxo generico abaixo, so sem
+        // buildRadioQueue) - seed fixa pelo nome dava sempre a mesma ordem a cada "Entrar".
+        // Radio personalizada de categoria continua no fluxo normal abaixo - tem tantos
+        // artistas quanto a radio de genero dinamica equivalente, se beneficia do mesmo algoritmo.
+        if (radio.isCustom && radio.customId?.startsWith("album:") == true) {
+            val isVariousArtists = radio.songs.map { it.artist }.distinct().size > 1
+            if (!isVariousArtists) return radio.songs
+            return shuffledRadioSession(radio)
+        }
+        if (radio.isCustom && radio.customId?.startsWith("artist:") == true) {
+            return shuffledRadioSession(radio)
+        }
         val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)
             ?.split(",")
             ?.mapNotNull { it.toLongOrNull() }
@@ -221,6 +394,29 @@ class MusicLibraryRepository(private val context: Context) {
                 .putString(lastRadioSessionKey(radio.name), session.joinToString(",") { it.id.toString() })
                 .apply()
         }
+        return session
+    }
+
+    // Embaralha com anti-repeticao (varias tentativas, fica com a mais diferente da ultima
+    // sessao salva) sem passar pelo buildRadioQueue de diversidade por artista - usado por
+    // radio de artista e de album "various artists" em radioSessionFrom(), onde a lista de
+    // artistas ja e pequena/fechada de proposito.
+    private fun shuffledRadioSession(radio: LocalRadio): List<LocalSong> {
+        val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)
+            ?.split(",")
+            ?.mapNotNull { it.toLongOrNull() }
+            .orEmpty()
+        val attempts = (0 until RADIO_SESSION_ATTEMPTS).map { attempt ->
+            radio.songs.shuffled(Random(stableHash("${radio.name}:${System.nanoTime()}:${Random.nextLong()}:$attempt")))
+        }
+        val session = if (previousIds.isEmpty()) {
+            attempts.first()
+        } else {
+            attempts.minByOrNull { radioSequenceSimilarity(it, previousIds) }.orEmpty()
+        }
+        metadataPrefs.edit()
+            .putString(lastRadioSessionKey(radio.name), session.joinToString(",") { it.id.toString() })
+            .apply()
         return session
     }
 
@@ -402,6 +598,176 @@ class MusicLibraryRepository(private val context: Context) {
 
         tempFile.delete()
         return true
+    }
+
+    // --- Correcao de capa de album (busca na internet + grava de verdade na faixa) ---
+
+    fun albumsWithoutArtwork(songs: List<LocalSong>): List<LocalAlbum> =
+        albumsFrom(songs)
+            .filter { !hasRealArtwork(it.artworkUri) }
+            .sortedBy { it.title.lowercase() }
+
+    // O Uri de albumart do MediaStore sempre existe pra qualquer albumId > 0 - so decodificando
+    // (ou tentando) da pra saber se tem uma imagem de verdade por tras ou so o placeholder do
+    // sistema. inJustDecodeBounds evita alocar o bitmap inteiro so pra checar isso.
+    private fun hasRealArtwork(uri: Uri?): Boolean {
+        if (uri == null) return false
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, bounds)
+            }
+            bounds.outWidth > 0 && bounds.outHeight > 0
+        }.getOrDefault(false)
+    }
+
+    // iTunes Search API: publica, sem chave/autenticacao, limite informal generoso o bastante
+    // pra uso pessoal. artworkUrl100 vem sempre — a troca "100x100bb" -> "600x600bb" e um truque
+    // conhecido da propria Apple pra pedir uma resolucao maior do mesmo arquivo.
+    // Varias tentativas em vez de uma query so: album com sufixo de edicao/remaster
+    // ("Nome (Deluxe Edition)", "Nome [Remastered 2011]") quase nunca bate exato com o titulo
+    // catalogado na iTunes, e artista+album colado num "term" so as vezes falha onde o titulo
+    // sozinho acha. Cada tentativa roda so se a anterior nao deu resultado suficiente, e todos os
+    // resultados unicos (por trackId/preview) somam nas opcoes finais - usuario pediu mais opcoes.
+    suspend fun searchArtworkCandidates(album: LocalAlbum): List<ArtworkCandidate> = withContext(Dispatchers.IO) {
+        val cleanTitle = cleanAlbumTitleForSearch(album.title)
+        val primaryArtist = primaryArtistName(album.artist)
+        val artistPlusTitle = "$primaryArtist $cleanTitle".trim()
+        val queries = listOf(artistPlusTitle, cleanTitle, primaryArtist)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        val seen = LinkedHashMap<String, ArtworkCandidate>()
+        for (query in queries) {
+            if (seen.size >= ARTWORK_CANDIDATE_LIMIT) break
+            val results = runCatching { fetchItunesAlbumResults(query) }.getOrDefault(emptyList())
+            results.forEach { item ->
+                val preview = item.optString("artworkUrl100").takeIf { it.isNotBlank() } ?: return@forEach
+                if (seen.containsKey(preview)) return@forEach
+                val full = preview.replace("100x100bb", "600x600bb")
+                val collectionName = item.optString("collectionName").ifBlank { album.title }
+                val artistName = item.optString("artistName").ifBlank { album.artist }
+                seen[preview] = ArtworkCandidate(previewUrl = preview, fullUrl = full, label = "$collectionName - $artistName")
+            }
+            // So tenta a proxima query (mais generica) se a atual nao trouxe nada - uma vez com
+            // resultado, nao vale a pena arriscar poluir com correspondencias mais fracas.
+            if (results.isNotEmpty()) break
+        }
+        seen.values.toList()
+    }
+
+    private fun fetchItunesAlbumResults(query: String): List<JSONObject> {
+        val term = URLEncoder.encode(query, "UTF-8")
+        val url = "https://itunes.apple.com/search?term=$term&entity=album&limit=$ARTWORK_CANDIDATE_LIMIT"
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = 10_000
+            requestMethod = "GET"
+            setRequestProperty("User-Agent", "PailerPlayer/0.1")
+        }
+        val body = connection.inputStream.use { it.readBytes().decodeToString() }
+        connection.disconnect()
+        val results = JSONObject(body).optJSONArray("results") ?: JSONArray()
+        return (0 until results.length()).mapNotNull { results.optJSONObject(it) }
+    }
+
+    // Remove ruido de edicao/versao que raramente bate com o titulo catalogado na loja:
+    // "(Deluxe Edition)", "[Remastered 2011]", "- Live", "(Bonus Track Version)" etc.
+    private fun cleanAlbumTitleForSearch(title: String): String =
+        title
+            .replace(Regex("[\\(\\[][^)\\]]*(?:deluxe|remaster|edition|version|bonus|anniversary|expanded|live)[^)\\]]*[\\)\\]]", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*-\\s*(?:deluxe|remaster(?:ed)?|live|single|ep)\\b.*", RegexOption.IGNORE_CASE), "")
+            .replace(WHITESPACE_REGEX, " ")
+            .trim()
+            .ifBlank { title.trim() }
+
+    suspend fun downloadArtwork(url: String): ByteArray? = withContext(Dispatchers.IO) {
+        runCatching {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 10_000
+                requestMethod = "GET"
+            }
+            val bytes = connection.inputStream.use { it.readBytes() }
+            connection.disconnect()
+            bytes.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    fun createArtworkWriteRequest(album: LocalAlbum): PendingIntent? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val uris = album.songs.map { it.contentUri }.distinct()
+        if (uris.isEmpty()) return null
+        return MediaStore.createWriteRequest(context.contentResolver, uris)
+    }
+
+    suspend fun applyArtworkToAlbum(album: LocalAlbum, imageBytes: ByteArray): Int = withContext(Dispatchers.IO) {
+        var updated = 0
+        album.songs.forEach { song ->
+            val ok = runCatching { writeArtworkToAudioFile(song, imageBytes) }
+                .onFailure { error -> Log.w(TAG, "Falha ao gravar capa em ${song.id} - ${song.title}", error) }
+                .getOrDefault(false)
+            if (ok) {
+                updated += 1
+                runCatching {
+                    MediaScannerConnection.scanFile(context, arrayOf(pathForRescan(song)), null, null)
+                }
+            }
+        }
+        updated
+    }
+
+    private fun writeArtworkToAudioFile(song: LocalSong, imageBytes: ByteArray): Boolean {
+        val tagDir = File(context.cacheDir, "tag_write").apply { mkdirs() }
+        val extension = audioExtension(song).lowercase()
+        if (extension !in SUPPORTED_TAG_EXTENSIONS) {
+            Log.w(TAG, "Formato sem suporte para escrita: .$extension em ${song.title}")
+            return false
+        }
+        val tempFile = File(tagDir, "art_${song.id}.$extension")
+
+        context.contentResolver.openInputStream(song.contentUri)?.use { input ->
+            tempFile.outputStream().use { output -> input.copyTo(output) }
+        } ?: run {
+            Log.w(TAG, "Nao consegui abrir leitura para ${song.title}")
+            return false
+        }
+
+        val audioFile = AudioFileIO.read(tempFile)
+        val tag = audioFile.tagOrCreateAndSetDefault
+        val artwork = ArtworkFactory.getNew().apply {
+            binaryData = imageBytes
+            mimeType = sniffImageMimeType(imageBytes)
+            pictureType = PictureTypes.DEFAULT_ID
+        }
+        runCatching { tag.deleteArtworkField() }
+        tag.setField(artwork)
+        audioFile.commit()
+
+        context.contentResolver.openOutputStream(song.contentUri, "wt")?.use { output ->
+            tempFile.inputStream().use { input -> input.copyTo(output) }
+        } ?: run {
+            Log.w(TAG, "Nao consegui abrir escrita para ${song.title}")
+            return false
+        }
+
+        tempFile.delete()
+        return true
+    }
+
+    private fun sniffImageMimeType(bytes: ByteArray): String = when {
+        bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() -> "image/png"
+        else -> "image/jpeg"
+    }
+
+    // MediaScannerConnection quer um path de sistema de arquivos, nao um content:// Uri - so pra
+    // acelerar o MediaStore reindexar a capa nova (senao demora pro albumart Uri atualizar sozinho).
+    private fun pathForRescan(song: LocalSong): String {
+        val projection = arrayOf(MediaStore.Audio.Media.DATA)
+        return context.contentResolver.query(song.contentUri, projection, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }.orEmpty()
     }
 
     private fun audioExtension(song: LocalSong): String {
@@ -626,7 +992,9 @@ class MusicLibraryRepository(private val context: Context) {
         seed: String,
     ): Int {
         val previous = queue.lastOrNull()
-        val recentArtists = queue.takeLast(4).flatMap { it.artistKeys }.toSet()
+        // Janela de 4 pra 6 faixas: com poucos artistas no genero, olhar só as ultimas 3-4
+        // deixava o mesmo artista voltar cedo demais mesmo sem ficar literalmente colado.
+        val recentArtists = queue.takeLast(6).flatMap { it.artistKeys }.toSet()
         val recentAlbums = queue.takeLast(5).map { it.albumKey }.toSet()
         val recentGenres = queue.takeLast(4).map { it.genreKey }.toSet()
         return (selectedCount * 5_000) +
@@ -643,7 +1011,7 @@ class MusicLibraryRepository(private val context: Context) {
         queue: List<RadioCandidate>,
         seed: String,
     ): RadioCandidate {
-        val recentArtists = queue.takeLast(3).flatMap { it.artistKeys }.toSet()
+        val recentArtists = queue.takeLast(6).flatMap { it.artistKeys }.toSet()
         val recentAlbums = queue.takeLast(5).map { it.albumKey }.toSet()
         val recentGenres = queue.takeLast(4).map { it.genreKey }.toSet()
         val previous = queue.lastOrNull()
@@ -662,12 +1030,19 @@ class MusicLibraryRepository(private val context: Context) {
         return this[random.nextInt(topCount)]
     }
 
+    // Tetos baixos de proposito mesmo com poucos artistas no genero: a formula antiga
+    // (RADIO_LIMIT / artistCount) liberava ate 10 musicas do mesmo artista numa fila de 30 se
+    // o genero so tivesse 3 artistas distintos (caso real: radio "indie" dominada por um unico
+    // artista) - o resultado parecia repetitivo mesmo sem duas musicas dele ficarem coladas.
+    // Preferir uma sessao mais curta (buildRadioQueue para quando os artistas disponiveis
+    // acabam) a uma sessao de 30 faixas inflada de repeticao do mesmo artista.
     private fun radioArtistLimit(artistCount: Int): Int = when {
         artistCount <= 0 -> RADIO_LIMIT
         artistCount >= RADIO_LIMIT -> 1
         artistCount >= 15 -> 2
         artistCount >= 10 -> 3
-        else -> ((RADIO_LIMIT + artistCount - 1) / artistCount).coerceAtLeast(1)
+        artistCount >= 6 -> 4
+        else -> 5
     }
 
     private fun primaryArtistKey(artist: String): String =
@@ -724,11 +1099,19 @@ class MusicLibraryRepository(private val context: Context) {
             .toSet()
             .ifEmpty { setOf(artist.lowercase().trim()) }
 
-    private fun previewCovers(songs: List<LocalSong>, seed: String): List<LocalSong> =
-        songs
+    // Radio de um album "various artists" (musicas com o mesmo ALBUM_ID mas artistas
+    // diferentes - ver LocalAlbum.isVariousArtists) tem so 1 entrada distinta por albumId,
+    // entao complementa com diversidade por artista pra nao acabar com so 1 capa no mosaico.
+    private fun previewCovers(songs: List<LocalSong>, seed: String): List<LocalSong> {
+        val byAlbum = songs
             .distinctBy { it.albumId }
             .sortedBy { stableHash("$seed:${it.albumId}:${it.album}") }
-            .take(4)
+        if (byAlbum.size >= 4) return byAlbum.take(4)
+        val byArtist = songs
+            .distinctBy { it.artist }
+            .sortedBy { stableHash("$seed:${it.artist}") }
+        return (byAlbum + byArtist + songs).distinct().take(4)
+    }
 
     private fun dynamicGenreRadios(songs: List<LocalSong>): List<LocalRadio> {
         val eligibleSongs = songs.filter { it.genre.isNotBlank() }
@@ -865,6 +1248,10 @@ class MusicLibraryRepository(private val context: Context) {
         val metadataTokens: List<String> = emptyList(),
         val excludedMetadataTokens: List<String> = emptyList(),
         val requireMetadataTokenMatch: Boolean = false,
+        // So usado por perfis de decada (ex.: "Anos 2000") - quando presente, o ano da musica
+        // (MediaStore YEAR) precisa estar no intervalo. Perfil sem genreTokens/metadataTokens
+        // e com yearRange vira um perfil "so por ano" (ver matches()).
+        val yearRange: IntRange? = null,
     ) {
         // Tokens sao constantes por perfil; normalizar uma vez (lazy) em vez de a cada
         // musica evita milhares de chamadas repetidas a Normalizer.normalize durante radiosFrom().
@@ -876,8 +1263,13 @@ class MusicLibraryRepository(private val context: Context) {
             val genre = normalize(song.genre)
             val metadata = normalize("${song.artist} ${song.album}")
             if (normalizedExcludedTokens.any { metadata.contains(it) }) return false
+            if (yearRange != null && song.year !in yearRange) return false
             val metadataMatch = normalizedMetadataTokens.any { metadata.contains(it) }
             if (requireMetadataTokenMatch) return metadataMatch
+            if (normalizedGenreTokens.isEmpty() && normalizedMetadataTokens.isEmpty()) {
+                // Perfil so por ano: ja passou pelo filtro de yearRange acima.
+                return yearRange != null
+            }
             return normalizedGenreTokens.any { token -> genre.contains(token) || metadata.contains(token) } ||
                 metadataMatch
         }
@@ -893,6 +1285,9 @@ class MusicLibraryRepository(private val context: Context) {
 
     private companion object {
         const val KEY_METADATA_SCHEMA_VERSION = "metadata_schema_version"
+        const val KEY_CUSTOM_RADIOS = "custom_radio_definitions"
+        const val KEY_HIDDEN_RADIOS = "hidden_radio_keys"
+        const val ARTWORK_CANDIDATE_LIMIT = 10
         const val METADATA_SCHEMA_VERSION = 2
         const val RADIO_LIMIT = 30
         const val TAG = "PailerTags"
@@ -992,6 +1387,12 @@ class MusicLibraryRepository(private val context: Context) {
         )
 
         val RADIO_PROFILES = listOf(
+            RadioProfile(
+                name = "Anos 2000",
+                seed = "anos-2000",
+                genreTokens = emptyList(),
+                yearRange = 2000..2009,
+            ),
             RadioProfile(
                 name = "Rap nacional",
                 seed = "rap-br",

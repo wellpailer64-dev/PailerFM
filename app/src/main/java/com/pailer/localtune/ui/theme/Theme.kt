@@ -5,17 +5,29 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
+// Paleta Pailer FM: cinza escuro, prateado, vermelho e bege claro.
+val PailerCharcoal = Color(0xFF1C1E23)
+val PailerSurface = Color(0xFF24262C)
+val PailerSurfaceHigh = Color(0xFF2C2F36)
+val PailerSurfaceHighest = Color(0xFF343740)
+val PailerGunmetal = Color(0xFF474A50)
+val PailerSilver = Color(0xFFBFC0C2)
+val PailerIvory = Color(0xFFF0E1CF)
+val PailerRed = Color(0xFFB53A2E)
+
 private val LocalTuneColors = darkColorScheme(
-    primary = Color(0xFFFF7A00),
+    primary = PailerRed,
     onPrimary = Color.White,
-    secondary = Color(0xFFFFB25A),
-    tertiary = Color(0xFFFFE0B2),
-    background = Color(0xFF080604),
-    surface = Color(0xFF15100C),
-    surfaceVariant = Color(0xFF2A1B10),
-    onBackground = Color(0xFFF8FAFC),
-    onSurface = Color(0xFFFFF7ED),
-    onSurfaceVariant = Color(0xFFD6C4B0),
+    secondary = PailerSilver,
+    onSecondary = PailerCharcoal,
+    tertiary = PailerIvory,
+    onTertiary = PailerCharcoal,
+    background = PailerCharcoal,
+    surface = PailerSurface,
+    surfaceVariant = PailerGunmetal,
+    onBackground = PailerIvory,
+    onSurface = PailerIvory,
+    onSurfaceVariant = PailerSilver,
 )
 
 @Composable

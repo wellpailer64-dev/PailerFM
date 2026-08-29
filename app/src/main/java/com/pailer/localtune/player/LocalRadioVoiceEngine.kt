@@ -10,6 +10,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import com.pailer.localtune.data.KokoroConfig
 import com.pailer.localtune.data.RadioScript
 import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageConfig
@@ -72,10 +73,11 @@ class LocalRadioVoiceEngine(
         val startedAt = System.currentTimeMillis()
         return runCatching {
             val selectedVits = vitsFor(config, speaker)
-            Log.d(TAG, "loading engine speaker=$speaker model=${selectedVits?.model.orEmpty()}")
+            val selectedKokoro = kokoroFor(config, speaker)
+            Log.d(TAG, "loading engine speaker=$speaker model=${selectedVits?.model.orEmpty()}${selectedKokoro?.model.orEmpty()}")
             val modelConfig = OfflineTtsModelConfig(
                 vits = selectedVits?.let { config.toSherpaVits(it) } ?: OfflineTtsVitsModelConfig(),
-                kokoro = config.kokoro?.let {
+                kokoro = selectedKokoro?.let {
                     OfflineTtsKokoroModelConfig(
                         model = config.path(it.model),
                         voices = config.path(it.voices),
@@ -122,27 +124,70 @@ class LocalRadioVoiceEngine(
         }.getOrNull()
     }
 
+    // "mixed" (ver ADR-014): cada slot roda seu proprio motor (ex.: Frankie em vits/piper,
+    // Nicky em kokoro) - femaleEngine/maleEngine dizem qual config (vits ou kokoro) vale pra
+    // aquele slot. Os demais engines continuam com um unico motor pro pacote inteiro.
+    private fun perSpeakerEngine(config: RadioVoicePackageConfig, speaker: RadioSpeaker): String =
+        if (config.engine == "mixed") {
+            when (speaker) {
+                RadioSpeaker.Female -> config.femaleEngine
+                RadioSpeaker.Male -> config.maleEngine
+            }.orEmpty()
+        } else {
+            config.engine
+        }
+
     private fun vitsFor(config: RadioVoicePackageConfig, speaker: RadioSpeaker): VitsConfig? =
-        when (config.engine) {
+        when (perSpeakerEngine(config, speaker)) {
             "vits-dual", "piper-dual" -> when (speaker) {
                 RadioSpeaker.Female -> config.femaleVits
                 RadioSpeaker.Male -> config.maleVits
             }
+            "vits", "piper" -> if (config.engine == "mixed") {
+                when (speaker) {
+                    RadioSpeaker.Female -> config.femaleVits
+                    RadioSpeaker.Male -> config.maleVits
+                }
+            } else {
+                config.vits
+            }
+            "kokoro" -> null
             else -> config.vits
         }
 
-    private fun speakerIdFor(config: RadioVoicePackageConfig, speaker: RadioSpeaker): Int =
-        when (config.engine) {
-            "vits-dual", "piper-dual" -> 0
+    private fun kokoroFor(config: RadioVoicePackageConfig, speaker: RadioSpeaker): KokoroConfig? =
+        when (perSpeakerEngine(config, speaker)) {
+            "kokoro" -> if (config.engine == "mixed") {
+                when (speaker) {
+                    RadioSpeaker.Female -> config.femaleKokoro
+                    RadioSpeaker.Male -> config.maleKokoro
+                }
+            } else {
+                config.kokoro
+            }
+            "vits", "vits-dual", "piper", "piper-dual" -> null
+            else -> config.kokoro
+        }
+
+    private fun speakerIdFor(config: RadioVoicePackageConfig, speaker: RadioSpeaker): Int {
+        // "vits"/"piper" puro usa femaleSpeakerId/maleSpeakerId porque e UM modelo multi-speaker
+        // compartilhado (ver TTS.md); vits-dual/piper-dual e cada slot do "mixed" em vits/piper
+        // usam sid=0 porque cada slot tem seu proprio arquivo de modelo dedicado.
+        val perSpeaker = perSpeakerEngine(config, speaker)
+        return when {
+            config.engine == "vits-dual" || config.engine == "piper-dual" -> 0
+            config.engine == "mixed" && (perSpeaker == "vits" || perSpeaker == "piper") -> 0
             else -> when (speaker) {
                 RadioSpeaker.Female -> config.femaleSpeakerId
                 RadioSpeaker.Male -> config.maleSpeakerId
             }
         }
+    }
 
     private fun engineKey(config: RadioVoicePackageConfig, speaker: RadioSpeaker): String {
         val vits = vitsFor(config, speaker)
-        return "${config.rootDir.absolutePath}:${config.engine}:${speaker.name}:${vits?.model.orEmpty()}:${config.name}"
+        val kokoro = kokoroFor(config, speaker)
+        return "${config.rootDir.absolutePath}:${config.engine}:${speaker.name}:${vits?.model.orEmpty()}:${kokoro?.model.orEmpty()}:${config.name}"
     }
 
     private fun RadioVoicePackageConfig.toSherpaVits(vits: VitsConfig): OfflineTtsVitsModelConfig =

@@ -46,10 +46,17 @@ do binder thread do `ResultReceiver` e das threads do `MediaPlayer`/TTS sem coor
 | R6 | Intro atrasa até ~1,8 s mesmo com sherpa ativo | espera por `ttsReady` do TTS legado antes de decidir caminho |
 | R7 | Sem TTS do sistema funcional, rádio perde intro/boletim mesmo com pacote sherpa OK | `ttsReady`/`pendingRadioIntro` bloqueiam o fluxo inteiro |
 | R8 | Música fica pausada para sempre se a fala travar (timeout local + TTS legado falhando calado); Media3 rebaixa o serviço e o sistema mata o processo | nenhum caminho garantia chamada a `finishNewsBreak()`/`finishRadioIntro()` |
+| R9 | Boletim nunca mais toca na sessão (sem pausa, sem log, sem fallback) — reportado em radios personalizadas mas não é exclusivo delas | `startRadioNewsMode` carrega `newsBulletins` uma única vez, em paralelo à vinheta; se os 5 feeds RSS falharem todos (rede instável/DNS/feed fora do ar — cada falha é ignorada silenciosamente em `NewsBulletinRepository.loadStories`), a lista fica vazia pro resto da sessão e `speakNextNewsBreak()`/`prepareUpcomingBulletin()` só retornavam cedo, sem tentar de novo |
 
 **Mitigação atual (ADR-009 em [DECISIONS.md](DECISIONS.md)):** watchdog de 90 s com
 token por anúncio força a retomada quando R8 acontece. Correção de raiz é o controller
 da Seção B.
+
+**Mitigação de R9 (29/08/2026):** `speakNextNewsBreak()` e `prepareUpcomingBulletin()`
+agora logam (`PailerRadioVoice`) e chamam `reloadNewsBulletinsIfNeeded()` quando
+`newsBulletins` está vazio, em vez de desistir pro resto da sessão. Não resolve a causa
+(feeds indisponíveis continuam indisponíveis), mas recupera sozinho assim que a rede
+volta e dá rastro pra diagnosticar via logcat.
 
 ---
 

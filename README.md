@@ -22,8 +22,10 @@ Feito em Kotlin, Jetpack Compose e Media3/ExoPlayer.
   fila que evita repetir a sessao anterior.
 - Abertura com vinheta gravada (intro comum + complemento por genero, sem narracao
   falada) antes da primeira musica de cada entrada na radio.
-- Boletins de noticia entre as musicas (RSS do g1), em modo manchete ou dialogo entre
-  locutora e locutor, com duracao configuravel.
+- Boletins de noticia entre as musicas (RSS de g1/Super/Olhar Digital/BBC Brasil), em
+  modo manchete ou bate-bola entre Frankie (otimista) e Nicky (pessimista), duas vozes
+  masculinas com humor acido, opinando de verdade sobre a materia lida - com duracao
+  configuravel.
 - Vozes locais offline via sherpa-onnx (VITS/Piper/Kokoro/Supertonic) rodando em processo
   separado (`:radio_voice`); pacote .zip de vozes instalavel pela UI. Fallback para o
   TTS do sistema quando nao ha pacote ativo.

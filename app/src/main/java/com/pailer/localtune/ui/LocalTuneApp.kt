@@ -27,6 +27,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,6 +52,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -70,6 +72,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
@@ -100,6 +103,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -122,12 +126,17 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -140,18 +149,33 @@ import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
+import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.PendingTagChange
-import com.pailer.localtune.data.RadioBulletinDuration
 import com.pailer.localtune.data.RadioBulletinMode
 import com.pailer.localtune.player.LocalTuneViewModel
+import com.pailer.localtune.player.AlbumArtworkUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
 import com.pailer.localtune.player.RadioBulletinUiState
 import com.pailer.localtune.player.RadioVoiceUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
+import com.pailer.localtune.ui.theme.PailerCharcoal
+import com.pailer.localtune.ui.theme.PailerGunmetal
+import com.pailer.localtune.ui.theme.PailerRed
+import com.pailer.localtune.ui.theme.PailerSilver
+import com.pailer.localtune.ui.theme.PailerSurface
+import com.pailer.localtune.ui.theme.PailerSurfaceHigh
+import com.pailer.localtune.ui.theme.PailerSurfaceHighest
+import com.pailer.localtune.util.DayPeriod
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.LocalTime
 
 private enum class LibraryTab(val label: String) {
     Home("Inicio"),
@@ -169,6 +193,7 @@ private enum class SettingsPage {
     TagWriter,
     Artists,
     RadioBulletins,
+    AlbumArtwork,
 }
 
 @Composable
@@ -235,7 +260,7 @@ private fun PermissionGate(onGrant: () -> Unit) {
             )
             Spacer(Modifier.height(28.dp))
             Text(
-                text = "Pailer Player",
+                text = "Pailer FM",
                 style = MaterialTheme.typography.headlineLarge,
                 fontWeight = FontWeight.Black,
                 color = MaterialTheme.colorScheme.onBackground,
@@ -287,6 +312,28 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             viewModel.writePendingTagsToMediaStore()
         }
     }
+    var pendingArtworkAlbum by remember { mutableStateOf<LocalAlbum?>(null) }
+    val artworkWriteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        val album = pendingArtworkAlbum
+        pendingArtworkAlbum = null
+        if (result.resultCode == Activity.RESULT_OK && album != null) {
+            viewModel.applyPendingArtwork(album)
+        } else {
+            viewModel.cancelArtworkApply()
+        }
+    }
+    val requestApplyArtwork = { album: LocalAlbum ->
+        pendingArtworkAlbum = album
+        val request = viewModel.createArtworkApplyRequest(album)
+        if (request != null) {
+            artworkWriteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+        } else {
+            pendingArtworkAlbum = null
+            viewModel.applyPendingArtwork(album)
+        }
+    }
     val deleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
@@ -313,6 +360,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val content = viewModel.libraryContentState.value
     val player = viewModel.playerState.value
     val metadata = viewModel.metadataState.value
+    val albumArtwork = viewModel.albumArtworkState.value
+    LaunchedEffect(albumArtwork.appliedVersion) {
+        // A Uri de albumart nao muda quando a capa embutida no arquivo muda - sem isso o app
+        // continuaria mostrando o bitmap antigo (ou o placeholder) ate reiniciar.
+        if (albumArtwork.appliedVersion > 0) artworkMemoryCache.evictAll()
+    }
     val radioBulletins = viewModel.radioBulletinState.value
     val radioVoice = viewModel.radioVoiceState.value
     val songs = content.songs
@@ -382,7 +435,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     }
                     NavigationBar(
                         modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
-                        containerColor = Color(0xF015100C),
+                        containerColor = PailerSurface.copy(alpha = 0.94f),
                     ) {
                         LibraryTab.entries.forEach { tab ->
                             NavigationBarItem(
@@ -418,14 +471,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     .windowInsetsPadding(WindowInsets.statusBars),
             ) {
                 LibraryHeader(
-                    selectedTab = selectedTab,
-                    titleOverride = when {
-                        selectedAlbum != null -> "Album"
-                        selectedArtist != null -> "Artista"
-                        selectedRadio != null -> "Radio"
-                        selectedGenre != null -> "Categoria"
-                        else -> null
-                    },
                     query = library.query,
                     isLoading = library.isLoading,
                     onQueryChange = viewModel::setQuery,
@@ -433,7 +478,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         settingsPage = SettingsPage.Main
                         showSettings = true
                     },
-                    showSearch = selectedTab != LibraryTab.Playlists,
                 )
 
                 val openedAlbum = selectedAlbum
@@ -459,6 +503,13 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             selectedAlbum = viewModel.saveAlbumMetadataEdit(openedAlbum, title, artistName, genre)
                             requestRecentMetadataEditWrite()
                         },
+                        onCreateRadio = { viewModel.createRadioFromAlbum(openedAlbum) },
+                        albumArtwork = albumArtwork,
+                        onOpenArtworkSearch = { viewModel.openArtworkSearch(openedAlbum) },
+                        onCloseArtworkSearch = viewModel::closeArtworkSearch,
+                        onSelectArtworkCandidate = viewModel::selectArtworkCandidate,
+                        onApplyArtwork = requestApplyArtwork,
+                        currentlyPlayingSongId = player.songId,
                     )
                     openedArtist != null -> ArtistDetailScreen(
                         artist = openedArtist,
@@ -473,6 +524,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             selectedArtist = viewModel.saveArtistMetadataEdits(openedArtist, artistName, edits)
                             requestRecentMetadataEditWrite()
                         },
+                        onCreateRadio = { viewModel.createRadioFromArtist(openedArtist) },
                     )
                     openedRadio != null -> RadioDetailScreen(
                         radio = openedRadio,
@@ -499,12 +551,20 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         },
                         onPlaySong = { index -> viewModel.playRadioSession(radioSession, openedRadio.name, startIndex = index) },
                         onOpenPlayer = { showFullPlayer = true },
+                        onDeleteRadio = {
+                            viewModel.deleteRadio(openedRadio)
+                            radioSession = emptyList()
+                            selectedRadio = null
+                            isGeneratingRadio = false
+                        },
                     )
                     openedGenre != null -> GenreDetailScreen(
                         genre = openedGenre,
                         artists = openedGenreArtists,
                         onOpenArtist = { selectedArtist = it },
+                        onPlayGenre = { viewModel.playSongs(openedGenre.songs, source = "Categoria ${openedGenre.name}") },
                         onShuffleGenre = { viewModel.playSongs(openedGenre.songs, shuffle = true, source = "Mix da categoria ${openedGenre.name}") },
+                        onCreateRadio = { viewModel.createRadioFromGenre(openedGenre) },
                     )
                     selectedTab == LibraryTab.Home -> HomeScreen(
                         songs = songs,
@@ -550,6 +610,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             selectedGenre = it
                         },
                         onOpenPlayer = { showFullPlayer = true },
+                        showGifBanner = false,
                     )
                     selectedTab == LibraryTab.Playlists -> PlaylistsScreen(
                         radios = radios,
@@ -569,6 +630,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             visible = showSettings,
             page = settingsPage,
             metadata = metadata,
+            albumArtwork = albumArtwork,
             radioBulletins = radioBulletins,
             radioVoice = radioVoice,
             batteryProtected = viewModel.isIgnoringBatteryOptimizations(),
@@ -588,15 +650,22 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onScanPendingTagWrites = viewModel::scanPendingTagWrites,
             onScanArtists = viewModel::scanDuplicateArtists,
             onUnifyArtist = viewModel::unifyArtistGroup,
+            onScanAlbumArtwork = viewModel::scanAlbumsWithoutArtwork,
+            onOpenArtworkSearch = viewModel::openArtworkSearch,
+            onCloseArtworkSearch = viewModel::closeArtworkSearch,
+            onSelectArtworkCandidate = viewModel::selectArtworkCandidate,
+            onApplyArtwork = requestApplyArtwork,
             onSetRadioBulletinMode = viewModel::setRadioBulletinMode,
-            onSetRadioBulletinDuration = viewModel::setRadioBulletinDuration,
             onSetRadioBulletinPreferLocalWriter = viewModel::setRadioBulletinPreferLocalWriter,
             onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
             onTestRadioVoicePackage = viewModel::testRadioVoicePackage,
             onTestRadioBulletin = viewModel::testRadioBulletin,
+            onReplayTestAudio = viewModel::replayLastTestAudio,
             onTestAndroidVoice = viewModel::testAndroidVoiceBulletin,
+            hasHiddenRadios = viewModel.hasHiddenRadios(),
+            onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
         )
 
         pendingDeleteSong?.let { song ->
@@ -634,6 +703,13 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         }
 
         if (showFullPlayer) {
+            val playingAlbum = remember(player.songId, songs, albums) {
+                songs.firstOrNull { it.id == player.songId }
+                    ?.let { song -> albums.firstOrNull { it.id == song.albumId } }
+            }
+            val playingArtist = remember(player.artist, artists) {
+                artists.firstOrNull { it.key == player.artist.trim().lowercase() }
+            }
             FullPlayer(
                 player = player,
                 isFavorite = viewModel.isCurrentSongFavorite(),
@@ -645,6 +721,20 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 onShuffle = viewModel::toggleShuffle,
                 onRepeat = viewModel::cycleRepeat,
                 onSeek = viewModel::seekTo,
+                albumSongs = playingAlbum?.songs.orEmpty(),
+                onOpenAlbum = playingAlbum?.let { album ->
+                    { showFullPlayer = false; selectedAlbum = album }
+                },
+                onOpenArtist = playingArtist?.let { artist ->
+                    { showFullPlayer = false; selectedArtist = artist }
+                },
+                isAlbumSongFavorite = viewModel::isSongFavorite,
+                onToggleAlbumSongFavorite = viewModel::toggleSongFavorite,
+                onPlayAlbumSong = { song ->
+                    playingAlbum?.let { album ->
+                        viewModel.playSongs(album.songs, album.songs.indexOf(song), source = "Álbum ${album.title}")
+                    }
+                },
             )
         }
     }
@@ -652,70 +742,89 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
 
 @Composable
 private fun LibraryHeader(
-    selectedTab: LibraryTab,
-    titleOverride: String? = null,
     query: String,
     isLoading: Boolean,
     onQueryChange: (String) -> Unit,
     onSettings: () -> Unit,
     showSearch: Boolean = true,
 ) {
-    Column(Modifier.padding(horizontal = 18.dp, vertical = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(
-                painter = painterResource(R.drawable.pailer_logo),
-                contentDescription = null,
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(9.dp)),
-                contentScale = ContentScale.Crop,
-            )
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Pailer Player",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
-                Text(
-                    text = titleOverride ?: selectedTab.label,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            IconButton(onClick = onSettings, enabled = !isLoading) {
-                Icon(
-                    Icons.Filled.Settings,
-                    contentDescription = "Configuracoes",
-                    tint = MaterialTheme.colorScheme.onBackground,
-                )
-            }
-        }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Image(
+            painter = painterResource(R.drawable.pailer_logo),
+            contentDescription = null,
+            modifier = Modifier
+                .size(26.dp)
+                .clip(RoundedCornerShape(7.dp)),
+            contentScale = ContentScale.Crop,
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            buildAnnotatedString {
+                append("Pailer ")
+                withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary)) { append("FM") }
+            },
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 1,
+        )
         if (showSearch) {
-            TextField(
-                value = query,
-                onValueChange = onQueryChange,
+            Spacer(Modifier.width(10.dp))
+            Row(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 10.dp),
-                singleLine = true,
-                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                placeholder = { Text("Buscar musicas, artistas e albuns") },
-                shape = RoundedCornerShape(18.dp),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = MaterialTheme.colorScheme.surface,
-                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                    focusedTextColor = MaterialTheme.colorScheme.onBackground,
-                    unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
-                    cursorColor = MaterialTheme.colorScheme.primary,
-                    focusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    unfocusedLeadingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                ),
+                    .weight(1f)
+                    .height(34.dp)
+                    .clip(RoundedCornerShape(17.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Search,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(6.dp))
+                Box(Modifier.weight(1f)) {
+                    if (query.isEmpty()) {
+                        Text(
+                            "Buscar",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    BasicTextField(
+                        value = query,
+                        onValueChange = onQueryChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodySmall.copy(
+                            color = MaterialTheme.colorScheme.onBackground,
+                        ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    )
+                }
+            }
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
+        Spacer(Modifier.width(4.dp))
+        IconButton(
+            onClick = onSettings,
+            enabled = !isLoading,
+            modifier = Modifier.size(36.dp),
+        ) {
+            Icon(
+                Icons.Filled.Settings,
+                contentDescription = "Configuracoes",
+                tint = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.size(20.dp),
             )
         }
     }
@@ -726,6 +835,7 @@ private fun SettingsDrawer(
     visible: Boolean,
     page: SettingsPage,
     metadata: MetadataUiState,
+    albumArtwork: AlbumArtworkUiState,
     radioBulletins: RadioBulletinUiState,
     radioVoice: RadioVoiceUiState,
     batteryProtected: Boolean,
@@ -741,15 +851,22 @@ private fun SettingsDrawer(
     onScanPendingTagWrites: () -> Unit,
     onScanArtists: () -> Unit,
     onUnifyArtist: (DuplicateArtistGroup) -> Unit,
+    onScanAlbumArtwork: () -> Unit,
+    onOpenArtworkSearch: (LocalAlbum) -> Unit,
+    onCloseArtworkSearch: () -> Unit,
+    onSelectArtworkCandidate: (ArtworkCandidate) -> Unit,
+    onApplyArtwork: (LocalAlbum) -> Unit,
     onSetRadioBulletinMode: (RadioBulletinMode) -> Unit,
-    onSetRadioBulletinDuration: (RadioBulletinDuration) -> Unit,
     onSetRadioBulletinPreferLocalWriter: (Boolean) -> Unit,
     onImportRadioVoicePackage: () -> Unit,
     onClearRadioVoicePackage: () -> Unit,
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
     onTestRadioVoicePackage: () -> Unit,
     onTestRadioBulletin: () -> Unit,
+    onReplayTestAudio: () -> Unit,
     onTestAndroidVoice: () -> Unit,
+    hasHiddenRadios: Boolean = false,
+    onRestoreHiddenRadios: () -> Unit = {},
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -775,7 +892,7 @@ private fun SettingsDrawer(
                     modifier = Modifier
                         .fillMaxHeight()
                         .widthIn(min = 320.dp, max = 390.dp),
-                    color = Color(0xFF120D09),
+                    color = PailerSurfaceHigh,
                     tonalElevation = 8.dp,
                 ) {
                     when (page) {
@@ -803,6 +920,12 @@ private fun SettingsDrawer(
                             onOpenRadioBulletins = {
                                 onPageChange(SettingsPage.RadioBulletins)
                             },
+                            onOpenAlbumArtwork = {
+                                onPageChange(SettingsPage.AlbumArtwork)
+                                onScanAlbumArtwork()
+                            },
+                            hasHiddenRadios = hasHiddenRadios,
+                            onRestoreHiddenRadios = onRestoreHiddenRadios,
                         )
                         SettingsPage.Metadata -> MetadataSettingsPanel(
                             metadata = metadata,
@@ -833,14 +956,23 @@ private fun SettingsDrawer(
                             radioVoice = radioVoice,
                             onBack = { onPageChange(SettingsPage.Main) },
                             onSetMode = onSetRadioBulletinMode,
-                            onSetDuration = onSetRadioBulletinDuration,
                             onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
                             onImportVoicePackage = onImportRadioVoicePackage,
                             onClearVoicePackage = onClearRadioVoicePackage,
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
                             onTestVoicePackage = onTestRadioVoicePackage,
                             onTestRadioBulletin = onTestRadioBulletin,
+                            onReplayTestAudio = onReplayTestAudio,
                             onTestAndroidVoice = onTestAndroidVoice,
+                        )
+                        SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
+                            state = albumArtwork,
+                            onBack = { onPageChange(SettingsPage.Main) },
+                            onScan = onScanAlbumArtwork,
+                            onOpenSearch = onOpenArtworkSearch,
+                            onCloseSearch = onCloseArtworkSearch,
+                            onSelectCandidate = onSelectArtworkCandidate,
+                            onApply = onApplyArtwork,
                         )
                     }
                 }
@@ -860,6 +992,9 @@ private fun SettingsMainPanel(
     onOpenTagWriter: () -> Unit,
     onOpenArtists: () -> Unit,
     onOpenRadioBulletins: () -> Unit,
+    onOpenAlbumArtwork: () -> Unit,
+    hasHiddenRadios: Boolean = false,
+    onRestoreHiddenRadios: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -930,6 +1065,22 @@ private fun SettingsMainPanel(
             icon = Icons.Filled.Person,
             onClick = onOpenArtists,
         )
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        SettingsActionRow(
+            title = "Corrigir capas",
+            subtitle = "Buscar capa na internet pros albuns sem imagem",
+            icon = Icons.Filled.Image,
+            onClick = onOpenAlbumArtwork,
+        )
+        if (hasHiddenRadios) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Restaurar radios ocultas",
+                subtitle = "Traz de volta as radios de perfil/genero que voce apagou",
+                icon = Icons.Filled.Sync,
+                onClick = onRestoreHiddenRadios,
+            )
+        }
     }
 }
 
@@ -939,13 +1090,13 @@ private fun RadioBulletinSettingsPanel(
     radioVoice: RadioVoiceUiState,
     onBack: () -> Unit,
     onSetMode: (RadioBulletinMode) -> Unit,
-    onSetDuration: (RadioBulletinDuration) -> Unit,
     onSetPreferLocalWriter: (Boolean) -> Unit,
     onImportVoicePackage: () -> Unit,
     onClearVoicePackage: () -> Unit,
     onSetVoiceEnabled: (Boolean) -> Unit,
     onTestVoicePackage: () -> Unit,
     onTestRadioBulletin: () -> Unit,
+    onReplayTestAudio: () -> Unit,
     onTestAndroidVoice: () -> Unit,
 ) {
     val settings = radioBulletins.settings
@@ -1004,32 +1155,6 @@ private fun RadioBulletinSettingsPanel(
         )
 
         Spacer(Modifier.height(18.dp))
-        Text("Duracao", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-        ) {
-            RadioBulletinDuration.entries.forEach { duration ->
-                TextButton(
-                    onClick = { onSetDuration(duration) },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(
-                        text = duration.radioLabel(),
-                        color = if (settings.duration == duration) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        fontWeight = if (settings.duration == duration) FontWeight.Bold else FontWeight.Normal,
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(18.dp))
         Text("Redator local", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
         RadioBulletinChoiceRow(
             title = radioBulletins.localWriterName,
@@ -1055,7 +1180,7 @@ private fun RadioBulletinSettingsPanel(
         Spacer(Modifier.height(8.dp))
         Surface(
             modifier = Modifier.fillMaxWidth(),
-            color = Color(0xE51B120C),
+            color = PailerSurface.copy(alpha = 0.9f),
             shape = RoundedCornerShape(8.dp),
         ) {
             Column(Modifier.padding(12.dp)) {
@@ -1151,6 +1276,11 @@ private fun RadioBulletinSettingsPanel(
                             Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
+                    if (radioVoice.canReplayTest) {
+                        TextButton(onClick = onReplayTestAudio) {
+                            Text("Tocar de novo", color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
                 }
             }
         }
@@ -1215,12 +1345,6 @@ private fun RadioBulletinChoiceRow(
             Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
     }
-}
-
-private fun RadioBulletinDuration.radioLabel(): String = when (this) {
-    RadioBulletinDuration.Short -> "Curta"
-    RadioBulletinDuration.Normal -> "Normal"
-    RadioBulletinDuration.Long -> "Longa"
 }
 
 @Composable
@@ -1353,6 +1477,268 @@ private fun AlbumArtistCleanupSettingsPanel(
 }
 
 @Composable
+private fun AlbumArtworkSettingsPanel(
+    state: AlbumArtworkUiState,
+    onBack: () -> Unit,
+    onScan: () -> Unit,
+    onOpenSearch: (LocalAlbum) -> Unit,
+    onCloseSearch: () -> Unit,
+    onSelectCandidate: (ArtworkCandidate) -> Unit,
+    onApply: (LocalAlbum) -> Unit,
+) {
+    val activeAlbum = state.albumsWithoutArtwork.firstOrNull { it.key == state.activeAlbumKey }
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(horizontal = 18.dp, vertical = 22.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+                }
+                Text(
+                    "Corrigir capas",
+                    modifier = Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Text(
+                state.message ?: "${state.albumsWithoutArtwork.size} albuns sem capa",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = onScan,
+                enabled = !state.isScanning,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (state.isScanning) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(if (state.isScanning) "Procurando..." else "Varrer albuns")
+            }
+            Spacer(Modifier.height(16.dp))
+            if (state.albumsWithoutArtwork.isEmpty() && !state.isScanning) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        "Nenhum album sem capa.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    contentPadding = PaddingValues(bottom = 24.dp),
+                ) {
+                    items(state.albumsWithoutArtwork, key = { it.key }) { album ->
+                        RowItem(
+                            title = album.title,
+                            subtitle = album.artist,
+                            icon = { ArtworkBox(album.artworkUri, Modifier.size(52.dp)) },
+                            onClick = { onOpenSearch(album) },
+                            trailing = {
+                                TextButton(onClick = { onOpenSearch(album) }) {
+                                    Text("Corrigir")
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        if (activeAlbum != null) {
+            ArtworkSearchOverlay(
+                album = activeAlbum,
+                state = state,
+                onCancel = onCloseSearch,
+                onSelectCandidate = onSelectCandidate,
+                onApply = { onApply(activeAlbum) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArtworkSearchOverlay(
+    album: LocalAlbum,
+    state: AlbumArtworkUiState,
+    onCancel: () -> Unit,
+    onSelectCandidate: (ArtworkCandidate) -> Unit,
+    onApply: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.58f)),
+    ) {
+        Surface(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(18.dp)
+                .fillMaxWidth(),
+            color = PailerSurfaceHigh,
+            shape = RoundedCornerShape(8.dp),
+            tonalElevation = 10.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        album.title,
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onBackground,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = onCancel) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancelar", tint = MaterialTheme.colorScheme.onBackground)
+                    }
+                }
+                when {
+                    state.isSearching -> Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 24.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                    state.candidates.isEmpty() -> Text(
+                        "Nenhuma capa encontrada pra essa busca.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    else -> LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        items(state.candidates, key = { it.previewUrl }) { candidate ->
+                            val selected = candidate == state.selectedCandidate
+                            Column(
+                                modifier = Modifier
+                                    .width(84.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onSelectCandidate(candidate) },
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .then(
+                                            if (selected) {
+                                                Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f))
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
+                                        .padding(if (selected) 3.dp else 0.dp),
+                                ) {
+                                    NetworkThumbnail(url = candidate.previewUrl, modifier = Modifier.fillMaxSize())
+                                }
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    candidate.label,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (state.isDownloadingSelection) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Baixando capa escolhida...",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    TextButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                        Text("Cancelar")
+                    }
+                    Button(
+                        onClick = onApply,
+                        enabled = state.selectedCandidate != null && !state.isDownloadingSelection && !state.isApplying,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        if (state.isApplying) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(if (state.isApplying) "Gravando..." else "Aplicar")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NetworkThumbnail(url: String, modifier: Modifier = Modifier) {
+    var image by remember(url) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var failed by remember(url) { mutableStateOf(false) }
+    LaunchedEffect(url) {
+        val bitmap = withContext(Dispatchers.IO) { loadNetworkThumbnail(url) }
+        if (bitmap != null) image = bitmap else failed = true
+    }
+    val currentImage = image
+    when {
+        currentImage != null -> Image(
+            bitmap = currentImage,
+            contentDescription = null,
+            modifier = modifier.clip(RoundedCornerShape(6.dp)),
+            contentScale = ContentScale.Crop,
+        )
+        failed -> ArtworkPlaceholder(modifier = modifier, iconModifier = Modifier.size(20.dp))
+        else -> Box(modifier, contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
+private fun loadNetworkThumbnail(url: String): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val connection = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 6000
+            readTimeout = 6000
+            requestMethod = "GET"
+        }
+        val bytes = connection.inputStream.use { it.readBytes() }
+        connection.disconnect()
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }.getOrNull()
+
+@Composable
 private fun TagWriterSettingsPanel(
     metadata: MetadataUiState,
     onBack: () -> Unit,
@@ -1400,7 +1786,7 @@ private fun TagWriterSettingsPanel(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0x9922160F))
+                        .background(PailerGunmetal.copy(alpha = 0.6f))
                         .padding(12.dp),
                 ) {
                     Text(
@@ -1521,7 +1907,7 @@ private fun DuplicateArtistRow(group: DuplicateArtistGroup, onUnify: () -> Unit)
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xE51B120C))
+            .background(PailerSurface.copy(alpha = 0.9f))
             .padding(12.dp),
     ) {
         Text(
@@ -1561,7 +1947,7 @@ private fun PendingTagChangeRow(change: PendingTagChange) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xE51B120C))
+            .background(PailerSurface.copy(alpha = 0.9f))
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1587,7 +1973,7 @@ private fun PendingTagChangeRow(change: PendingTagChange) {
             change.fields.forEach { field ->
                 Text(
                     field,
-                    color = Color(0xFFFF7A1A),
+                    color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.bodySmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -1620,7 +2006,7 @@ private fun AlbumArtistReviewCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xE51B120C))
+            .background(PailerSurface.copy(alpha = 0.9f))
             .padding(14.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -1713,7 +2099,7 @@ private fun MetadataReviewCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xE51B120C))
+            .background(PailerSurface.copy(alpha = 0.9f))
             .padding(14.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -1821,10 +2207,10 @@ private fun HomeScreen(
     val homeListenAgain = remember(listenAgain) { listenAgain.take(8) }
     val homeSuggestedAlbums = remember(suggestedAlbums) { suggestedAlbums.take(6) }
     val homeFavoriteAlbums = remember(favoriteAlbums) { favoriteAlbums.take(6) }
-    val homeRadios = remember(radios) { radios.take(5) }
+    val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
 
     LazyColumn(contentPadding = PaddingValues(bottom = 18.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        if (player.activeRadioName.isNotBlank() && player.hasMedia) {
+        if (radioIsActive) {
             item {
                 LiveNowRadioCard(
                     player = player,
@@ -1833,7 +2219,9 @@ private fun HomeScreen(
                 )
             }
         }
-        if (continueSong != null) {
+        // So mostra "Continuar ouvindo" quando nao ha radio tocando - com a radio ativa o
+        // card "ao vivo" acima ja ocupa esse espaco (pedido do usuario).
+        if (continueSong != null && !radioIsActive) {
             item {
                 ContinueListeningCard(
                     song = continueSong,
@@ -1845,7 +2233,23 @@ private fun HomeScreen(
         }
         item {
             SectionTitle("Albuns adicionados recentemente", modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp))
+            val recentAlbumsListState = rememberLazyListState()
+            // Carrossel automatico bem lento, avancando uma capa por vez - pausa longa entre
+            // cada passo em vez de animacao de deslize lenta (LazyListState.animateScrollToItem
+            // nao expoe duracao customizavel), da o mesmo efeito de "passeando" pelas capas.
+            LaunchedEffect(homeRecentAlbums) {
+                if (homeRecentAlbums.size > 1) {
+                    while (true) {
+                        delay(4500)
+                        if (!recentAlbumsListState.isScrollInProgress) {
+                            val next = (recentAlbumsListState.firstVisibleItemIndex + 1) % homeRecentAlbums.size
+                            recentAlbumsListState.animateScrollToItem(next)
+                        }
+                    }
+                }
+            }
             LazyRow(
+                state = recentAlbumsListState,
                 contentPadding = PaddingValues(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -1914,14 +2318,6 @@ private fun HomeScreen(
                 )
             }
         }
-        item {
-            SectionTitle("Radios rapidas", modifier = Modifier.padding(horizontal = 18.dp))
-            Column(Modifier.padding(horizontal = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                homeRadios.forEach { radio ->
-                    RadioRow(radio = radio, onClick = { onOpenRadio(radio) })
-                }
-            }
-        }
         item { SectionTitle("Novas no aparelho", modifier = Modifier.padding(horizontal = 18.dp)) }
         items(songs.take(8), key = { it.id }) { song ->
             Box(Modifier.padding(horizontal = 10.dp)) {
@@ -1958,8 +2354,11 @@ private fun GenreDetailScreen(
     genre: LocalRadio,
     artists: List<LocalArtist>,
     onOpenArtist: (LocalArtist) -> Unit,
+    onPlayGenre: () -> Unit,
     onShuffleGenre: () -> Unit,
+    onCreateRadio: () -> Unit = {},
 ) {
+    var showCreateRadioConfirm by rememberSaveable(genre.name) { mutableStateOf(false) }
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
@@ -1979,10 +2378,52 @@ private fun GenreDetailScreen(
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
                 )
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = onShuffleGenre, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Filled.Shuffle, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Misturar categoria")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(
+                        onClick = onPlayGenre,
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
+                    ) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = "Tocar categoria",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = onShuffleGenre,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.Shuffle,
+                            contentDescription = "Misturar categoria",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = { showCreateRadioConfirm = true },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.PlaylistPlay,
+                            contentDescription = "Criar radio desta categoria",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
             }
@@ -1993,6 +2434,24 @@ private fun GenreDetailScreen(
                 onClick = { onOpenArtist(artist) },
             )
         }
+    }
+    if (showCreateRadioConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCreateRadioConfirm = false },
+            icon = { Icon(Icons.Filled.PlaylistPlay, contentDescription = null) },
+            title = { Text("Criar radio") },
+            text = { Text("Criar uma radio a partir da categoria \"${genre.name}\"?") },
+            confirmButton = {
+                TextButton(onClick = { showCreateRadioConfirm = false; onCreateRadio() }) {
+                    Text("Sim")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateRadioConfirm = false }) {
+                    Text("Cancelar")
+                }
+            },
+        )
     }
 }
 
@@ -2007,8 +2466,9 @@ private fun ArtistDetailScreen(
     onShuffleArtist: () -> Unit,
     availableGenres: List<String>,
     onSaveMetadata: (String, List<AlbumMetadataEdit>) -> Unit,
+    onCreateRadio: () -> Unit = {},
 ) {
-    val artworkUri = artist.songs.firstOrNull { it.artworkUri != null }?.artworkUri
+    val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
     var showEditor by rememberSaveable(artist.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
         LazyVerticalGrid(
@@ -2046,7 +2506,8 @@ private fun ArtistDetailScreen(
             item(span = { GridItemSpan(maxLineSpan) }) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     ArtworkBox(
-                        uri = artworkUri,
+                        uri = artworkSong?.artworkUri,
+                        embeddedSourceUri = artworkSong?.contentUri,
                         modifier = Modifier
                             .fillMaxWidth(0.62f)
                             .aspectRatio(1f),
@@ -2071,6 +2532,12 @@ private fun ArtistDetailScreen(
                         Icon(Icons.Filled.Shuffle, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Misturar artista")
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onCreateRadio, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Filled.PlaylistPlay, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Criar radio deste artista")
                     }
                 }
             }
@@ -2137,7 +2604,7 @@ private fun ArtistMetadataEditorOverlay(
                 .padding(18.dp)
                 .fillMaxWidth()
                 .heightIn(max = 640.dp),
-            color = Color(0xFF140E0A),
+            color = PailerSurfaceHigh,
             shape = RoundedCornerShape(8.dp),
             tonalElevation = 10.dp,
         ) {
@@ -2181,7 +2648,7 @@ private fun ArtistMetadataEditorOverlay(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xE51B120C))
+                            .background(PailerSurface.copy(alpha = 0.9f))
                             .padding(12.dp),
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2272,8 +2739,8 @@ private fun MetadataTextField(
         },
         shape = RoundedCornerShape(8.dp),
         colors = TextFieldDefaults.colors(
-            focusedContainerColor = Color(0xFF24170F),
-            unfocusedContainerColor = Color(0xFF24170F),
+            focusedContainerColor = PailerSurfaceHighest,
+            unfocusedContainerColor = PailerSurfaceHighest,
             focusedTextColor = MaterialTheme.colorScheme.onBackground,
             unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
             cursorColor = MaterialTheme.colorScheme.primary,
@@ -2322,8 +2789,16 @@ private fun AlbumDetailScreen(
     onToggleSongFavorite: (LocalSong) -> Unit,
     availableGenres: List<String>,
     onSaveMetadata: (String, String, String) -> Unit,
+    onCreateRadio: () -> Unit = {},
+    albumArtwork: AlbumArtworkUiState = AlbumArtworkUiState(),
+    onOpenArtworkSearch: () -> Unit = {},
+    onCloseArtworkSearch: () -> Unit = {},
+    onSelectArtworkCandidate: (ArtworkCandidate) -> Unit = {},
+    onApplyArtwork: (LocalAlbum) -> Unit = {},
+    currentlyPlayingSongId: Long? = null,
 ) {
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
+    var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
@@ -2356,14 +2831,43 @@ private fun AlbumDetailScreen(
                 }
             }
             item {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    ArtworkBox(
-                        uri = album.artworkUri,
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth(0.72f)
-                            .aspectRatio(1f),
-                        iconModifier = Modifier.size(64.dp),
-                    )
+                            .aspectRatio(1f)
+                            .clip(RoundedCornerShape(8.dp)),
+                    ) {
+                        if (album.isVariousArtists) {
+                            AlbumCoverMosaic(
+                                songs = album.songs,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            ArtworkBox(
+                                uri = album.artworkUri,
+                                modifier = Modifier.fillMaxSize(),
+                                iconModifier = Modifier.size(64.dp),
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .fillMaxHeight(0.22f)
+                                .background(
+                                    Brush.verticalGradient(
+                                        colors = listOf(
+                                            Color.Transparent,
+                                            PailerCharcoal.copy(alpha = 0.55f),
+                                        ),
+                                    ),
+                                ),
+                        )
+                    }
                     Spacer(Modifier.height(18.dp))
                     Text(
                         album.title,
@@ -2388,22 +2892,51 @@ private fun AlbumDetailScreen(
                 }
             }
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(
                         onClick = onPlayAlbum,
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
                     ) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Tocar")
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = "Tocar album",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                        )
                     }
-                    Button(
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
                         onClick = onShuffleAlbum,
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
                     ) {
-                        Icon(Icons.Filled.Shuffle, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Misturar")
+                        Icon(
+                            Icons.Filled.Shuffle,
+                            contentDescription = "Misturar album",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = { showCreateRadioConfirm = true },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.PlaylistPlay,
+                            contentDescription = "Criar radio deste album",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
                     }
                 }
             }
@@ -2415,6 +2948,8 @@ private fun AlbumDetailScreen(
                     isFavorite = isSongFavorite(song),
                     onClick = { onPlaySong(index) },
                     onToggleFavorite = { onToggleSongFavorite(song) },
+                    isPlaying = song.id == currentlyPlayingSongId,
+                    showArtwork = album.isVariousArtists,
                 )
             }
         }
@@ -2428,6 +2963,37 @@ private fun AlbumDetailScreen(
                     onSaveMetadata(title, artistName, genre)
                     showEditor = false
                 },
+                onFixArtwork = {
+                    showEditor = false
+                    onOpenArtworkSearch()
+                },
+            )
+        }
+        if (albumArtwork.activeAlbumKey == album.key) {
+            ArtworkSearchOverlay(
+                album = album,
+                state = albumArtwork,
+                onCancel = onCloseArtworkSearch,
+                onSelectCandidate = onSelectArtworkCandidate,
+                onApply = { onApplyArtwork(album) },
+            )
+        }
+        if (showCreateRadioConfirm) {
+            AlertDialog(
+                onDismissRequest = { showCreateRadioConfirm = false },
+                icon = { Icon(Icons.Filled.PlaylistPlay, contentDescription = null) },
+                title = { Text("Criar radio") },
+                text = { Text("Criar uma radio a partir do album \"${album.title}\"?") },
+                confirmButton = {
+                    TextButton(onClick = { showCreateRadioConfirm = false; onCreateRadio() }) {
+                        Text("Sim")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showCreateRadioConfirm = false }) {
+                        Text("Cancelar")
+                    }
+                },
             )
         }
     }
@@ -2439,6 +3005,7 @@ private fun AlbumMetadataEditorOverlay(
     availableGenres: List<String>,
     onCancel: () -> Unit,
     onSave: (String, String, String) -> Unit,
+    onFixArtwork: () -> Unit = {},
 ) {
     var title by remember(album.key) { mutableStateOf(album.title) }
     var artist by remember(album.key) { mutableStateOf(album.artist) }
@@ -2454,7 +3021,7 @@ private fun AlbumMetadataEditorOverlay(
                 .align(Alignment.Center)
                 .padding(18.dp)
                 .fillMaxWidth(),
-            color = Color(0xFF140E0A),
+            color = PailerSurfaceHigh,
             shape = RoundedCornerShape(8.dp),
             tonalElevation = 10.dp,
         ) {
@@ -2482,6 +3049,11 @@ private fun AlbumMetadataEditorOverlay(
                     label = "Genero",
                     placeholder = availableGenres.take(4).joinToString(" / "),
                 )
+                OutlinedButton(onClick = onFixArtwork, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Image, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Corrigir capa")
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -2508,28 +3080,57 @@ private fun AlbumTrackRow(
     isFavorite: Boolean,
     onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
+    isPlaying: Boolean = false,
+    // So pra albuns "various artists" (LocalAlbum.isVariousArtists) - mostra a capa
+    // EMBUTIDA de cada faixa em vez do numero, porque o album inteiro compartilha uma unica
+    // capa de MediaStore que nao representa a faixa individual.
+    showArtwork: Boolean = false,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
+            .then(
+                if (isPlaying) {
+                    Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
+                } else {
+                    Modifier
+                }
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            trackNumber.toString(),
-            modifier = Modifier.width(34.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        if (showArtwork) {
+            ArtworkBox(
+                uri = song.artworkUri,
+                embeddedSourceUri = song.contentUri,
+                modifier = Modifier.size(40.dp),
+                iconModifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+        } else if (isPlaying) {
+            Icon(
+                Icons.Filled.GraphicEq,
+                contentDescription = "Tocando agora",
+                modifier = Modifier.width(34.dp).size(18.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        } else {
+            Text(
+                trackNumber.toString(),
+                modifier = Modifier.width(34.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
         Column(Modifier.weight(1f)) {
             Text(
                 song.title,
-                color = MaterialTheme.colorScheme.onBackground,
+                color = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                fontWeight = FontWeight.Normal,
+                fontWeight = if (isPlaying) FontWeight.SemiBold else FontWeight.Normal,
             )
             Text(
                 formatDuration(song.durationMs),
@@ -2555,9 +3156,14 @@ private fun SongsScreen(
     onPlay: (Int) -> Unit,
     onDeleteSong: (LocalSong) -> Unit = {},
 ) {
-    LazyColumn(contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        items(songs, key = { it.id }) { song ->
-            SongRow(
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(3),
+        contentPadding = PaddingValues(18.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        gridItems(songs, key = { it.id }) { song ->
+            SongGridCard(
                 song = song,
                 isFavorite = isSongFavorite(song),
                 onClick = { onPlay(songs.indexOf(song)) },
@@ -2574,16 +3180,31 @@ private fun PlaylistsScreen(
     player: PlayerUiState,
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenPlayer: () -> Unit,
+    showGifBanner: Boolean = true,
 ) {
+    val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(18.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        if (player.activeRadioName.isNotBlank() && player.hasMedia) {
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                LiveNowRadioCard(player = player, onClick = onOpenPlayer)
+        // O banner ambiente some quando ha radio tocando pra nao duplicar o gif junto do
+        // LiveNowRadioCard, que ja tem seu proprio fundo animado.
+        if (showGifBanner) {
+            if (radioIsActive) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    LiveNowRadioCard(player = player, onClick = onOpenPlayer)
+                }
+            } else {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    DayPeriodGifBackground(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(170.dp)
+                            .clip(RoundedCornerShape(14.dp)),
+                    )
+                }
             }
         }
         gridItems(radios, key = { it.name }) { radio ->
@@ -2602,7 +3223,9 @@ private fun RadioDetailScreen(
     onEnterRadio: () -> Unit,
     onPlaySong: (Int) -> Unit,
     onOpenPlayer: () -> Unit,
+    onDeleteRadio: () -> Unit = {},
 ) {
+    var showDeleteConfirm by rememberSaveable(radio.customId) { mutableStateOf(false) }
     LazyColumn(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -2616,6 +3239,14 @@ private fun RadioDetailScreen(
                         tint = MaterialTheme.colorScheme.onBackground,
                     )
                 }
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = { showDeleteConfirm = true }) {
+                    Icon(
+                        Icons.Filled.Delete,
+                        contentDescription = "Remover radio",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
             }
         }
         if (player.activeRadioName == radio.name && player.hasMedia) {
@@ -2626,7 +3257,7 @@ private fun RadioDetailScreen(
         item {
             Card(
                 shape = RoundedCornerShape(8.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xE522160F)),
+                colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.9f)),
             ) {
                 Column(Modifier.padding(18.dp)) {
                     RadioCoverMosaic(
@@ -2693,6 +3324,18 @@ private fun RadioDetailScreen(
             }
         }
     }
+
+    if (showDeleteConfirm) {
+        DeleteConfirmDialog(
+            title = "Remover radio?",
+            message = "\"${radio.name}\" sai da lista de radios. As musicas continuam no aparelho.",
+            onConfirm = {
+                showDeleteConfirm = false
+                onDeleteRadio()
+            },
+            onDismiss = { showDeleteConfirm = false },
+        )
+    }
 }
 
 @Composable
@@ -2713,7 +3356,7 @@ private fun LiveRadioBadge(isActive: Boolean) {
                 .size(if (isActive) 10.dp else 8.dp)
                 .alpha(if (isActive) pulse else 0.55f)
                 .clip(CircleShape)
-                .background(Color(0xFFFF6A1A)),
+                .background(MaterialTheme.colorScheme.primary),
         )
         Spacer(Modifier.width(8.dp))
         Text(
@@ -2740,7 +3383,11 @@ private fun RadioTrackRow(index: Int, song: LocalSong, onClick: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        ArtworkBox(song.artworkUri, Modifier.size(48.dp))
+        ArtworkBox(
+            uri = song.artworkUri,
+            embeddedSourceUri = song.contentUri,
+            modifier = Modifier.size(48.dp),
+        )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(
@@ -2768,10 +3415,15 @@ private fun LiveNowRadioCard(player: PlayerUiState, onClick: () -> Unit, modifie
             .fillMaxWidth()
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xE522160F)),
+        colors = CardDefaults.cardColors(containerColor = PailerSurface),
     ) {
-        Column(Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 LiveRadioBadge(isActive = true)
                 Spacer(Modifier.weight(1f))
                 Text(
@@ -2780,52 +3432,78 @@ private fun LiveNowRadioCard(player: PlayerUiState, onClick: () -> Unit, modifie
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
-            Spacer(Modifier.height(14.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                ArtworkBox(player.artworkUri, Modifier.size(92.dp))
-                Spacer(Modifier.width(16.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        player.playbackSource.ifBlank { "Rádio" },
-                        color = Color(0xFFFF7A1A),
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        player.title.ifBlank { "Tocando agora" },
-                        color = MaterialTheme.colorScheme.onBackground,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        player.currentNewsHeadline.ifBlank { player.artist },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // Proporcao real dos gifs (720x406~414) - fundo inteiro, sem cortar topo/base.
+                    .aspectRatio(16f / 9f),
+            ) {
+                DayPeriodGifBackground(
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.FillBounds,
+                )
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, PailerCharcoal.copy(alpha = 0.92f)),
+                            )
+                        )
+                        .padding(top = 18.dp, start = 10.dp, end = 10.dp, bottom = 6.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ArtworkBox(
+                            uri = player.artworkUri,
+                            embeddedSourceUri = player.artworkSourceUri,
+                            modifier = Modifier.size(34.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                player.playbackSource.ifBlank { "Rádio" },
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                player.title.ifBlank { "Tocando agora" },
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                listOf(player.artist, player.album).filter { it.isNotBlank() }.joinToString(" • "),
+                                color = Color.White.copy(alpha = 0.75f),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(5.dp))
+                    LinearProgressIndicator(
+                        progress = {
+                            if (player.durationMs > 0) {
+                                (player.positionMs.toFloat() / player.durationMs.toFloat()).coerceIn(0f, 1f)
+                            } else {
+                                0f
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(3.dp)
+                            .clip(CircleShape),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = Color.White.copy(alpha = 0.25f),
                     )
                 }
             }
-            Spacer(Modifier.height(14.dp))
-            LinearProgressIndicator(
-                progress = {
-                    if (player.durationMs > 0) {
-                        (player.positionMs.toFloat() / player.durationMs.toFloat()).coerceIn(0f, 1f)
-                    } else {
-                        0f
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(CircleShape),
-                color = Color(0xFFFF7A1A),
-                trackColor = Color(0x33FFFFFF),
-            )
         }
     }
 }
@@ -2841,7 +3519,13 @@ private fun SongRow(
     RowItem(
         title = song.title,
         subtitle = "${song.artist} • ${formatDuration(song.durationMs)}",
-        icon = { ArtworkBox(song.artworkUri, Modifier.size(52.dp)) },
+        icon = {
+            ArtworkBox(
+                uri = song.artworkUri,
+                embeddedSourceUri = song.contentUri,
+                modifier = Modifier.size(52.dp),
+            )
+        },
         onClick = onClick,
         onLongClick = onLongClick,
         trailing = onToggleFavorite?.let {
@@ -2863,7 +3547,13 @@ private fun AlbumRow(album: LocalAlbum, onClick: () -> Unit) {
     RowItem(
         title = album.title,
         subtitle = "${album.artist} • ${album.songs.size} musicas",
-        icon = { ArtworkBox(album.artworkUri, Modifier.size(58.dp)) },
+        icon = {
+            if (album.isVariousArtists) {
+                AlbumCoverMosaic(songs = album.songs, modifier = Modifier.size(58.dp))
+            } else {
+                ArtworkBox(album.artworkUri, Modifier.size(58.dp))
+            }
+        },
         onClick = onClick,
     )
 }
@@ -2871,7 +3561,7 @@ private fun AlbumRow(album: LocalAlbum, onClick: () -> Unit) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
-    val artworkUri = artist.songs.firstOrNull { it.artworkUri != null }?.artworkUri
+    val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2879,7 +3569,8 @@ private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
         ArtworkBox(
-            uri = artworkUri,
+            uri = artworkSong?.artworkUri,
+            embeddedSourceUri = artworkSong?.contentUri,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f),
@@ -2913,13 +3604,22 @@ private fun AlbumGridCard(album: LocalAlbum, onClick: () -> Unit, onLongClick: (
             .clip(RoundedCornerShape(8.dp))
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
-        ArtworkBox(
-            uri = album.artworkUri,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(1f),
-            iconModifier = Modifier.size(38.dp),
-        )
+        if (album.isVariousArtists) {
+            AlbumCoverMosaic(
+                songs = album.songs,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+            )
+        } else {
+            ArtworkBox(
+                uri = album.artworkUri,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                iconModifier = Modifier.size(38.dp),
+            )
+        }
         Spacer(Modifier.height(7.dp))
         Text(
             album.title,
@@ -2931,6 +3631,65 @@ private fun AlbumGridCard(album: LocalAlbum, onClick: () -> Unit, onLongClick: (
         )
         Text(
             album.artist,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SongGridCard(
+    song: LocalSong,
+    isFavorite: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    onToggleFavorite: (() -> Unit)? = null,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+    ) {
+        Box {
+            ArtworkBox(
+                uri = song.artworkUri,
+                embeddedSourceUri = song.contentUri,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                iconModifier = Modifier.size(38.dp),
+            )
+            if (onToggleFavorite != null) {
+                IconButton(
+                    onClick = onToggleFavorite,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .size(30.dp),
+                ) {
+                    Icon(
+                        imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                        contentDescription = "Curtir faixa",
+                        tint = if (isFavorite) MaterialTheme.colorScheme.primary else Color.White,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(7.dp))
+        Text(
+            song.title,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.Normal,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            song.artist,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2981,7 +3740,11 @@ private fun RadioRow(radio: LocalRadio, onClick: () -> Unit) {
 
 @Composable
 private fun RadioCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifier) {
-    val covers = songs.distinctBy { it.albumId }.take(4)
+    // Faixas de uma radio "album" personalizada (LocalAlbum.isVariousArtists) compartilham o
+    // mesmo ALBUM_ID - distinctBy{albumId} sozinho colapsaria pra 1 capa so, entao complementa
+    // com diversidade por artista.
+    val byAlbum = songs.distinctBy { it.albumId }
+    val covers = (byAlbum + songs.distinctBy { it.artist } + songs).distinct().take(4)
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
@@ -2995,6 +3758,7 @@ private fun RadioCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifi
                         if (song != null) {
                             ArtworkBox(
                                 uri = song.artworkUri,
+                                embeddedSourceUri = song.contentUri,
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxSize(),
@@ -3020,6 +3784,45 @@ private fun RadioCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifi
                 .align(Alignment.Center)
                 .size(24.dp),
         )
+    }
+}
+
+// Mosaico de capas pra albuns "various artists" (compilacoes montadas a mao) - as faixas
+// compartilham o mesmo ALBUM_ID no MediaStore, entao nao da pra usar `distinctBy { albumId }`
+// como no RadioCoverMosaic. Prioriza diversidade por artista e usa a capa EMBUTIDA de cada
+// faixa (nao a do MediaStore, que seria a mesma pra todas) - ver LocalAlbum.isVariousArtists.
+@Composable
+private fun AlbumCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifier) {
+    val covers = (songs.distinctBy { it.artist } + songs).distinct().take(4)
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        repeat(2) { rowIndex ->
+            Row(Modifier.weight(1f)) {
+                repeat(2) { columnIndex ->
+                    val song = covers.getOrNull(rowIndex * 2 + columnIndex)
+                    if (song != null) {
+                        ArtworkBox(
+                            uri = song.artworkUri,
+                            embeddedSourceUri = song.contentUri,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize(),
+                            iconModifier = Modifier.size(20.dp),
+                        )
+                    } else {
+                        ArtworkPlaceholder(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize(),
+                            iconModifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3130,7 +3933,7 @@ private fun ContinueListeningCard(
             .fillMaxWidth()
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xE522160F)),
+        colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.9f)),
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -3139,6 +3942,7 @@ private fun ContinueListeningCard(
             Box(contentAlignment = Alignment.Center) {
                 ArtworkBox(
                     uri = song.artworkUri,
+                    embeddedSourceUri = song.contentUri,
                     modifier = Modifier.size(154.dp),
                     iconModifier = Modifier.size(46.dp),
                 )
@@ -3146,7 +3950,7 @@ private fun ContinueListeningCard(
                     modifier = Modifier
                         .size(54.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC080604)),
+                        .background(PailerCharcoal.copy(alpha = 0.8f)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
@@ -3209,6 +4013,7 @@ private fun SongCoverCard(song: LocalSong, onClick: () -> Unit) {
     ) {
         ArtworkBox(
             uri = song.artworkUri,
+            embeddedSourceUri = song.contentUri,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f),
@@ -3241,13 +4046,22 @@ private fun AlbumCoverCard(album: LocalAlbum, onClick: () -> Unit) {
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick),
     ) {
-        ArtworkBox(
-            uri = album.artworkUri,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(1f),
-            iconModifier = Modifier.size(48.dp),
-        )
+        if (album.isVariousArtists) {
+            AlbumCoverMosaic(
+                songs = album.songs,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+            )
+        } else {
+            ArtworkBox(
+                uri = album.artworkUri,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                iconModifier = Modifier.size(48.dp),
+            )
+        }
         Spacer(Modifier.height(9.dp))
         Text(
             album.title,
@@ -3274,7 +4088,7 @@ private fun MiniPlayer(
     onToggle: () -> Unit,
     onNext: () -> Unit,
 ) {
-    Surface(color = Color(0xF015100C)) {
+    Surface(color = PailerSurface.copy(alpha = 0.94f)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -3282,7 +4096,11 @@ private fun MiniPlayer(
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ArtworkBox(player.artworkUri, Modifier.size(48.dp))
+            ArtworkBox(
+                uri = player.artworkUri,
+                embeddedSourceUri = player.artworkSourceUri,
+                modifier = Modifier.size(48.dp),
+            )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 if (player.playbackSource.isNotBlank()) {
@@ -3290,7 +4108,7 @@ private fun MiniPlayer(
                         player.playbackSource,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        color = Color(0xFFFF7A1A),
+                        color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
@@ -3340,6 +4158,12 @@ private fun FullPlayer(
     onShuffle: () -> Unit,
     onRepeat: () -> Unit,
     onSeek: (Long) -> Unit,
+    albumSongs: List<LocalSong> = emptyList(),
+    onOpenAlbum: (() -> Unit)? = null,
+    onOpenArtist: (() -> Unit)? = null,
+    isAlbumSongFavorite: (LocalSong) -> Boolean = { false },
+    onToggleAlbumSongFavorite: (LocalSong) -> Unit = {},
+    onPlayAlbumSong: (LocalSong) -> Unit = {},
 ) {
     val isRadio = player.activeRadioName.isNotBlank()
     Box(
@@ -3389,6 +4213,7 @@ private fun FullPlayer(
             Spacer(Modifier.height(36.dp))
             ArtworkBox(
                 uri = player.artworkUri,
+                embeddedSourceUri = player.artworkSourceUri,
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(1f)
@@ -3406,16 +4231,34 @@ private fun FullPlayer(
             )
             Text(
                 text = player.artist,
-                modifier = Modifier.padding(top = 4.dp),
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .then(
+                        if (onOpenArtist != null) Modifier.clickable(onClick = onOpenArtist) else Modifier
+                    ),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (player.album.isNotBlank()) {
+                Text(
+                    text = player.album,
+                    modifier = Modifier
+                        .padding(top = 2.dp)
+                        .then(
+                            if (onOpenAlbum != null) Modifier.clickable(onClick = onOpenAlbum) else Modifier
+                        ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             if (player.currentNewsHeadline.isNotBlank()) {
                 Spacer(Modifier.height(12.dp))
                 Card(
                     shape = RoundedCornerShape(8.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0x9922160F)),
+                    colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.6f)),
                 ) {
                     Text(
                         text = "Notícia rápida: ${player.currentNewsHeadline}",
@@ -3441,8 +4284,8 @@ private fun FullPlayer(
                         .fillMaxWidth()
                         .height(5.dp)
                         .clip(CircleShape),
-                    color = Color(0xFFFF7A1A),
-                    trackColor = Color(0x33FFFFFF),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f),
                 )
             } else {
                 Slider(
@@ -3493,7 +4336,12 @@ private fun FullPlayer(
                         )
                     }
                     IconButton(onClick = onPrevious, modifier = Modifier.size(58.dp)) {
-                        Icon(Icons.Filled.SkipPrevious, contentDescription = "Anterior", modifier = Modifier.size(38.dp))
+                        Icon(
+                            Icons.Filled.SkipPrevious,
+                            contentDescription = "Anterior",
+                            modifier = Modifier.size(38.dp),
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
                     }
                     IconButton(
                         onClick = onToggle,
@@ -3510,7 +4358,12 @@ private fun FullPlayer(
                         )
                     }
                     IconButton(onClick = onNext, modifier = Modifier.size(58.dp)) {
-                        Icon(Icons.Filled.SkipNext, contentDescription = "Proxima", modifier = Modifier.size(38.dp))
+                        Icon(
+                            Icons.Filled.SkipNext,
+                            contentDescription = "Proxima",
+                            modifier = Modifier.size(38.dp),
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
                     }
                     IconButton(onClick = onRepeat) {
                         Icon(
@@ -3528,7 +4381,54 @@ private fun FullPlayer(
                         )
                     }
                 }
+                AlbumSongsSection(
+                    albumTitle = player.album,
+                    songs = albumSongs,
+                    currentSongId = player.songId,
+                    isFavorite = isAlbumSongFavorite,
+                    onToggleFavorite = onToggleAlbumSongFavorite,
+                    onSongClick = onPlayAlbumSong,
+                )
             }
+        }
+    }
+}
+
+@Composable
+private fun AlbumSongsSection(
+    albumTitle: String,
+    songs: List<LocalSong>,
+    currentSongId: Long?,
+    isFavorite: (LocalSong) -> Boolean,
+    onToggleFavorite: (LocalSong) -> Unit,
+    onSongClick: (LocalSong) -> Unit,
+) {
+    val otherSongs = songs.filter { it.id != currentSongId }
+    if (otherSongs.isEmpty()) return
+    Spacer(Modifier.height(22.dp))
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(PailerGunmetal.copy(alpha = 0.4f))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            "Mais de ${albumTitle.ifBlank { "este álbum" }}",
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+        otherSongs.forEach { song ->
+            AlbumTrackRow(
+                trackNumber = song.trackNumber.takeIf { it > 0 } ?: (songs.indexOf(song) + 1),
+                song = song,
+                isFavorite = isFavorite(song),
+                onClick = { onSongClick(song) },
+                onToggleFavorite = { onToggleFavorite(song) },
+            )
         }
     }
 }
@@ -3552,7 +4452,7 @@ private fun LiveSourceLabel(text: String, isLive: Boolean, modifier: Modifier = 
                     .size(10.dp)
                     .alpha(pulse)
                     .clip(CircleShape)
-                    .background(Color(0xFFFF6A1A)),
+                    .background(MaterialTheme.colorScheme.primary),
             )
             Spacer(Modifier.width(9.dp))
         }
@@ -3575,7 +4475,7 @@ private fun RadioUpcomingQueue(upcomingTracks: List<String>) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0x6622160F))
+            .background(PailerGunmetal.copy(alpha = 0.4f))
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
@@ -3590,7 +4490,7 @@ private fun RadioUpcomingQueue(upcomingTracks: List<String>) {
                 Text(
                     (index + 1).toString().padStart(2, '0'),
                     modifier = Modifier.width(28.dp),
-                    color = Color(0xFFFF7A1A),
+                    color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -3611,13 +4511,19 @@ private fun ArtworkBox(
     uri: Uri?,
     modifier: Modifier,
     iconModifier: Modifier = Modifier.size(26.dp),
+    // Uri do proprio arquivo de audio (LocalSong.contentUri) - quando presente, tenta a capa
+    // embutida NELE primeiro (MediaMetadataRetriever) antes de cair pro `uri` (capa
+    // compartilhada do MediaStore por ALBUM_ID). So usado onde uma faixa precisa mostrar a
+    // capa dela mesma em vez da capa do album inteiro (ex.: compilacoes com varios artistas).
+    embeddedSourceUri: Uri? = null,
 ) {
     val context = LocalContext.current
-    var image by remember(uri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var image by remember(uri, embeddedSourceUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
-    LaunchedEffect(uri) {
+    LaunchedEffect(uri, embeddedSourceUri) {
         image = withContext(Dispatchers.IO) {
-            uri?.let { loadScaledArtwork(context, it) }
+            embeddedSourceUri?.let { loadEmbeddedArtwork(context, it) }
+                ?: uri?.let { loadScaledArtwork(context, it) }
         }
     }
 
@@ -3655,6 +4561,33 @@ private fun loadScaledArtwork(context: android.content.Context, uri: Uri): andro
         bitmap
     }.getOrNull()
 
+// Le a capa embutida NO ARQUIVO (ID3 APIC/FLAC PICTURE/etc via MediaMetadataRetriever) em vez
+// da capa compartilhada por ALBUM_ID do MediaStore. Mais custoso (abre o arquivo por faixa),
+// entao so e chamado onde uma compilacao de varios artistas precisa da capa por-faixa de
+// verdade - ver `embeddedSourceUri` em ArtworkBox e LocalAlbum.isVariousArtists.
+private fun loadEmbeddedArtwork(context: android.content.Context, contentUri: Uri): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val cacheKey = "embedded:$contentUri"
+        artworkMemoryCache.get(cacheKey)?.let { return@runCatching it }
+        val retriever = android.media.MediaMetadataRetriever()
+        val bitmap = try {
+            retriever.setDataSource(context, contentUri)
+            val bytes = retriever.embeddedPicture ?: return@runCatching null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            val sampleSize = calculateArtworkSampleSize(bounds.outWidth, bounds.outHeight)
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+        } finally {
+            retriever.release()
+        }
+        if (bitmap != null) artworkMemoryCache.put(cacheKey, bitmap)
+        bitmap
+    }.getOrNull()
+
 private val artworkMemoryCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(96)
 
 private fun calculateArtworkSampleSize(width: Int, height: Int): Int {
@@ -3682,9 +4615,9 @@ private fun ArtworkPlaceholder(
             .background(
                 Brush.linearGradient(
                     listOf(
-                        Color(0xFFFF7A00),
-                        Color(0xFF2A1B10),
-                        Color(0xFFFFB25A),
+                        MaterialTheme.colorScheme.primary,
+                        PailerGunmetal,
+                        PailerSilver,
                     )
                 )
             ),
@@ -3783,12 +4716,52 @@ private fun LibraryTab.icon() = when (this) {
 @Composable
 private fun appBackgroundBrush(): Brush = Brush.verticalGradient(
     colors = listOf(
-        Color(0xFF2A1204),
-        Color(0xFF120B06),
-        MaterialTheme.colorScheme.background,
-        Color(0xFF080604),
+        lerp(PailerSurfaceHigh, PailerRed, 0.07f),
+        lerp(PailerSurface, PailerRed, 0.04f),
+        lerp(MaterialTheme.colorScheme.background, PailerRed, 0.05f),
+        lerp(PailerCharcoal, PailerRed, 0.09f),
     )
 )
+
+@Composable
+private fun rememberCurrentDayPeriod(): DayPeriod {
+    var period by remember { mutableStateOf(DayPeriod.current()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60_000L)
+            period = DayPeriod.current()
+        }
+    }
+    return period
+}
+
+@Composable
+private fun rememberGifImageLoader(): ImageLoader {
+    val context = LocalContext.current
+    return remember(context) {
+        ImageLoader.Builder(context)
+            .components {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    add(ImageDecoderDecoder.Factory())
+                } else {
+                    add(GifDecoder.Factory())
+                }
+            }
+            .build()
+    }
+}
+
+@Composable
+private fun DayPeriodGifBackground(modifier: Modifier = Modifier, contentScale: ContentScale = ContentScale.Crop) {
+    val period = rememberCurrentDayPeriod()
+    AsyncImage(
+        model = period.gifRes,
+        imageLoader = rememberGifImageLoader(),
+        contentDescription = null,
+        modifier = modifier,
+        contentScale = contentScale,
+    )
+}
 
 private fun formatDuration(durationMs: Long): String {
     val totalSeconds = (durationMs / 1000).coerceAtLeast(0)

@@ -77,6 +77,17 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   caminho já suportado pelo Media3.
 - **Não mudar sem:** necessidade real (ex.: seek bar interativa) e estudo das versões
   novas de RemoteViews (API 31+).
+- **Pegadinha (29/08/2026):** `RemoteViews` só permite inflar uma lista fechada de
+  classes de View (`FrameLayout`, `LinearLayout`, `TextView`, `ImageView`,
+  `ProgressBar` etc.) — um `<View>` puro usado como scrim (`widget_bg_scrim`) quebrava
+  os dois widgets inteiros com `InflateException: Class not allowed to be inflated
+  android.view.View`, sem nenhum log no processo do app (a inflação falha no processo
+  do launcher/host, não no nosso). Sintoma no aparelho: launcher mostra "Não é possível
+  carregar o widget" e a falha sobrevive a `notifyAppWidgetViewDataChanged`/reinstalar o
+  app — só reaparece renderizando de novo com um layout válido. Corrigido trocando o
+  `<View>` por `<FrameLayout>` (mesmo resultado visual, classe permitida). Lição: ao
+  adicionar qualquer View nova nesses layouts, checar contra a lista de classes
+  suportadas por `RemoteViews.addView`/`checkNotSupported` antes de testar no aparelho.
 
 ## ADR-007 — Sessão de rádio com anti-repetição por similaridade
 
@@ -228,4 +239,191 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   Android). Se precisar de Normal/Longa confiável com Kokoro, a solução certa é
   serializar + cachear engine entre requests (P0 do [TODO.md](TODO.md)), não só subir
   timeout de novo.
+
+## ADR-014 — Dois locutores masculinos (Frankie/Nicky) + bate-bola sensível ao conteúdo
+
+- **Contexto:** dois pedidos diretos do usuário em 28/08/2026: (1) a voz feminina do
+  Kokoro (`pf_dora`, ID 42) não agradou; (2) o bate-bola do boletim (`RadioBulletin.kt`)
+  reagia com frases genéricas sorteadas ("Pois é, quem diria") desconectadas do conteúdo
+  real da notícia, sempre com a locutora abrindo/fechando e o locutor só emplacando uma
+  frase no meio — sem opinião de verdade nem participação igual. Pedido de inspiração:
+  clima Sopranos/GTA IV, dois locutores com personalidade oposta (otimista vs
+  pessimista) e humor ácido, se chamando pelo nome no ar; nomes escolhidos pela IA de
+  propósito ("elemento surpresa").
+- **Decisão (voz):** trocado o slot `femaleSpeakerId` do manifest Kokoro de 42
+  (`pf_dora`) pra 44 (`pm_santa`) — terceira voz masculina do mesmo pacote, citada como
+  não usada desde o ADR-013. **Não** voltou pro Piper: o Piper já tinha sido testado e
+  rejeitado antes por soar "fraco, sem personalidade" (ADR-013), então reaproveitar o
+  Kokoro (motor já aprovado) trocando só um ID resolve sem reabrir aquele problema.
+  Nomes dos personagens: **Frankie** (otimista, slot Female) e **Nicky** (pessimista,
+  slot Male) — os enums `RadioSpeaker.Female`/`Male` continuam intactos, são só nomes
+  de slot herdados do pacote de voz, não implicam gênero. `speed` também caiu de 0.92
+  pra 0.85 (locutores mais lentos, outro pedido do usuário), com
+  `BULLETIN_PREP_TIMEOUT_MS` ajustado de 160s pra 175s na mesma proporção. Voz do ID 44
+  sintetizada e validada por RMS/pico localmente (mesmo método do ADR-013) antes de
+  empacotar, mas **ainda sem aprovação por ouvido humano no aparelho**.
+- **Decisão (roteiro):** `FallbackRadioScriptWriter.buildDialogueLines()` reescrito:
+  classifica o tema da notícia por palavra-chave (título + resumo, agora capturado do
+  RSS — ver decisão de notícias abaixo) em 10 categorias, escolhe de bancos de texto
+  próprios por tema pra cada personagem (opinião "inventada" mas amarrada ao tema, não
+  genérica), extrai um "gancho" (percentual/valor/número do texto) quando existe, e
+  monta o número de falas **pela duração** (2/4/6, sempre metade pra cada um) em vez de
+  gerar um script fixo de 3 falas e cortar depois com `fitFor()` — o corte antigo podia
+  apagar a fala inteira de um dos dois se o outro estourasse o orçamento de palavras,
+  quebrando a participação igual. `fitFor()` continua só como rede de segurança.
+- **Decisão (notícias):** `NewsBulletinRepository` trocou de 4 feeds só do g1 pra 5
+  feeds (2 g1 + Super/Olhar Digital/BBC Brasil) buscados **em paralelo**
+  (`coroutineScope`/`async`/`awaitAll` — sequencial custava a soma dos timeouts, hoje
+  custa só o maior) e passou a capturar também `<description>`/`<summary>` do RSS (até
+  220 caracteres, limpo de HTML), não só o título — é esse resumo que dá ao roteirista
+  conteúdo de verdade da matéria pra comentar, não só a manchete.
+- **Motivo:** reduzir dependência de uma única fonte editorial (pedido explícito:
+  "vindo muita notícia do G1"), trazer o ângulo de curiosidades/novidades pedido, e
+  fazer o bate-bola soar como comentário de verdade sobre o tema em vez de reação
+  aleatória — sem precisar de LLM real (`OptionalLocalLlmRadioScriptWriter` continua
+  não implementado, ver ADR-002), só heurística determinística mais rica.
+- **Não mudar sem:** confirmar com o usuário se a voz do ID 44 (Nicky) soou bem no
+  aparelho — se não, `voice-models/kokoro/kokoro-multi-lang-v1_0/` tem só esses 3
+  speakers pt-BR (42/43/44), não há um quarto pra tentar sem baixar/treinar outro
+  pacote. Se os bancos de texto por tema (`TOPIC_BANK` em `RadioBulletin.kt`) começarem
+  a repetir demais em uso real, a correção é adicionar mais variantes por tema, não
+  reverter pra reação genérica.
+- **Atualização (28/08/2026):** `pm_santa` (ID 44) foi ouvido no aparelho e **também**
+  rejeitado (mesma sessão, personagem "Frankie"). Kokoro pt-BR ficou então limitado a
+  1 voz aprovada (`pm_alex`, ID 43, hoje o Nicky) — os outros dois speakers do pacote já
+  foram testados e recusados. Continuação em ADR-015.
+
+## ADR-015 — Bug de acentuação no texto do bate-bola + motor de voz "mixed"
+
+- **Contexto:** com o Kokoro pt-BR esgotado (ADR-014), testados vários candidatos Piper
+  pt-BR pro Frankie (Miro, Jeff, Faber, Cadu — baixados de
+  `k2-fsa/sherpa-onnx/releases/tag/tts-models`). Usuário reportou "atenção" saindo com
+  som de K em vez de S, e "notícia"/"aí" sem ênfase na sílaba tônica, em **todos** eles.
+  Investigação (metadados do onnx, comparação byte-a-byte do `espeak-ng-data` entre
+  pacotes, leitura do código-fonte do `piper-phonemize-lexicon.cc` e do
+  `espeak_ng_SetVoiceByName` do espeak-ng) descartou defeito de modelo/motor. Causa real:
+  todo o texto falado escrito em `RadioBulletin.kt` (bancos de fala do Frankie/Nicky) e
+  em `LocalTuneViewModel.kt` (scripts dos botões de teste) foi escrito **sem nenhum
+  acento** ("atencao", "noticia", "ai"). Sem o acento, o fonemizador espeak-ng (usado
+  tanto pelo Kokoro quanto pelo Piper) não tem como saber onde recai a força da sílaba
+  nem que "ção" é som de S — isso vale pra qualquer voz, não é característica de nenhum
+  pacote específico. Um bug relacionado foi achado no classificador de tema
+  (`classifyTopic`): a lista `TOPIC_KEYWORDS` também estava sem acento e comparava por
+  substring direto contra o resumo/título real do RSS (que vem acentuado) — "politica"
+  nunca batia com "política" porque "í" e "i" são caracteres diferentes.
+- **Decisão:**
+  1. Todo o texto falado em `RadioBulletin.kt` e `LocalTuneViewModel.kt` reescrito com
+     acentuação correta.
+  2. `classifyTopic` passou a normalizar (remover diacríticos via
+     `java.text.Normalizer.Form.NFD` + regex `\p{Mn}+`) os dois lados antes de comparar,
+     em vez de manter uma lista de palavras-chave acentuada à mão — mais robusto a longo
+     prazo que corrigir acento por acento numa lista que só cresce.
+  3. Voz final escolhida pelo usuário depois de ouvir as amostras corrigidas: **Frankie**
+     = Piper `pt_BR-faber-medium` (não tinha sido testado individualmente antes — só o
+     par Dii/Faber tinha sido rejeitado em conjunto no ADR-013); **Nicky** continua
+     Kokoro `pm_alex` (ID 43), sem mudança.
+  4. Como Frankie (vits/Piper) e Nicky (kokoro) agora são motores diferentes no mesmo
+     pacote, criado um terceiro tipo de `engine` no manifest: **`"mixed"`** — cada slot
+     (`voices.female`/`voices.male`) declara seu próprio `"engine"` (`"vits"` ou
+     `"kokoro"`) e sua própria config, em vez do pacote inteiro rodar um único motor.
+     Implementado em `RadioVoicePackageRepository.kt` (`femaleEngine`/`maleEngine`,
+     `femaleKokoro`/`maleKokoro`, validação por slot) e `LocalRadioVoiceEngine.kt`
+     (`perSpeakerEngine()`/`vitsFor()`/`kokoroFor()`/`speakerIdFor()` agora dependem do
+     motor daquele slot especificamente quando `engine == "mixed"`). Os engines
+     existentes (`vits`, `vits-dual`, `piper-dual`, `kokoro`, `supertonic`) não mudaram
+     de comportamento.
+  5. `speed` caiu mais uma vez, de 0.85 pra **0.78** (outro pedido do usuário, "um pouco
+     mais devagar"), confirmado nas amostras que o usuário aprovou.
+  6. Pacote final: `voice-models/mixed_package/` (fonte) →
+     `voice-models/Pailer-Radio-Voices-FrankieFaber-NickyKokoro.zip` (importável, ~137 MB
+     — a maior parte é o modelo Kokoro do Nicky; `espeak-ng-data` é compartilhado entre
+     os dois slots dentro do zip, já que é byte-idêntico entre os pacotes Kokoro e Piper
+     testados, evitando duplicar ~18 MB à toa).
+- **Motivo:** o usuário confirmou por ouvido que a acentuação corrigida resolveu o
+  problema relatado ("amei, ficou ótimo agora") e escolheu Faber entre as opções
+  testadas.
+- **Não mudar sem:** ao escrever qualquer string nova que vai ser falada pelo TTS
+  (`RadioScriptLine`, scripts de teste), sempre usar acentuação correta — não é estilo,
+  é requisito funcional de pronúncia (ver também o comentário no topo de
+  `RadioBulletin.kt`). Ao adicionar mais opções de voz Piper pt-BR no futuro
+  (`Miro`/`Jeff`/`Cadu`/`Edresson`/`Dii` já estão em `voice-models/`, mais opções em
+  `k2-fsa/sherpa-onnx/releases/tag/tts-models`, incluindo `vits-coqui-pt-cv` — treinado
+  em Common Voice, multi-falante, ainda não testado), testar sempre com texto acentuado
+  desde o primeiro teste, pra não repetir esse ciclo de suspeitar do modelo errado.
+- **Atualização (28/08/2026):** o pacote `mixed` (Frankie/Piper + Nicky/Kokoro) foi
+  testado em boletim real no aparelho e **estourou os 175s** de
+  `BULLETIN_PREP_TIMEOUT_MS` — o Kokoro sozinho já não cabia direito (ADR-013/014), e
+  com dois engines carregando na mesma síntese (`LocalRadioVoiceEngine` não cacheia
+  entre requests, ADR-003) o tempo total ainda foi maior. Decisão final: **abandonar o
+  Kokoro** e o motor `mixed` na prática, ficando só com Piper (`vits-dual`) nos dois
+  locutores. Nicky trocou de Kokoro `pm_alex` pra Piper `pt_BR-jeff-medium` (mesmo
+  dataset gravado do Faber, `OHF-Voice/voice-datasets`, CC0) — testado no aparelho e
+  aprovado no desempenho ("o teste foi perfeito"), mas o usuário não gostou do timbre
+  do Jeff especificamente. Trocado de novo, ainda no mesmo pacote leve, pra
+  **Piper `pt_BR-miro-high`** (voz que o usuário já tinha elogiado antes de o bug de
+  acentuação ser encontrado — ver acima; pipeline/dataset diferente do Faber/Jeff,
+  timbre mais distinto entre os dois locutores). Licença do Miro é CC-BY-NC-SA (não
+  comercial) — sem problema aqui, app pessoal nunca publicado (ADR-012). Pacote final:
+  `voice-models/piper_only_package/` → `Pailer-Radio-Voices-FrankieFaber-NickyMiro.zip`
+  (~36 MB, contra ~137 MB do pacote `mixed` anterior). **Miro também foi rejeitado** logo
+  em seguida (mesmo dia) — trocado de novo pra Piper `pt_BR-cadu-medium` (mesmo dataset
+  CC0 do Faber/Jeff), zip `Pailer-Radio-Voices-FrankieFaber-NickyCadu.zip`. Medido
+  localmente (PC, não aparelho): os
+  dois motores carregados + 6 falas sintetizadas (diálogo "Longo" inteiro) em ~11s —
+  ordens de grandeza mais rápido que o Kokoro. O motor `mixed` (código em
+  `RadioVoicePackageRepository.kt`/`LocalRadioVoiceEngine.kt`) **continua no código**,
+  sem uso — não removido, pode servir se um dia fizer sentido misturar motores de novo,
+  mas não é mais o caminho ativo. `BULLETIN_PREP_TIMEOUT_MS` mantido em 175s por ora
+  (folga generosa de sobra com Piper puro, não precisa de ajuste fino agora).
+
+## ADR-016 — Capa por-faixa em álbuns "various artists" + consequências no shuffle e no delete de rádio
+
+- **Contexto (29/08/2026):** usuário reportou que um álbum montado à mão (ex.: "2000's",
+  faixas de vários artistas sob o mesmo nome de álbum) mostrava a **mesma capa** — a da
+  primeira faixa escaneada — em todas as músicas, no álbum, na tela cheia do player, nos
+  cartões de artista e na rádio criada a partir dele. Causa raiz: o MediaStore agrupa por
+  `ALBUM_ID`, que é baseado só no nome do álbum; todas as faixas com o mesmo `album` tag
+  caem no mesmo `ALBUM_ID`, e `content://media/external/audio/albumart/<id>` só guarda
+  **uma** imagem por `ALBUM_ID`, não uma por faixa.
+- **Decisão:**
+  1. `LocalAlbum.isVariousArtists` (`songs.map{artist}.distinct().size > 1`) marca esses
+     álbuns. Onde marcado: mosaico de 4 capas (`AlbumCoverMosaic`) no lugar da capa única
+     (header do álbum, `AlbumRow`/`AlbumGridCard`/`AlbumCoverCard`); faixas dentro do
+     álbum mostram thumbnail própria (`AlbumTrackRow.showArtwork`).
+  2. Pra faixa individual (fora do contexto de álbum — tela cheia do player, mini player,
+     "Ouvir de novo", lista de músicas, linha de rádio, cartão "ao vivo agora", avatar de
+     artista), a correção é **sempre** tentar a capa **embutida no arquivo** primeiro
+     (`loadEmbeddedArtwork` via `MediaMetadataRetriever.embeddedPicture`, não o MediaStore
+     compartilhado), caindo pro `artworkUri` do MediaStore só se o arquivo não tiver capa
+     embutida. Parâmetro `embeddedSourceUri` em `ArtworkBox`; pro estado do player,
+     `PlayerUiState.artworkSourceUri` (de `MediaItem.localConfiguration?.uri`) evita ter
+     que resolver a `LocalSong` de novo em `MiniPlayer`/`FullPlayer`/`LiveNowRadioCard`.
+  3. `previewCovers()`/`RadioCoverMosaic` (mosaico de rádio) usavam só
+     `distinctBy{albumId}` — colapsa pra 1 capa quando as faixas da rádio vêm de um único
+     álbum "various artists". Complementado com `distinctBy{artist}` como segunda fonte de
+     diversidade quando a primeira não enche 4 posições.
+  4. **Consequência no shuffle:** `radioSessionFrom()` tocava rádio de álbum sempre na
+     ordem de faixa (ADR de origem: álbum de artista único é sequência proposital, tipo
+     álbum conceitual). Pra álbum "various artists" isso não faz sentido — não é uma
+     sequência intencional de verdade — então passou a embaralhar com anti-repetição
+     (`shuffledRadioSession()`, mesmo esquema do de rádio de artista). Álbum de artista
+     único continua tocando em ordem, sem mudança.
+  5. **Consequência no delete de rádio:** usuário pediu pra poder apagar qualquer rádio,
+     não só as personalizadas — motivado por querer remover a rádio de perfil "Anos 2000".
+     Rádios de perfil/gênero não têm definição persistida (são recalculadas da biblioteca
+     toda vez), então "apagar" uma delas só tira da lista (`hideRadio()`, chave = nome
+     normalizado, em `hidden_radio_keys` no mesmo SharedPreferences das definições
+     personalizadas). Ação reversível via "Restaurar rádios ocultas" nas Configurações.
+- **Motivo:** o usuário insistiu explicitamente que a vinheta gravada por gênero (Grunge,
+  Indie, Jazz etc. — `VINHETA_BY_RADIO_KEY` em `LocalTuneViewModel.kt`, chaveada pelo
+  **nome** da rádio) precisa continuar funcionando se uma rádio for apagada e recriada
+  depois (projeto de vinhetas por gênero ainda em construção, aos poucos). Como
+  `hideRadio()` só filtra a lista por nome — nunca toca em `VINHETA_BY_RADIO_KEY` nem na
+  lógica que gera a rádio a partir da biblioteca — desocultar uma rádio de perfil/gênero a
+  faz reaparecer com a vinheta de sempre, intacta.
+- **Não mudar sem:** ao adicionar qualquer tela nova que mostre a capa de uma faixa
+  individual, usar `embeddedSourceUri` (não só `artworkUri`) — do contrário reintroduz o
+  mesmo bug em mais um lugar. Ao mexer em `hideRadio()`/`VINHETA_BY_RADIO_KEY`, manter os
+  dois desacoplados (um não deve depender do outro) — é isso que garante a vinheta
+  sobreviver ao apagar/recriar.
 

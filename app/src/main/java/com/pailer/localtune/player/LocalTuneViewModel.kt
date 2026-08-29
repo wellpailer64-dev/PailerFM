@@ -35,8 +35,8 @@ import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
 import com.pailer.localtune.data.MusicLibraryRepository
+import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.PendingTagChange
-import com.pailer.localtune.data.RadioBulletinDuration
 import com.pailer.localtune.data.RadioBulletinMode
 import com.pailer.localtune.data.RadioBulletinRepository
 import com.pailer.localtune.data.RadioBulletinSettings
@@ -92,6 +92,11 @@ data class PlayerUiState(
     val artist: String = "",
     val album: String = "",
     val artworkUri: android.net.Uri? = null,
+    // Uri do PROPRIO arquivo de audio tocando (nao a capa) - permite extrair a capa embutida
+    // por faixa em vez da capa compartilhada por ALBUM_ID do MediaStore (`artworkUri` acima),
+    // que da errado em compilacoes com varios artistas sob o mesmo nome de album. Ver
+    // LocalAlbum.isVariousArtists e `embeddedSourceUri` em ArtworkBox (LocalTuneApp.kt).
+    val artworkSourceUri: android.net.Uri? = null,
     val playbackSource: String = "",
     val activeRadioName: String = "",
     val currentNewsHeadline: String = "",
@@ -119,6 +124,21 @@ data class MetadataUiState(
     val message: String? = null,
 )
 
+data class AlbumArtworkUiState(
+    val albumsWithoutArtwork: List<LocalAlbum> = emptyList(),
+    val isScanning: Boolean = false,
+    val activeAlbumKey: String? = null,
+    val isSearching: Boolean = false,
+    val candidates: List<ArtworkCandidate> = emptyList(),
+    val selectedCandidate: ArtworkCandidate? = null,
+    val isDownloadingSelection: Boolean = false,
+    val isApplying: Boolean = false,
+    val message: String? = null,
+    // Incrementado a cada capa gravada com sucesso - a UI observa isso pra saber quando invalidar
+    // o cache de bitmaps em memoria (a Uri de albumart nao muda, so o que ela aponta por tras).
+    val appliedVersion: Int = 0,
+)
+
 data class RadioBulletinUiState(
     val settings: RadioBulletinSettings = RadioBulletinSettings(),
     val localWriterInstalled: Boolean = false,
@@ -139,6 +159,9 @@ data class RadioVoiceUiState(
     val maleSpeaker: String = "",
     val detail: String = "Nenhum pacote de voz instalado",
     val message: String? = null,
+    // Existe um audio de teste (voz ou boletim) ainda no disco pra tocar de novo sem gerar
+    // outra vez - ver playTestAudio()/replayLastTestAudio().
+    val canReplayTest: Boolean = false,
 )
 
 private data class LocalVoiceSynthesisResult(
@@ -165,12 +188,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var radioNewsEnabled = false
     private var completedRadioSongs = 0
     private var newsBulletins: List<RadioScript> = emptyList()
+    private var bulletinReloadInFlight = false
     private var nextBulletinIndex = 0
     private var speakingNews = false
     private var currentNewsHeadline = ""
     private var resumeAfterNews = false
     private var pendingVinheta = false
     private var announcementPlayer: MediaPlayer? = null
+    private var lastTestAudioFile: File? = null
     private var announcementToken = 0
     private var announcementWatchdogJob: Job? = null
     private var libraryScanRunning = false
@@ -196,6 +221,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     var metadataState = androidx.compose.runtime.mutableStateOf(MetadataUiState())
         private set
+
+    var albumArtworkState = androidx.compose.runtime.mutableStateOf(AlbumArtworkUiState())
+        private set
+
+    // Bytes da capa baixada pro candidato selecionado - fora do StateFlow/State de proposito
+    // (ByteArray nao tem equals estrutural util pra Compose, e o dado so importa no momento de
+    // aplicar). Fica nulo ate selectArtworkCandidate() terminar o download.
+    private var pendingArtworkBytes: ByteArray? = null
 
     var radioBulletinState = androidx.compose.runtime.mutableStateOf(loadRadioBulletinUiState())
         private set
@@ -301,10 +334,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         updateRadioBulletinSettings(radioBulletinState.value.settings.copy(mode = mode))
     }
 
-    fun setRadioBulletinDuration(duration: RadioBulletinDuration) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(duration = duration))
-    }
-
     fun setRadioBulletinPreferLocalWriter(preferLocalWriter: Boolean) {
         updateRadioBulletinSettings(radioBulletinState.value.settings.copy(preferLocalWriter = preferLocalWriter))
     }
@@ -357,13 +386,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val script = RadioScript(
                 story = com.pailer.localtune.data.NewsStory(
                     title = "Teste de voz local",
-                    source = "Pailer Player",
+                    source = "Pailer FM",
                 ),
                 source = RadioScriptSource.Fallback,
                 lines = listOf(
                     RadioScriptLine(
                         speaker = RadioSpeaker.Female,
-                        text = "Teste da voz local do Pailer Player.",
+                        text = "Aqui é o Frankie testando a voz local do Pailer FM.",
                     ),
                 ),
             )
@@ -373,8 +402,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
                     isTesting = false,
                     message = "Teste OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s. Voz local ativada.",
+                    canReplayTest = true,
                 )
-                playAnnouncementFile(result.file) {}
+                playTestAudio(result.file)
             } else {
                 radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, false).apply()
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
@@ -399,23 +429,23 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val script = RadioScript(
                 story = com.pailer.localtune.data.NewsStory(
                     title = "Teste de boletim",
-                    source = "Pailer Player",
+                    source = "Pailer FM",
                 ),
                 source = RadioScriptSource.Fallback,
                 lines = listOf(
                     RadioScriptLine(
                         speaker = RadioSpeaker.Female,
-                        text = "Noticia rapida: cientistas brasileiros desenvolveram uma tecnica de reciclagem " +
-                            "de plastico usando bacterias marinhas.",
+                        text = "Nicky, cola aqui: cientistas brasileiros desenvolveram uma técnica de reciclagem " +
+                            "de plástico usando bactérias marinhas.",
                     ),
                     RadioScriptLine(
                         speaker = RadioSpeaker.Male,
-                        text = "O estudo foi publicado essa semana e promete reduzir o descarte de garrafas " +
-                            "PET em ate setenta por cento nos proximos anos.",
+                        text = "Frankie, eu já desconfio de notícia boa demais, sempre tem letra miúda. " +
+                            "Mas tá aí, reduz garrafa PET em setenta por cento, quero ver.",
                     ),
                     RadioScriptLine(
                         speaker = RadioSpeaker.Female,
-                        text = "Fica a dica, e agora voltamos para a nossa programação normal.",
+                        text = "Eu prefiro acreditar, sempre rendeu mais do que desconfiar. Voltamos já com mais.",
                     ),
                 ),
             )
@@ -424,8 +454,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
                     isTestingBulletin = false,
                     message = "Boletim OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s (2 locutores).",
+                    canReplayTest = true,
                 )
-                playAnnouncementFile(result.file) {}
+                playTestAudio(result.file)
             } else {
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
                     isTestingBulletin = false,
@@ -464,10 +495,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val maleVoice = offlineVoices.getOrNull(1) ?: tts.voice
 
             val lines = listOf(
-                RadioSpeaker.Female to "Noticia rapida: cientistas brasileiros desenvolveram uma tecnica de reciclagem " +
-                    "de plastico usando bacterias marinhas.",
+                RadioSpeaker.Female to "Notícia rápida: cientistas brasileiros desenvolveram uma técnica de reciclagem " +
+                    "de plástico usando bactérias marinhas.",
                 RadioSpeaker.Male to "O estudo foi publicado essa semana e promete reduzir o descarte de garrafas " +
-                    "PET em ate setenta por cento nos proximos anos.",
+                    "PET em até setenta por cento nos próximos anos.",
                 RadioSpeaker.Female to "Fica a dica, e agora voltamos para a nossa programação normal.",
             )
             val startedAt = System.currentTimeMillis()
@@ -547,7 +578,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun updateRadioBulletinSettings(settings: RadioBulletinSettings) {
         radioPrefs.edit()
             .putString(KEY_RADIO_BULLETIN_MODE, settings.mode.name)
-            .putString(KEY_RADIO_BULLETIN_DURATION, settings.duration.name)
             .putBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, settings.preferLocalWriter)
             .apply()
         radioBulletinState.value = loadRadioBulletinUiState()
@@ -560,16 +590,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     ?: RadioBulletinMode.Dialogue.name,
             )
         }.getOrDefault(RadioBulletinMode.Dialogue)
-        val duration = runCatching {
-            RadioBulletinDuration.valueOf(
-                radioPrefs.getString(KEY_RADIO_BULLETIN_DURATION, RadioBulletinDuration.Short.name)
-                    ?: RadioBulletinDuration.Short.name,
-            )
-        }.getOrDefault(RadioBulletinDuration.Short)
+        // Duracao do boletim nao e mais preferencia do usuario - cada materia escolhe sozinha
+        // (ver RadioBulletinRepository.pickDuration) de acordo com o quanto de conteudo real
+        // tem pra render.
         val settings = RadioBulletinSettings(
             mode = mode,
             songsBetweenBulletins = RADIO_BULLETIN_DEFAULT_INTERVAL,
-            duration = duration,
             preferLocalWriter = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, true),
         )
         val status = bulletinRepository.localWriterStatus()
@@ -865,6 +891,114 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             availableGenres = repository.availableGenres(updatedSongs),
             suggestions = metadataState.value.suggestions - album.key,
             message = if (missing.isEmpty()) "Revisao concluida." else "Genero salvo. Proximo album.",
+        )
+    }
+
+    fun scanAlbumsWithoutArtwork() {
+        albumArtworkState.value = albumArtworkState.value.copy(isScanning = true, message = null)
+        viewModelScope.launch {
+            val songs = libraryState.value.songs
+            val missing = withContext(Dispatchers.Default) { repository.albumsWithoutArtwork(songs) }
+            albumArtworkState.value = albumArtworkState.value.copy(
+                albumsWithoutArtwork = missing,
+                isScanning = false,
+                message = if (missing.isEmpty()) "Todos os albuns ja tem capa." else null,
+            )
+        }
+    }
+
+    fun openArtworkSearch(album: LocalAlbum) {
+        pendingArtworkBytes = null
+        albumArtworkState.value = albumArtworkState.value.copy(
+            activeAlbumKey = album.key,
+            isSearching = true,
+            candidates = emptyList(),
+            selectedCandidate = null,
+            message = null,
+        )
+        viewModelScope.launch {
+            val results = repository.searchArtworkCandidates(album)
+            if (albumArtworkState.value.activeAlbumKey != album.key) return@launch
+            albumArtworkState.value = albumArtworkState.value.copy(
+                isSearching = false,
+                candidates = results,
+                message = if (results.isEmpty()) "Nenhuma capa encontrada pra \"${album.title}\"." else null,
+            )
+        }
+    }
+
+    fun closeArtworkSearch() {
+        pendingArtworkBytes = null
+        albumArtworkState.value = albumArtworkState.value.copy(
+            activeAlbumKey = null,
+            candidates = emptyList(),
+            selectedCandidate = null,
+            isDownloadingSelection = false,
+        )
+    }
+
+    fun selectArtworkCandidate(candidate: ArtworkCandidate) {
+        pendingArtworkBytes = null
+        albumArtworkState.value = albumArtworkState.value.copy(
+            selectedCandidate = candidate,
+            isDownloadingSelection = true,
+            message = null,
+        )
+        viewModelScope.launch {
+            val bytes = repository.downloadArtwork(candidate.fullUrl)
+            if (albumArtworkState.value.selectedCandidate != candidate) return@launch
+            pendingArtworkBytes = bytes
+            albumArtworkState.value = albumArtworkState.value.copy(
+                isDownloadingSelection = false,
+                message = if (bytes == null) "Nao consegui baixar essa capa, tenta outra." else null,
+            )
+        }
+    }
+
+    // Sincrono de proposito (mesmo padrao de createRecentMetadataEditWriteRequest): so pede a
+    // permissao de escrita se ja tiver os bytes da capa em mao, baixados em selectArtworkCandidate.
+    fun createArtworkApplyRequest(album: LocalAlbum): PendingIntent? {
+        if (pendingArtworkBytes == null) return null
+        return runCatching { repository.createArtworkWriteRequest(album) }.getOrNull()
+    }
+
+    fun applyPendingArtwork(album: LocalAlbum) {
+        val bytes = pendingArtworkBytes
+        if (bytes == null) {
+            albumArtworkState.value = albumArtworkState.value.copy(message = "Escolha uma capa antes de aplicar.")
+            return
+        }
+        albumArtworkState.value = albumArtworkState.value.copy(isApplying = true)
+        viewModelScope.launch {
+            val updated = runCatching { repository.applyArtworkToAlbum(album, bytes) }.getOrDefault(0)
+            pendingArtworkBytes = null
+            val message = if (updated > 0) {
+                "Capa aplicada em $updated faixas de \"${album.title}\"."
+            } else {
+                "Nao consegui gravar a capa em nenhuma faixa."
+            }
+            albumArtworkState.value = albumArtworkState.value.copy(
+                isApplying = false,
+                activeAlbumKey = null,
+                candidates = emptyList(),
+                selectedCandidate = null,
+                albumsWithoutArtwork = if (updated > 0) {
+                    albumArtworkState.value.albumsWithoutArtwork.filterNot { it.key == album.key }
+                } else {
+                    albumArtworkState.value.albumsWithoutArtwork
+                },
+                appliedVersion = if (updated > 0) albumArtworkState.value.appliedVersion + 1 else albumArtworkState.value.appliedVersion,
+                message = message,
+            )
+            showToast(message)
+        }
+    }
+
+    fun cancelArtworkApply() {
+        pendingArtworkBytes = null
+        albumArtworkState.value = albumArtworkState.value.copy(
+            isApplying = false,
+            message = "Permissao cancelada. Nada foi alterado.",
         )
     }
 
@@ -1171,6 +1305,56 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    fun createRadioFromAlbum(album: LocalAlbum) {
+        repository.createRadioFromAlbum(album)
+        rebuildLibraryContent()
+        showToast("Radio \"${album.title}\" criada.")
+    }
+
+    fun createRadioFromArtist(artist: LocalArtist) {
+        repository.createRadioFromArtist(artist)
+        rebuildLibraryContent()
+        showToast("Radio \"${artist.name}\" criada.")
+    }
+
+    fun createRadioFromGenre(genre: LocalRadio) {
+        if (repository.createRadioFromGenre(genre) == null) {
+            showToast("Categoria sem musicas pra criar radio.")
+            return
+        }
+        rebuildLibraryContent()
+        showToast("Radio \"${genre.name}\" criada.")
+    }
+
+    fun deleteCustomRadio(radio: LocalRadio) {
+        val customId = radio.customId ?: return
+        repository.deleteCustomRadio(customId)
+        rebuildLibraryContent()
+        showToast("Radio \"${radio.name}\" removida.")
+    }
+
+    // Radios de perfil/genero (Grunge, Anos 2000, Jazz etc.) nao tem definicao persistida pra
+    // apagar - sao recalculadas da biblioteca toda vez. "Apagar" aqui so tira da lista (ver
+    // MusicLibraryRepository.hideRadio); a vinheta por genero continua chaveada pelo nome
+    // (VINHETA_BY_RADIO_KEY abaixo), entao volta intacta se a radio for desocultada depois.
+    fun deleteRadio(radio: LocalRadio) {
+        if (radio.isCustom) {
+            deleteCustomRadio(radio)
+        } else {
+            repository.hideRadio(radio)
+            rebuildLibraryContent()
+            showToast("Radio \"${radio.name}\" removida.")
+        }
+    }
+
+    fun hasHiddenRadios(): Boolean = repository.hiddenRadioKeys().isNotEmpty()
+
+    fun restoreHiddenRadios() {
+        repository.unhideAllRadios()
+        rebuildLibraryContent()
+        showToast("Radios ocultas restauradas.")
+    }
+
     fun unifyArtistGroup(group: DuplicateArtistGroup) {
         repository.saveArtistUnification(group)
         val variants = group.variants.map { it.lowercase().trim() }.toSet()
@@ -1209,7 +1393,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         recordPlayback(songs[index].id)
         controller?.apply {
             shuffleModeEnabled = shuffle
-            setMediaItems(songs.map { it.toMediaItem() }, index, startPositionMs.coerceAtLeast(0L))
+            setMediaItems(songs.map { it.toMediaItem(radioName) }, index, startPositionMs.coerceAtLeast(0L))
             prepare()
             if (autoPlay) play()
         }
@@ -1311,6 +1495,24 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private fun reloadNewsBulletinsIfNeeded() {
+        if (bulletinReloadInFlight || !radioNewsEnabled) return
+        val radioName = activeRadioName
+        if (radioName.isBlank()) return
+        bulletinReloadInFlight = true
+        val settings = radioBulletinState.value.settings
+        viewModelScope.launch {
+            val reloaded = runCatching {
+                bulletinRepository.loadScripts(settings, radioName)
+            }.getOrDefault(emptyList())
+            if (reloaded.isNotEmpty() && activeRadioName == radioName) {
+                newsBulletins = reloaded
+                Log.d(TAG_RADIO_VOICE, "boletim: recarga recuperou ${reloaded.size} historias")
+            }
+            bulletinReloadInFlight = false
+        }
+    }
+
     private fun stopRadioNewsMode() {
         radioNewsEnabled = false
         completedRadioSongs = 0
@@ -1381,7 +1583,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
     private fun prepareUpcomingBulletin() {
-        if (!radioVoiceState.value.isEnabled || newsBulletins.isEmpty()) return
+        if (newsBulletins.isEmpty()) {
+            reloadNewsBulletinsIfNeeded()
+            return
+        }
+        if (!radioVoiceState.value.isEnabled) return
         if (bulletinPrepJob?.isActive == true) return
         val index = nextBulletinIndex % newsBulletins.size
         val script = newsBulletins[index]
@@ -1403,7 +1609,17 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun speakNextNewsBreak() {
-        if (!ttsReady || speakingNews || newsBulletins.isEmpty()) return
+        if (!ttsReady || speakingNews) return
+        if (newsBulletins.isEmpty()) {
+            // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed fora do
+            // ar - ver NewsBulletinRepository.loadStories, falha e ignorada silenciosamente por
+            // feed) e a lista ficava vazia pro resto da sessao, sem log e sem nova tentativa -
+            // o boletim simplesmente nunca mais tocava. Loga pra dar pra diagnosticar e tenta
+            // recarregar em segundo plano; essa chamada so desiste dessa vez.
+            Log.w(TAG_RADIO_VOICE, "boletim: newsBulletins vazio no intervalo - tentando recarregar")
+            reloadNewsBulletinsIfNeeded()
+            return
+        }
         val player = controller ?: return
         val bulletinIndex = nextBulletinIndex % newsBulletins.size
         val bulletin = newsBulletins[bulletinIndex]
@@ -1494,6 +1710,48 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
         controller?.let { updatePlayerState(it) }
+    }
+
+    // So pros botoes de teste em Configuracoes: ao contrario do playAnnouncementFile do boletim
+    // ao vivo (que sempre apaga o WAV depois de tocar - ver RADIO_PIPELINE.md), este mantem o
+    // arquivo no disco pra permitir repetir o mesmo teste sem sintetizar de novo (pedido do
+    // usuario - sintese local pode levar bastante tempo, ver BULLETIN_PREP_TIMEOUT_MS).
+    private fun playTestAudio(file: java.io.File) {
+        if (lastTestAudioFile != null && lastTestAudioFile != file) {
+            lastTestAudioFile?.delete()
+        }
+        lastTestAudioFile = file
+        announcementPlayer?.release()
+        announcementPlayer = null
+        runCatching {
+            MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                setOnCompletionListener {
+                    it.release()
+                    if (announcementPlayer === it) announcementPlayer = null
+                }
+                setOnErrorListener { player, _, _ ->
+                    player.release()
+                    if (announcementPlayer === player) announcementPlayer = null
+                    true
+                }
+                prepare()
+                start()
+                announcementPlayer = this
+            }
+        }
+    }
+
+    fun replayLastTestAudio() {
+        val file = lastTestAudioFile
+        if (file == null || !file.exists()) {
+            radioVoiceState.value = radioVoiceState.value.copy(
+                message = "Nenhum audio de teste pra repetir, gere um teste primeiro.",
+                canReplayTest = false,
+            )
+            return
+        }
+        playTestAudio(file)
     }
 
     private fun playAnnouncementFile(file: java.io.File, onFinished: () -> Unit) {
@@ -1595,7 +1853,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun String.toSingleLineScript(): RadioScript =
         RadioScript(
-            story = com.pailer.localtune.data.NewsStory(title = this, source = "Pailer Player"),
+            story = com.pailer.localtune.data.NewsStory(title = this, source = "Pailer FM"),
             source = RadioScriptSource.Fallback,
             lines = listOf(RadioScriptLine(RadioSpeaker.Female, this)),
         )
@@ -1631,6 +1889,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             artist = metadata?.artist?.toString().orEmpty(),
             album = metadata?.albumTitle?.toString().orEmpty(),
             artworkUri = metadata?.artworkUri,
+            artworkSourceUri = player.currentMediaItem?.localConfiguration?.uri,
             playbackSource = playbackSource,
             activeRadioName = activeRadioName,
             currentNewsHeadline = currentNewsHeadline,
@@ -1713,6 +1972,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.removeListener(playerListener)
         controllerFuture?.let(MediaController::releaseFuture)
         announcementPlayer?.release()
+        lastTestAudioFile?.delete()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         controller = null
@@ -1727,7 +1987,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_FAVORITE_SONGS = "favorite_song_ids"
         const val KEY_FAVORITE_ARTISTS = "favorite_artist_keys"
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
-        const val KEY_RADIO_BULLETIN_DURATION = "radio_bulletin_duration"
         const val KEY_RADIO_BULLETIN_LOCAL_WRITER = "radio_bulletin_local_writer"
         const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
         const val MAX_HISTORY_ITEMS = 80
@@ -1745,7 +2004,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // (~9-10s de load por locutor + ~2 chars/s de geracao) — modelo maior, sem cache
         // entre requests (ver TTS.md). 120s cortava o boletim quase no fim; 160s da folga
         // pequena so pra Curta — Normal/Longa com Kokoro provavelmente ainda estouram.
-        const val BULLETIN_PREP_TIMEOUT_MS = 160_000L
+        // Atualizacao (28/08/2026, ADR-014): "speed" do manifest caiu de 0.92 pra 0.85
+        // (locutores mais lentos, pedido do usuario) — audio ~9% mais longo pro mesmo
+        // texto, custo de geracao sobe na mesma proporcao. Timeout subiu pra 175s pra
+        // manter a mesma folga de antes.
+        const val BULLETIN_PREP_TIMEOUT_MS = 175_000L
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
@@ -1766,6 +2029,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             "mpb" to R.raw.vinheta_mpb,
             "hiphoprap" to R.raw.vinheta_hip_hop,
             "rapnacional" to R.raw.vinheta_rap,
+            "jazz" to R.raw.vinheta_jazz,
+            "anos2000" to R.raw.vinheta_anos_2000,
         )
     }
 }

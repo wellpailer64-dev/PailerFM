@@ -30,6 +30,14 @@ data class RadioVoicePackageConfig(
     val femaleVits: VitsConfig?,
     val maleVits: VitsConfig?,
     val kokoro: KokoroConfig?,
+    // femaleKokoro/maleKokoro + femaleEngine/maleEngine: so usados quando engine == "mixed"
+    // (ver ADR-014) - cada slot roda seu proprio motor (ex.: slot feminino em vits/piper, slot
+    // masculino em kokoro), diferente de vits-dual/piper-dual onde os dois slots sao sempre o
+    // mesmo motor.
+    val femaleKokoro: KokoroConfig?,
+    val maleKokoro: KokoroConfig?,
+    val femaleEngine: String?,
+    val maleEngine: String?,
     val supertonic: SupertonicConfig?,
 )
 
@@ -156,6 +164,7 @@ class RadioVoicePackageRepository(private val context: Context) {
         val engine = manifest.optString("engine").ifBlank { "vits" }.lowercase()
         val female = manifest.optString("femaleSpeaker").ifBlank { manifest.optString("female").ifBlank { "Locutora" } }
         val male = manifest.optString("maleSpeaker").ifBlank { manifest.optString("male").ifBlank { "Locutor" } }
+        val voicesJson = manifest.optJSONObject("voices")
         return RadioVoicePackageConfig(
             rootDir = rootDir,
             name = name,
@@ -187,14 +196,12 @@ class RadioVoicePackageRepository(private val context: Context) {
             } else {
                 null
             },
-            femaleVits = manifest.optJSONObject("voices")
-                ?.optJSONObject("female")
-                ?.optJSONObject("vits")
-                ?.toVitsConfig(),
-            maleVits = manifest.optJSONObject("voices")
-                ?.optJSONObject("male")
-                ?.optJSONObject("vits")
-                ?.toVitsConfig(),
+            femaleVits = voicesJson?.optJSONObject("female")?.optJSONObject("vits")?.toVitsConfig(),
+            maleVits = voicesJson?.optJSONObject("male")?.optJSONObject("vits")?.toVitsConfig(),
+            femaleKokoro = voicesJson?.optJSONObject("female")?.optJSONObject("kokoro")?.toKokoroConfig(),
+            maleKokoro = voicesJson?.optJSONObject("male")?.optJSONObject("kokoro")?.toKokoroConfig(),
+            femaleEngine = voicesJson?.optJSONObject("female")?.optString("engine")?.lowercase()?.ifBlank { null },
+            maleEngine = voicesJson?.optJSONObject("male")?.optString("engine")?.lowercase()?.ifBlank { null },
             kokoro = manifest.optJSONObject("kokoro")?.let {
                 KokoroConfig(
                     model = it.optString("model"),
@@ -239,6 +246,10 @@ class RadioVoicePackageRepository(private val context: Context) {
                 validateVitsFiles(config.rootDir, config.femaleVits ?: error("Manifest sem voz feminina."))
                 validateVitsFiles(config.rootDir, config.maleVits ?: error("Manifest sem voz masculina."))
             }
+            "mixed" -> {
+                validateMixedSlot(config.rootDir, "feminino", config.femaleEngine, config.femaleVits, config.femaleKokoro)
+                validateMixedSlot(config.rootDir, "masculino", config.maleEngine, config.maleVits, config.maleKokoro)
+            }
             "kokoro" -> {
                 val kokoro = config.kokoro ?: error("Manifest sem configuracao kokoro.")
                 requirePackageFile(config.rootDir, kokoro.model, "modelo .onnx")
@@ -272,6 +283,37 @@ class RadioVoicePackageRepository(private val context: Context) {
             noiseScaleW = optDouble("noiseScaleW", 0.8).toFloat(),
             lengthScale = optDouble("lengthScale", 1.0).toFloat(),
         )
+
+    private fun JSONObject.toKokoroConfig(): KokoroConfig =
+        KokoroConfig(
+            model = optString("model"),
+            voices = optString("voices"),
+            tokens = optString("tokens"),
+            dataDir = optString("dataDir"),
+            lexicon = optString("lexicon"),
+            lang = optString("lang").ifBlank { "pt-br" },
+            dictDir = optString("dictDir"),
+            lengthScale = optDouble("lengthScale", 1.0).toFloat(),
+        )
+
+    private fun validateMixedSlot(
+        rootDir: File,
+        label: String,
+        engine: String?,
+        vits: VitsConfig?,
+        kokoro: KokoroConfig?,
+    ) {
+        when (engine) {
+            "vits", "piper" -> validateVitsFiles(rootDir, vits ?: error("Slot $label (mixed/$engine) sem configuracao vits."))
+            "kokoro" -> {
+                val cfg = kokoro ?: error("Slot $label (mixed/kokoro) sem configuracao kokoro.")
+                requirePackageFile(rootDir, cfg.model, "modelo .onnx do slot $label")
+                requirePackageFile(rootDir, cfg.voices, "voices do slot $label")
+                requirePackageFile(rootDir, cfg.tokens, "tokens do slot $label")
+            }
+            else -> error("Slot $label sem motor valido no modo mixed (engine ausente ou nao suportado: '$engine').")
+        }
+    }
 
     private fun validateVitsFiles(rootDir: File, vits: VitsConfig) {
         requirePackageFile(rootDir, vits.model, "modelo .onnx")

@@ -92,6 +92,9 @@ dependencies {
     implementation("androidx.media3:media3-session:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
 
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("io.coil-kt:coil-gif:2.6.0")
+
     implementation(files("libs/sherpa-onnx-static-link-onnxruntime-1.13.6.aar"))
     implementation("com.google.guava:guava:33.2.0-android")
     implementation("net.jthink:jaudiotagger:3.0.1")
