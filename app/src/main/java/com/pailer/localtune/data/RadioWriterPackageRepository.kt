@@ -188,6 +188,7 @@ object LocalLlamaTextGenerator {
     ): String
 
     // 02/09/2026: era 20_000 e abortava o decode a poucos instantes do fim (~27s reais neste
-    // aparelho) - causa raiz do "modelo não carrega" relatado em 01/09. Ver ADR-002.
-    private const val LOCAL_WRITER_NATIVE_TIMEOUT_MS = 45_000
+    // aparelho) - causa raiz do "modelo não carrega" relatado em 01/09. Subiu de novo (45s->60s)
+    // porque o prompt cresceu (exemplo few-shot contra o bug de "eco da instrução"). Ver ADR-002.
+    private const val LOCAL_WRITER_NATIVE_TIMEOUT_MS = 60_000
 }

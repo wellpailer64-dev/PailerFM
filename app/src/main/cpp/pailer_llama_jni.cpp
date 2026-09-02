@@ -99,7 +99,11 @@ Java_com_pailer_localtune_data_LocalLlamaTextGenerator_generateNative(
     const int32_t predict = std::max(16, std::min(static_cast<int32_t>(max_tokens), 260));
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(std::min(n_prompt + predict + 32, 2048));
-    ctx_params.n_batch = static_cast<uint32_t>(std::min(n_prompt, 512));
+    // n_batch precisa caber o prompt inteiro - decode() manda todos os n_prompt tokens de uma vez
+    // via llama_batch_get_one(). Um cap fixo abaixo de n_prompt (era 512) dispara
+    // GGML_ASSERT(n_tokens_all <= cparams.n_batch) dentro do llama_decode e mata o processo
+    // inteiro com SIGABRT - visto em campo em 02/09/2026 quando o prompt cresceu (ver ADR-002).
+    ctx_params.n_batch = static_cast<uint32_t>(std::min(n_prompt, 2048));
     ctx_params.n_ubatch = 128;
     ctx_params.no_perf = true;
     ctx_params.abort_callback = abort_when_expired;

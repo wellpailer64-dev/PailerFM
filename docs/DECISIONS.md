@@ -70,6 +70,45 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Não mudar sem (atualização):** manter o `llama_log_set()` — sem ele, qualquer futura
   falha do redator local volta a ser uma mensagem genérica sem pista nenhuma do que
   aconteceu de fato dentro do llama.cpp.
+- **Atualização (02/09/2026, eco de instrução + acentuação + crash nativo):** usuário
+  ouviu um boletim real e reportou que o Frankie/Nicky literalmente falaram a instrução
+  do roteiro ("provocação esperançosa, sem ingenuidade", "contra provocação... volta pra
+  rádio") em vez de gerar a fala de verdade - o Qwen3 1.7B copiou a descrição da
+  instrução como se fosse texto pra falar. Três correções em `buildPrompt()`/
+  `parseGeneratedLines()` (`RadioBulletin.kt`):
+  1. Prompt reescrito com um exemplo few-shot completo (matéria fictícia de trânsito)
+     mostrando o estilo esperado, mais instrução explícita "as descrições abaixo dizem O
+     QUE cada fala deve fazer, não são texto pra repetir". Modelos pequenos seguem
+     exemplo concreto muito melhor que instrução abstrata.
+  2. Reforçada a exigência de acentuação/pontuação corretas no prompt (mesmo motivo do
+     ADR-015, agora pro texto que o LLM gera em vez de string fixa no código) e
+     adicionada uma checagem de segurança em runtime (`hasAccentuation()`): se o roteiro
+     gerado não tiver nenhum caractere acentuado, é sinal de que saiu sem acento e cai no
+     fallback - texto de português corrido desse tamanho quase sempre tem acento, então
+     zero acentos é sinal forte de problema.
+  3. **Bug mais sério achado no processo**: o prompt maior (por causa do exemplo
+     few-shot) ultrapassou um cap fixo de 512 tokens que `pailer_llama_jni.cpp` usava pro
+     `n_batch` do llama.cpp. Como `decode()` manda o prompt inteiro de uma vez via
+     `llama_batch_get_one()`, um `n_batch` menor que o prompt viola um invariante interno
+     do llama.cpp (`GGML_ASSERT(n_tokens_all <= cparams.n_batch)`) e derruba o **processo
+     inteiro** com `SIGABRT` - não é um erro tratável em Kotlin, mata o app (incluindo a
+     música tocando) sem aviso. Corrigido trocando o cap fixo de 512 por `min(n_prompt,
+     2048)` (mesmo teto usado em `n_ctx`), já que `n_batch` precisa sempre caber o prompt
+     inteiro nesse fluxo de decode em lote único.
+  Timeouts subiram de novo (45s→60s nativo, 55s→70s Kotlin) porque o prompt maior aumenta
+  o tempo de prefill. Testado em campo: gerou boletim de 4 falas com acentuação correta e
+  sem eco de instrução, ex.: "A executiva do Bank of America foi morta a facadas em Times
+  Square, Nova York. Policiais atiraram contra ela, sem motivo, diz a polícia." Log do
+  texto gerado adicionado (`Log.d(TAG_RADIO_WRITER, "redator local texto: ...")`) pra
+  inspeção futura sem precisar reconstruir com log temporário de novo.
+- **Risco conhecido, não corrigido:** o redator local roda no processo principal do app
+  (mesmo `Dispatchers.Default` do `LocalTuneViewModel`), não isolado como o TTS
+  (`:radio_voice`, ver ADR-001). O bug do `n_batch` acima mostra que o llama.cpp pode
+  matar o processo inteiro com `SIGABRT` num assert interno - a mesma classe de risco que
+  motivou isolar o TTS em processo separado se aplica aqui, só que ainda não foi feito
+  pro redator. Avaliar mover `LocalLlamaTextGenerator`/`OptionalLocalLlmRadioScriptWriter`
+  pro processo `:radio_voice` (ou um processo próprio) antes de confiar no redator local
+  como algo mais que "enhancement opcional que não pode derrubar a rádio".
 
 ## ADR-003 — Engine TTS criado por request (sem cache persistente entre boletins)
 

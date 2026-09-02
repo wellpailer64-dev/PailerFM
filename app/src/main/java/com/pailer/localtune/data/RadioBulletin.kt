@@ -189,25 +189,44 @@ private class OptionalLocalLlmRadioScriptWriter(
             val generated = withTimeoutOrNull(LOCAL_WRITER_TIMEOUT_MS) {
                 LocalLlamaTextGenerator.generate(config, buildPrompt(story, context))
             } ?: error("Redator local demorou demais")
+            val lines = parseGeneratedLines(generated)
+            Log.d(TAG_RADIO_WRITER, "redator local texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
             RadioScript(
                 story = story,
                 source = RadioScriptSource.LocalLlm,
-                lines = parseGeneratedLines(generated),
+                lines = lines,
             )
         }
 
     private fun buildPrompt(story: NewsStory, context: RadioScriptContext): String {
         val title = story.title.toRadioSentence().limitWords(22)
         val summary = story.summary.ifBlank { "Sem resumo disponível." }.toRadioSentence().limitWords(55)
+        // O exemplo abaixo e as instrucoes de acentuacao existem por causa de dois bugs vistos em
+        // teste real no aparelho (02/09/2026, ver ADR-002): (1) sem um exemplo concreto, o modelo
+        // (Qwen3 1.7B) as vezes copiava a PROPRIA instrucao ("provocacao esperancosa, sem
+        // ingenuidade") como se fosse a fala, em vez de escrever uma fala de verdade seguindo
+        // aquela instrucao; (2) texto sem acento sai com pronuncia errada no sintetizador (mesma
+        // causa do ADR-015, so que agora na saida do LLM em vez de string fixa no codigo).
         return """
             <|im_start|>system
-            Roteirista da Pailer FM. PT-BR correto. Responda só JSON válido:
+            Roteirista da Pailer FM. Escreva em português correto e completo, com todos os
+            acentos (á é í ó ú â ê ô ã õ ç) e toda a pontuação (vírgulas, pontos) - o texto vai
+            direto pra um sintetizador de voz que só pronuncia certo com acentuação correta.
+            Responda só JSON válido, um array de 4 objetos:
             [{"speaker":"Female","text":"..."},{"speaker":"Male","text":"..."}]
-            Use exatamente 4 falas curtas:
-            1 Female/Frankie: notícia.
-            2 Male/Nicky: detalhe da matéria e leitura crítica.
-            3 Female/Frankie: provocação esperançosa, sem ingenuidade.
-            4 Male/Nicky: contra provocação e volta para a Rádio ${context.radioName}.
+            As instruções abaixo dizem O QUE cada fala deve fazer - NÃO são texto pra repetir.
+            Nunca escreva a instrução em si (tipo a palavra "provocação") como se fosse a fala;
+            escreva a fala de verdade, como um locutor falaria ao vivo. Exemplo (matéria
+            fictícia sobre trânsito, só pra mostrar o estilo esperado):
+            [{"speaker":"Female","text":"A prefeitura anunciou um novo corredor de ônibus pra Avenida Central."},
+            {"speaker":"Male","text":"A promessa é reduzir o tempo de viagem, mas o financiamento ainda depende da Câmara."},
+            {"speaker":"Female","text":"Se sair do papel, é um baita alívio pra quem enfrenta esse trânsito todo dia."},
+            {"speaker":"Male","text":"Vamos ver se vira obra ou só mais um anúncio. De volta pra Rádio ${context.radioName}."}]
+            Estrutura das 4 falas desta matéria:
+            1 Female/Frankie: conte a notícia.
+            2 Male/Nicky: traga um detalhe da matéria com leitura crítica.
+            3 Female/Frankie: reaja com otimismo realista, sem soar ingênua.
+            4 Male/Nicky: rebata com outra visão e puxe o ouvinte de volta pra Rádio ${context.radioName}.
             Nicky conhece capitalismo, imperialismo, lobby e corporativismo, mas não cite isso toda hora.
             Não invente fatos. Máximo 18 palavras por fala.
             <|im_end|>
@@ -241,16 +260,24 @@ private class OptionalLocalLlmRadioScriptWriter(
             val text = item.optString("text").toRadioSentence().ensureFinalPeriod()
             if (text.isBlank()) null else RadioScriptLine(speaker, text.limitWords(32))
         }.takeIf { lines ->
-            lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female
+            lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female && hasAccentuation(lines)
         } ?: error("Redator local devolveu roteiro inválido")
     }
 
+    // Texto de português corrido deste tamanho praticamente sempre tem pelo menos um caractere
+    // acentuado ("não", "é", "está", "notícia"...) - se não tiver nenhum, é sinal de que o
+    // modelo escreveu sem acento (mesma causa raiz do ADR-015, agora na saída do LLM em vez de
+    // string fixa no código) e a pronúncia vai sair errada. Cai no fallback nesse caso.
+    private fun hasAccentuation(lines: List<RadioScriptLine>): Boolean =
+        lines.joinToString(" ") { it.text }.any { it in ACCENTED_CHARS }
+
     private companion object {
         // 02/09/2026: decode real medido em ~27s neste aparelho (Dimensity 1200, 3 threads,
-        // Qwen3 1.7B Q4_K_M) - ver ADR-002. Timeout antigo de 35s já dava folga, o gargalo real
-        // era o timeout nativo (ver LOCAL_WRITER_NATIVE_TIMEOUT_MS). Mantido com folga generosa
-        // porque prepareUpcomingBulletin() roda em background durante a música, não bloqueia nada.
-        const val LOCAL_WRITER_TIMEOUT_MS = 55_000L
+        // Qwen3 1.7B Q4_K_M) - ver ADR-002. Prompt cresceu (exemplo few-shot contra o bug de
+        // "eco da instrução") então subiu de novo com folga. Mantido generoso porque
+        // prepareUpcomingBulletin() roda em background durante a música, não bloqueia nada.
+        const val LOCAL_WRITER_TIMEOUT_MS = 70_000L
+        const val ACCENTED_CHARS = "áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ"
     }
 }
 
