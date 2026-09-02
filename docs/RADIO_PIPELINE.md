@@ -106,11 +106,15 @@ Interface `RadioScriptWriter` com duas implementações:
 
 | Escritor | Quando é usado | Comportamento |
 |---|---|---|
-| `OptionalLocalLlmRadioScriptWriter` | modo Dialogue + pacote LLM instalado (`filesDir/radio_writer/model.ready`) | **Ainda não implementado** — lança erro; o chamador cai no fallback via `runCatching`. Ponto de extensão futuro. |
-| `FallbackRadioScriptWriter` | sempre disponível | Bate-bola entre Frankie (otimista) e Nicky (pessimista) — ver ADR-014 — ou headline curta (2 falas, só Frankie). |
+| `OptionalLocalLlmRadioScriptWriter` | modo Dialogue + pacote LLM instalado (`filesDir/radio_writer/model.ready`) | Usa Qwen3 1.7B GGUF via `llama.cpp` para reescrever o próximo boletim em JSON curto; qualquer falha, demora ou JSON inválido cai no fallback. |
+| `FallbackRadioScriptWriter` | sempre disponível | Bate-bola entre Frankie (otimista) e Nicky (pessimista), com abertura citando a última música, resumo da matéria pelo Nicky, provocação/contra provocação e chamada de volta para a rádio — ver ADR-014 — ou headline curta (2 falas, só Frankie). |
 
 Modos do usuário (`RadioBulletinMode`): `Off`, `Headlines` (só manchete), `Dialogue`
 (diálogo completo, tenta redator local primeiro).
+
+O pacote do redator local é importado pela tela de boletins. Ele fica fora do APK por
+tamanho: o pacote recomendado é `dist/Pailer-Radio-Writer-Qwen3-1.7B-Q4KM-v1.zip`
+(~1,03 GB), com `manifest.json` + `Qwen3-1.7B-Q4_K_M.gguf`.
 
 ### Bate-bola Frankie/Nicky (ADR-014)
 
@@ -118,8 +122,33 @@ Modos do usuário (`RadioBulletinMode`): `Off`, `Headlines` (só manchete), `Dia
 resumo, por palavra-chave — política, economia, ciência/tecnologia, saúde, cultura pop,
 esporte, clima, curiosidade, mundo/conflito ou geral) e monta as falas com bancos de
 texto próprios por tema para cada personagem, em vez de reações genéricas soltas.
+O Nicky agora resume ou explica a matéria antes de criticar, usando o resumo real do RSS
+quando existe. A opinião dos dois parte de uma leitura de mundo mais forte: capitalismo
+tardio, jogo imperialista, corporativismo, lobby, indústria cultural, plataformas e
+mercado financeiro aparecem como bagagem cultural, não como bordão repetido em toda fala.
 Extrai também um "gancho" (primeiro percentual, valor em R$ ou número grande do texto)
-pra referenciar algo concreto da matéria.
+para referenciar algo concreto da matéria.
+
+Na hora de tocar ou preparar o boletim, `LocalTuneViewModel` injeta a última faixa ouvida
+na primeira fala: "Você acaba de ouvir X, de Y, e vamos às notícias." Isso acontece só no
+contexto de reprodução, porque os roteiros-base são carregados quando a rádio começa e a
+música anterior só é conhecida no intervalo.
+
+Para não travar a entrada da rádio, `loadScripts()` continua carregando roteiros-base via
+fallback determinístico. O redator local entra em `prepareUpcomingBulletin()`, só para o
+próximo boletim. A versão gerada fica cacheada como texto e, se a voz local estiver ligada,
+também como áudio. Assim o app evita gerar oito notícias de uma vez e mantém silêncio
+mínimo entre as músicas.
+
+Regra de segurança em produção: depois que a música pausa, o app não chama mais o redator
+local nem tenta sintetizar voz local pesada se o WAV não estava pronto. Se o roteiro/áudio
+preparado não chegou a tempo, o boletim entra imediatamente com o roteiro-base e TTS do
+Android. A voz local é ganho de qualidade quando chega antes do intervalo, não dependência
+para a rádio continuar falando.
+
+O botão de teste de boletim também usa o caminho real: busca uma notícia RSS no momento,
+monta o roteiro, aplica o redator local se estiver disponível, sintetiza e toca o resultado.
+Não usa mais um texto fixo de demonstração.
 
 Diferença chave da versão antiga: o número de falas é decidido **pela duração**, não
 cortado depois por `fitFor()` — antes um script fixo de 3 falas podia perder a última
@@ -127,9 +156,9 @@ inteira se estourasse o limite de palavras, quebrando a participação igual dos
 
 | Duração | Falas | Estrutura |
 |---|---|---|
-| Short | 2 (1 cada) | Frankie parafraseia a manchete pro Nicky → Nicky reage com opinião do tema |
-| Normal | 4 (2 cada) | + Frankie contra-argumenta (otimista) → fecha (Frankie ou Nicky, alterna por hash do título) |
-| Long | 6 (3 cada) | + gancho/punchline do Nicky → punchline otimista do Frankie → fechamento |
+| Short | 5 | última música + manchete do Frankie → Nicky resume/explica com leitura crítica → Frankie provoca sem ingenuidade → Nicky contra provoca → volta para a rádio |
+| Normal | 5 | mesma estrutura, com mais margem de palavras para resumo e comentário |
+| Long | 6 | + uma fala extra do Nicky contextualizando consequência/gancho antes da provocação |
 
 `fitFor()` continua como rede de segurança (apara palavras se algum banco de texto sair
 grande), mas não deve mais precisar cortar linha inteira em uso normal.
@@ -138,9 +167,9 @@ Duração → limite de palavras aplicado por `fitFor()`:
 
 | Duração | Segundos alvo | Máx. palavras |
 |---|---|---|
-| Short | 20 | 55 |
-| Normal | 30 | 80 |
-| Long | 45 | 115 |
+| Short | 20 | 155 |
+| Normal | 30 | 190 |
+| Long | 45 | 235 |
 
 Cada fala vira uma linha `RadioScriptLine(speaker, text)` — o speaker define qual voz
 do pacote sintetiza aquela linha (ver [TTS.md](TTS.md)). Os enums `RadioSpeaker.Female`/
@@ -162,7 +191,7 @@ masculinas (Frankie no slot Female, Nicky no slot Male).
 - Anúncio local (sherpa) e vinhetas gravadas dividem o mesmo `MediaPlayer` dedicado
   (`announcementPlayer`) e o mesmo watchdog de 90 s — um por vez, release do anterior
   antes do novo;
-- Anúncio fallback (boletim sem sherpa): TTS do sistema com `QUEUE_FLUSH`; vinhetas não
+- Anúncio fallback (boletim sem WAV local pronto): TTS do sistema com `QUEUE_FLUSH`; vinhetas não
   têm fallback de TTS — se o `MediaPlayer` falhar, pula direto pra música;
 - Widgets/notificação continuam operando o player de música normalmente — é daí que
   nascem as races de "música por cima da locução" (R2 em [STATE_MACHINE.md](STATE_MACHINE.md)).

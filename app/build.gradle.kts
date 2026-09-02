@@ -31,6 +31,22 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += listOf(
+                    "-DLLAMA_BUILD_TESTS=OFF",
+                    "-DLLAMA_BUILD_EXAMPLES=OFF",
+                    "-DLLAMA_BUILD_TOOLS=OFF",
+                    "-DLLAMA_BUILD_SERVER=OFF",
+                    "-DLLAMA_BUILD_APP=OFF",
+                    "-DLLAMA_BUILD_COMMON=OFF",
+                    "-DLLAMA_CURL=OFF",
+                    "-DGGML_OPENMP=OFF",
+                )
+            }
+        }
     }
 
     signingConfigs {
@@ -66,6 +82,13 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     kotlinOptions {

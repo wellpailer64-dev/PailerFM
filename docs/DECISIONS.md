@@ -30,6 +30,46 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Motivo:** comportamento previsível por padrão; LLM é enhancement opcional plugável.
 - **Não mudar sem:** manter garantia de fallback. Nunca deixar a rádio dependente do
   redator local para existir.
+- **Atualização (01/09/2026):** o redator local foi ligado com Qwen3 1.7B Q4_K_M em
+  GGUF, executado por `llama.cpp` via JNI (`pailer_llama`). O modelo não entra no APK:
+  fica em pacote importável (`manifest.json` + `.gguf`) e é copiado para
+  `filesDir/radio_writer`. Para não gerar oito matérias ao entrar na rádio, `loadScripts`
+  continua criando roteiros-base determinísticos e o LLM só reescreve o próximo boletim
+  durante `prepareUpcomingBulletin()`. Se o modelo demorar, falhar ou devolver JSON ruim,
+  o fallback já existente continua tocando.
+- **Atualização (01/09/2026, falha em campo):** se o roteiro/áudio preparado não estiver
+  pronto quando chega a hora do boletim, a rádio não chama mais LLM nem síntese local
+  depois de pausar a música. Ela usa imediatamente o roteiro-base com TTS do Android.
+  O teste de boletim também deixou de usar texto fixo e passou a buscar uma notícia RSS
+  real no momento do teste.
+- **Atualização (02/09/2026, diagnóstico "modelo não carrega"):** o redator local sempre
+  caía no fallback em campo. Log nativo do llama.cpp não chegava ao logcat (stderr não é
+  redirecionado por padrão em app Android) — adicionado `llama_log_set()` encaminhando pra
+  `__android_log_print` (tag `PailerLlama`) em `pailer_llama_jni.cpp` pra diagnosticar.
+  Três causas encontradas, todas no mesmo teste em device real (Motorola Edge 40,
+  Dimensity 1200, 3 threads):
+  1. `LOCAL_WRITER_NATIVE_TIMEOUT_MS` (20 s) abortava o `llama_decode` via
+     `abort_callback` a poucos instantes do fim — o decode real leva ~19-27 s neste
+     aparelho pra um prompt de ~300 tokens. Subiu pra 45 s (nativo) / 55 s (wrapper
+     Kotlin `LOCAL_WRITER_TIMEOUT_MS`), com folga generosa porque a geração roda em
+     background durante a música (`prepareUpcomingBulletin()`), não bloqueia a entrada.
+  2. Qwen3 é um modelo "híbrido" que pensa por padrão (`<think>...</think>`) mesmo com
+     ChatML cru sem ferramenta de template - o raciocínio consumia o orçamento de tokens
+     inteiro antes de chegar no JSON. Corrigido com `/no_think` no turno do usuário +
+     bloco `<think>\n\n</think>\n\n` já vazio pré-preenchido no turno do assistente
+     (`buildPrompt()`).
+  3. `maxTokens` estava fixo em no máximo 96 no código (Kotlin e JNI), abaixo do que o
+     manifest do pacote já pedia (260) e insuficiente pra 4 falas em JSON - cortava a
+     resposta no meio de uma string. Subiu o teto pra 260 nos dois lados. Também
+     pré-preenchido o `[` de abertura do array no prompt (trava o formato sem precisar
+     mudar o parser, que já lida bem com JSON sem colchete de abertura).
+  Com os três ajustes, teste real gerou e sintetizou boletim completo via LLM local
+  (`roteiro=LocalLlm`) em teste em campo. Variância normal do modelo (roteiro que não
+  bate no formato de 4 falas) ainda cai no fallback determinístico, como já era o
+  comportamento esperado - não é bug, é o design do ADR funcionando.
+- **Não mudar sem (atualização):** manter o `llama_log_set()` — sem ele, qualquer futura
+  falha do redator local volta a ser uma mensagem genérica sem pista nenhuma do que
+  aconteceu de fato dentro do llama.cpp.
 
 ## ADR-003 — Engine TTS criado por request (sem cache persistente entre boletins)
 
@@ -292,6 +332,20 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   rejeitado (mesma sessão, personagem "Frankie"). Kokoro pt-BR ficou então limitado a
   1 voz aprovada (`pm_alex`, ID 43, hoje o Nicky) — os outros dois speakers do pacote já
   foram testados e recusados. Continuação em ADR-015.
+- **Atualização (01/09/2026):** o diálogo deixou de ser "manchete + crítica genérica".
+  A primeira fala agora pode receber, em tempo de reprodução, a última música ouvida
+  ("Você acaba de ouvir X, de Y, e vamos às notícias."); o Nicky passa a resumir ou
+  explicar a matéria usando o resumo real do RSS antes de fazer a leitura pessimista; o
+  Frankie provoca pelo lado otimista; o Nicky contra provoca com gancho ou consequência;
+  e o boletim fecha chamando a música da rádio de volta. Mesmo a duração Short usa essa
+  estrutura mínima de 5 falas, aceitando um boletim um pouco maior para soar mais
+  inteligente e menos automático.
+- **Atualização (01/09/2026, tom editorial):** os dois locutores ganharam uma leitura de
+  mundo mais forte. Eles entendem capitalismo tardio, imperialismo, corporativismo,
+  indústria cultural, lobby, plataformas e captura de mercado, mas essa bagagem aparece
+  como forma de observar a notícia, não como bordão obrigatório. O Frankie continua
+  sendo o contraponto menos cínico, mas deixou de soar ingênuo; o Nicky critica com mais
+  análise material e menos reclamação solta.
 
 ## ADR-015 — Bug de acentuação no texto do bate-bola + motor de voz "mixed"
 
@@ -426,4 +480,3 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   mesmo bug em mais um lugar. Ao mexer em `hideRadio()`/`VINHETA_BY_RADIO_KEY`, manter os
   dois desacoplados (um não deve depender do outro) — é isso que garante a vinheta
   sobreviver ao apagar/recriar.
-

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon exige a arte dentro da "safe zone" central (~66% do canvas 108dp) - sem
+     esse respiro, mascaras de launcher (circulo/squircle/cantos arredondados) cortam bordas
+     da logo, incluindo o topo. Inset encolhe a logo pra caber com folga. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/pailer_logo"
+    android:insetLeft="16%"
+    android:insetTop="16%"
+    android:insetRight="16%"
+    android:insetBottom="16%" />

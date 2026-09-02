@@ -1,8 +1,11 @@
 package com.pailer.localtune.data
 
 import android.content.Context
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 
 enum class RadioBulletinMode {
     Off,
@@ -56,6 +59,26 @@ data class RadioScript(
         get() = lines.joinToString(" ") { it.text }
 }
 
+data class RadioLastPlayedTrack(
+    val title: String,
+    val artist: String = "",
+)
+
+fun RadioScript.withLastPlayedIntro(track: RadioLastPlayedTrack?): RadioScript {
+    val playedTrack = track ?: return this
+    val cleanTitle = playedTrack.title.toRadioSentence().limitWords(14)
+    if (cleanTitle.isBlank() || lines.isEmpty()) return this
+    val cleanArtist = playedTrack.artist.toRadioSentence().limitWords(8)
+    val intro = if (cleanArtist.isBlank()) {
+        "Você acaba de ouvir $cleanTitle, e vamos às notícias."
+    } else {
+        "Você acaba de ouvir $cleanTitle, de $cleanArtist, e vamos às notícias."
+    }
+    return copy(lines = lines.mapIndexed { index, line ->
+        if (index == 0) line.copy(text = "$intro ${line.text}") else line
+    })
+}
+
 enum class RadioScriptSource {
     LocalLlm,
     Fallback,
@@ -93,9 +116,38 @@ class RadioBulletinRepository(context: Context) {
             when (settings.mode) {
                 RadioBulletinMode.Off -> null
                 RadioBulletinMode.Headlines -> fallbackWriter.writeHeadline(story, scriptContext)
-                RadioBulletinMode.Dialogue -> writeDialogue(story, scriptContext, settings.preferLocalWriter)
+                RadioBulletinMode.Dialogue -> fallbackWriter.write(story, scriptContext)
             }
         }.filterNotNull()
+    }
+
+    suspend fun loadLiveTestScript(settings: RadioBulletinSettings, radioName: String): RadioScript? {
+        if (settings.mode == RadioBulletinMode.Off) return null
+        val story = newsRepository.loadStories().firstOrNull() ?: return null
+        val context = RadioScriptContext(radioName = radioName, duration = pickDuration(story))
+        val baseScript = when (settings.mode) {
+            RadioBulletinMode.Off -> return null
+            RadioBulletinMode.Headlines -> fallbackWriter.writeHeadline(story, context)
+            RadioBulletinMode.Dialogue -> fallbackWriter.write(story, context)
+        }
+        return enhanceScript(baseScript, settings, radioName)
+    }
+
+    suspend fun enhanceScript(script: RadioScript, settings: RadioBulletinSettings, radioName: String): RadioScript {
+        if (settings.mode != RadioBulletinMode.Dialogue || !settings.preferLocalWriter) return script
+        if (!localWriter.status().isInstalled) {
+            Log.d(TAG_RADIO_WRITER, "redator local ausente; usando roteiro base")
+            return script
+        }
+        val context = RadioScriptContext(radioName = radioName, duration = pickDuration(script.story))
+        Log.d(TAG_RADIO_WRITER, "redator local iniciando para '${script.story.title}'")
+        return runCatching {
+            localWriter.write(script.story, context)
+        }.onSuccess {
+            Log.d(TAG_RADIO_WRITER, "redator local gerou ${it.lines.size} falas para '${script.story.title}'")
+        }.onFailure {
+            Log.w(TAG_RADIO_WRITER, "redator local falhou; usando roteiro base para '${script.story.title}'", it)
+        }.getOrDefault(script)
     }
 
     // Materia rica (resumo longo e/ou com numero/valor concreto pra comentar) rende bate-bola
@@ -111,40 +163,95 @@ class RadioBulletinRepository(context: Context) {
         }
     }
 
-    private suspend fun writeDialogue(
-        story: NewsStory,
-        context: RadioScriptContext,
-        preferLocalWriter: Boolean,
-    ): RadioScript {
-        if (preferLocalWriter && localWriter.status().isInstalled) {
-            runCatching { return localWriter.write(story, context) }
-        }
-        return fallbackWriter.write(story, context)
-    }
 }
 
 private class OptionalLocalLlmRadioScriptWriter(
     private val context: Context,
 ) : RadioScriptWriter {
+    private val packageRepository = RadioWriterPackageRepository(context)
+
     fun status(): LocalRadioWriterStatus {
-        val modelDir = context.filesDir.resolve("radio_writer")
-        val installed = modelDir.resolve("model.ready").exists()
+        val status = packageRepository.status()
         return LocalRadioWriterStatus(
-            isInstalled = installed,
-            modelName = "Redator local leve",
-            detail = if (installed) {
-                "Pacote local encontrado"
+            isInstalled = status.isInstalled,
+            modelName = status.packageName,
+            detail = if (status.isInstalled) {
+                "${status.modelName}. ${status.detail}"
             } else {
-                "Pacote de LLM ainda nao instalado"
+                status.detail
             },
         )
     }
 
     override suspend fun write(story: NewsStory, context: RadioScriptContext): RadioScript =
         withContext(Dispatchers.Default) {
-            // O pacote real de LLM entra aqui depois: prompt controlado, JSON curto e timeout agressivo.
-            error("Local LLM writer is not wired yet")
+            val config = packageRepository.config() ?: error("Pacote de redator local ausente")
+            val generated = withTimeoutOrNull(LOCAL_WRITER_TIMEOUT_MS) {
+                LocalLlamaTextGenerator.generate(config, buildPrompt(story, context))
+            } ?: error("Redator local demorou demais")
+            RadioScript(
+                story = story,
+                source = RadioScriptSource.LocalLlm,
+                lines = parseGeneratedLines(generated),
+            )
         }
+
+    private fun buildPrompt(story: NewsStory, context: RadioScriptContext): String {
+        val title = story.title.toRadioSentence().limitWords(22)
+        val summary = story.summary.ifBlank { "Sem resumo disponível." }.toRadioSentence().limitWords(55)
+        return """
+            <|im_start|>system
+            Roteirista da Pailer FM. PT-BR correto. Responda só JSON válido:
+            [{"speaker":"Female","text":"..."},{"speaker":"Male","text":"..."}]
+            Use exatamente 4 falas curtas:
+            1 Female/Frankie: notícia.
+            2 Male/Nicky: detalhe da matéria e leitura crítica.
+            3 Female/Frankie: provocação esperançosa, sem ingenuidade.
+            4 Male/Nicky: contra provocação e volta para a Rádio ${context.radioName}.
+            Nicky conhece capitalismo, imperialismo, lobby e corporativismo, mas não cite isso toda hora.
+            Não invente fatos. Máximo 18 palavras por fala.
+            <|im_end|>
+            <|im_start|>user
+            Fonte: ${story.source}
+            Título: $title
+            Resumo: $summary
+            /no_think
+            <|im_end|>
+            <|im_start|>assistant
+            <think>
+
+            </think>
+
+            [
+        """.trimIndent()
+    }
+
+    private fun parseGeneratedLines(generated: String): List<RadioScriptLine> {
+        val json = generated.substringAfter('[').substringBeforeLast(']', "").let {
+            if (it.isBlank()) generated else "[$it]"
+        }
+        val array = JSONArray(json)
+        return (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val speaker = when (item.optString("speaker")) {
+                "Female" -> RadioSpeaker.Female
+                "Male" -> RadioSpeaker.Male
+                else -> return@mapNotNull null
+            }
+            val text = item.optString("text").toRadioSentence().ensureFinalPeriod()
+            if (text.isBlank()) null else RadioScriptLine(speaker, text.limitWords(32))
+        }.takeIf { lines ->
+            lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female
+        } ?: error("Redator local devolveu roteiro inválido")
+    }
+
+    private companion object {
+        // 02/09/2026: decode real medido em ~27s neste aparelho (Dimensity 1200, 3 threads,
+        // Qwen3 1.7B Q4_K_M) - ver ADR-002. Timeout antigo de 35s já dava folga, o gargalo real
+        // era o timeout nativo (ver LOCAL_WRITER_NATIVE_TIMEOUT_MS). Mantido com folga generosa
+        // porque prepareUpcomingBulletin() roda em background durante a música, não bloqueia nada.
+        const val LOCAL_WRITER_TIMEOUT_MS = 55_000L
+    }
 }
 
 // Os dois locutores fixos do bate-bola (ver ADR-014). Nomes dos personagens, nao dos slots de
@@ -153,6 +260,7 @@ private class OptionalLocalLlmRadioScriptWriter(
 // usuario, "elemento surpresa" dos nomes).
 private const val FRANKIE = "Frankie"
 private const val NICKY = "Nicky"
+private const val TAG_RADIO_WRITER = "PailerRadioWriter"
 
 private enum class NewsTopic {
     CIENCIA_TECNOLOGIA,
@@ -175,122 +283,122 @@ private data class TopicBank(val optimist: List<String>, val pessimist: List<Str
 private val TOPIC_BANK: Map<NewsTopic, TopicBank> = mapOf(
     NewsTopic.POLITICA to TopicBank(
         optimist = listOf(
-            "eu acho até bonito, sempre tem alguém tentando resolver isso direito.",
-            "sabe que eu ainda acredito que dá pra consertar política com boa vontade.",
-            "no fim as coisas se ajeitam, sempre foi assim por aqui.",
+            "eu ainda acho que pressão pública bem feita arranca alguma coisa desse tabuleiro viciado.",
+            "dá para desconfiar do poder e, mesmo assim, cobrar saída concreta.",
+            "quando gente comum presta atenção, o roteiro oficial pelo menos precisa suar mais.",
         ),
         pessimist = listOf(
-            "político prometendo é disco arranhado, toca sempre a mesma música.",
-            "isso aí vira poeira debaixo do tapete antes do fim do mês.",
-            "eu já vi esse filme, e o final nunca muda.",
+            "política institucional adora vender crise como inevitável e acordo de bastidor como maturidade.",
+            "quando o poder explica demais, quase sempre tem alguém lucrando no silêncio.",
+            "isso tem cheiro de manutenção do mesmo jogo, só trocaram a iluminação do palco.",
         ),
     ),
     NewsTopic.ECONOMIA to TopicBank(
         optimist = listOf(
-            "eu boto fé que o bolso do trabalhador sai ganhando dessa vez.",
-            "toda crise por aí, um espertinho enxerga oportunidade.",
-            "capital de giro é coisa que vai e volta, eu não me abalo.",
+            "se essa conta for disputada direito, trabalhador também consegue arrancar fôlego.",
+            "número econômico só presta quando melhora vida real, e é isso que tem que ser cobrado.",
+            "até no mercado mais frio existe brecha quando a conversa sai da planilha e vai para a rua.",
         ),
         pessimist = listOf(
-            "dólar sobe, feijão sobe, só meu salário que fica parado.",
-            "isso aí cheira a boleto novo chegando pra mim.",
-            "economia boa é a que eu nunca vi de perto.",
+            "capital chama de ajuste o que, para gente comum, chega como aluguel, comida e ansiedade.",
+            "mercado comemora antes porque quase nunca é ele que sangra depois.",
+            "no capitalismo tardio, até alívio vem com taxa de administração.",
         ),
     ),
     NewsTopic.CIENCIA_TECNOLOGIA to TopicBank(
         optimist = listOf(
-            "isso aí é o tipo de coisa que muda o jogo, eu sinto no ar.",
-            "cientista trabalhando é sempre boa notícia escondida.",
-            "tecnologia dessas ainda vai facilitar a vida de todo mundo.",
+            "tecnologia com controle público e cabeça humana ainda pode virar ferramenta de libertação.",
+            "quando pesquisa séria escapa do marketing, ela consegue melhorar a vida de verdade.",
+            "avanço técnico não precisa servir só investidor; também pode servir gente cansada.",
         ),
         pessimist = listOf(
-            "toda vez que sai invenção nova, alguém perde o emprego calado.",
-            "eu não confio em nada que atualiza sozinho de madrugada.",
-            "tecnologia é boa até o dia que ela decide não te obedecer mais.",
+            "toda novidade tecnológica chega prometendo futuro e escondendo a planilha de demissões.",
+            "big tech chama vigilância de experiência personalizada e ainda cobra assinatura.",
+            "se a máquina aprende tudo sobre nós, alguém está transformando vida privada em ativo.",
         ),
     ),
     NewsTopic.SAUDE to TopicBank(
         optimist = listOf(
-            "toda notícia de saúde que anda pra frente eu recebo de braços abertos.",
-            "isso aí é motivo de comemorar, cuidar bem de gente é sempre vitória.",
-            "eu confio no avanço, ciência da saúde nunca para de me surpreender bem.",
+            "saúde pública forte ainda é uma das poucas ideias civilizadas que esse mundo produziu.",
+            "quando ciência chega sem virar luxo, aí sim dá para comemorar de peito aberto.",
+            "cuidar de gente deveria ser prioridade, não produto premium.",
         ),
         pessimist = listOf(
-            "toda vez que prometem cura, o preço do remédio sobe primeiro.",
-            "eu só acredito quando ver funcionando no posto perto de casa.",
-            "saúde boa por aqui é sorte, não regra.",
+            "o problema é quando cura vira portfólio e sofrimento vira mercado recorrente.",
+            "eu só acredito no avanço quando ele chega antes no posto do que na reunião de acionistas.",
+            "saúde tratada como negócio sempre encontra um jeito elegante de deixar alguém do lado de fora.",
         ),
     ),
     NewsTopic.CULTURA_POP to TopicBank(
         optimist = listOf(
-            "isso aí vai animar todo mundo, adoro quando a cultura dá as caras.",
-            "fama boa é a que dá assunto gostoso, essa entra na lista.",
-            "esse tipo de notícia é a razão de eu ainda gostar de fofoca.",
+            "cultura ainda abre fresta onde a propaganda queria parede lisa.",
+            "mesmo no meio da indústria, às vezes aparece uma obra que fala mais alto que a marca.",
+            "quando arte encontra público de verdade, nem algoritmo segura completamente.",
         ),
         pessimist = listOf(
-            "fama vem, fama vai, semana que vem ninguém lembra dessa.",
-            "artista some rápido, só o meme que fica pra sempre.",
-            "isso aí é assunto de vinte e quatro horas, no máximo.",
+            "indústria cultural transforma angústia em conteúdo e chama isso de conexão.",
+            "fama hoje é linha de produção: viraliza, monetiza, descarta e repete.",
+            "o algoritmo finge descobrir talento, mas adora mesmo é previsibilidade vendável.",
         ),
     ),
     NewsTopic.ESPORTE to TopicBank(
         optimist = listOf(
-            "é por essas que eu nunca desisto de torcer.",
-            "time que corre atrás sempre me arranca um sorriso.",
-            "isso aí é disciplina e sorte andando juntas, eu aposto nisso.",
+            "a beleza do esporte é que, às vezes, o corpo humano bagunça a planilha dos donos.",
+            "torcida organizada pelo afeto ainda é uma coisa que o dinheiro não compra inteira.",
+            "quando o jogo é bom, ele lembra que vida coletiva também pode ter alegria.",
         ),
         pessimist = listOf(
-            "todo time que vai bem assim acaba decepcionando na hora H.",
-            "eu já aprendi a não comemorar antes da hora nesse esporte.",
-            "isso aí anima até o próximo tropeço, que vem rápido.",
+            "esporte moderno vende paixão popular e entrega camarote, bet e contrato opaco.",
+            "quando o dinheiro entra demais no gramado, até o improviso precisa de patrocinador.",
+            "torcedor entrega alma, dirigente entrega coletiva, e a conta nunca fecha igual para os dois.",
         ),
     ),
     NewsTopic.CLIMA_NATUREZA to TopicBank(
         optimist = listOf(
-            "natureza sempre dá um jeito de se equilibrar, eu confio nisso.",
-            "boa notícia do tempo eu levo como sinal de que o ano vai ser bom.",
-            "chuva, sol ou calor, no fim sempre dá pra se adaptar.",
+            "ainda dá para tratar clima como projeto coletivo, não como nota de rodapé.",
+            "quando a reação vem antes do desastre, a humanidade até parece capaz de aprender.",
+            "proteção ambiental séria é menos romantismo e mais sobrevivência organizada.",
         ),
         pessimist = listOf(
-            "clima assim só me lembra que vai faltar alguma coisa em casa.",
-            "toda vez que a natureza avisa, a gente só descobre tarde demais.",
-            "eu já separei o guarda-chuva e a fé, na dúvida.",
+            "o planeta manda a fatura e o corporativismo tenta pagar com campanha bonita.",
+            "chamam de evento extremo para não dizer que o modelo inteiro virou extremo.",
+            "natureza não negocia com lobby, mas parece que ninguém avisou a sala do conselho.",
         ),
     ),
     NewsTopic.CURIOSIDADE to TopicBank(
         optimist = listOf(
-            "isso aí é o tipo de história que alegra qualquer roda de conversa.",
-            "o mundo ainda consegue me surpreender bonito de vez em quando.",
-            "guarda essa, é das raras que dá vontade de contar duas vezes.",
+            "curiosidade boa rompe o tédio industrial de um mundo que quer tudo padronizado.",
+            "essas histórias lembram que a realidade ainda escapa da embalagem.",
+            "quando algo estranho aparece, pelo menos o mundo admite que não cabe inteiro numa planilha.",
         ),
         pessimist = listOf(
-            "toda curiosidade dessas esconde um detalhe que ninguém quer contar.",
-            "isso aí é estranho demais pra ser só coincidência.",
-            "eu desconfio até de história bonita demais, minha praia é outra.",
+            "até curiosidade hoje vira isca de atenção para vender anúncio no intervalo.",
+            "o estranho me interessa, mas eu sempre procuro quem está empacotando o espanto.",
+            "se viralizou rápido demais, alguém já deve estar medindo quanto dá para extrair disso.",
         ),
     ),
     NewsTopic.MUNDO_CONFLITO to TopicBank(
         optimist = listOf(
-            "mesmo no meio da confusão, sempre aparece alguém tentando resolver direito.",
-            "eu boto fé que essa tensão toda ainda vira conversa, não vira briga.",
-            "história mostra que essas coisas acabam se acertando, custa mas acerta.",
+            "mesmo em tabuleiro imperial, diplomacia e pressão popular ainda conseguem abrir fresta.",
+            "quando a história aperta, solidariedade internacional vira mais que palavra bonita.",
+            "a saída decente quase nunca vem dos fortes, mas ela existe quando gente comum se recusa ao cinismo.",
         ),
         pessimist = listOf(
-            "conflito desses nunca acaba do jeito que prometem no começo.",
-            "isso aí é briga de longe, mas quem sente o rombo é sempre gente comum.",
-            "eu já vivi notícia assim antes, o final nunca muda de verdade.",
+            "império nunca chama interesse de interesse; chama de segurança, estabilidade ou missão.",
+            "geopolítica costuma ser gente poderosa movendo peças e gente comum enterrando consequência.",
+            "quando potência fala em ordem mundial, eu olho logo para quem vai pagar em silêncio.",
         ),
     ),
     NewsTopic.GERAL to TopicBank(
         optimist = listOf(
-            "e mesmo assim eu aposto que essa história ainda tem final feliz.",
-            "eu prefiro acreditar, sempre rendeu mais do que desconfiar.",
-            "isso aí tem cara de começo de coisa boa, eu sinto.",
+            "ainda dá para arrancar sentido desse caos quando a gente olha com honestidade.",
+            "nem toda estrutura vence para sempre; às vezes uma fissura pequena muda o rumo.",
+            "eu sigo achando que lucidez também serve para construir, não só para reclamar.",
         ),
         pessimist = listOf(
-            "eu já desconfio de notícia boa demais, sempre tem letra miúda.",
-            "isso aí vai dar o que falar, e raramente é coisa boa.",
-            "no fim das contas, sempre sobra pra quem menos pode.",
+            "quase toda manchete tem uma superfície brilhante e uma engrenagem feia trabalhando embaixo.",
+            "se parece simples demais, provavelmente esconderam a cadeia de interesses no rodapé.",
+            "no fim das contas, o sistema terceiriza o dano e privatiza o aplauso.",
         ),
     ),
 )
@@ -366,6 +474,22 @@ private fun extractHook(text: String): String? {
     return null
 }
 
+private fun buildMatterBrief(story: NewsStory): String {
+    val summary = story.summary.toRadioSentence()
+    val title = story.title.toRadioSentence()
+    val base = summary.takeIf { it.isNotBlank() && !it.equals(title, ignoreCase = true) }
+        ?: "a matéria aponta para ${title.lowercaseFirstWord()}."
+    return base.limitWords(28).ensureFinalPeriod()
+}
+
+private fun String.lowercaseFirstWord(): String =
+    replaceFirstChar { if (it.isUpperCase()) it.lowercaseChar() else it }
+
+private fun String.ensureFinalPeriod(): String =
+    trim().let { text ->
+        if (text.isBlank() || text.last() in ".!?") text else "$text."
+    }
+
 private class FallbackRadioScriptWriter : RadioScriptWriter {
     override suspend fun write(story: NewsStory, context: RadioScriptContext): RadioScript =
         withContext(Dispatchers.Default) {
@@ -405,6 +529,7 @@ private class FallbackRadioScriptWriter : RadioScriptWriter {
         val topic = classifyTopic(corpus)
         val hook = extractHook(corpus)
         val bank = TOPIC_BANK.forTopic(topic)
+        val matterBrief = buildMatterBrief(story)
 
         // Titulo limitado antes de entrar no template: manchete real pode ter 20+ palavras, e
         // isso sozinho ja estourava o orcamento do modo Curto e deixava o Nicky sem fala (o
@@ -413,44 +538,40 @@ private class FallbackRadioScriptWriter : RadioScriptWriter {
             RadioSpeaker.Female,
             "$NICKY, ${OPENERS.random().format(cleanTitle.limitWords(16))}",
         )
-        val pessimistReaction = RadioScriptLine(
+        val nickyExplains = RadioScriptLine(
             RadioSpeaker.Male,
-            "$FRANKIE, ${bank.pessimist.random()}",
+            "$FRANKIE, deixa eu traduzir sem release de assessoria: $matterBrief ${bank.pessimist.random()}",
         )
-        val optimistCounter = RadioScriptLine(
+        val frankieProvokes = RadioScriptLine(
             RadioSpeaker.Female,
-            bank.optimist.random(),
+            "$NICKY, dá para enxergar o jogo sujo sem entregar a alma para o cinismo. ${bank.optimist.random()}",
         )
-        val hookOrPunch = RadioScriptLine(
+        val nickyCounterProvokes = RadioScriptLine(
             RadioSpeaker.Male,
-            hook?.let { HOOK_CALLOUTS.random().format(it) } ?: PESSIMIST_PUNCHLINES.random(),
+            "$FRANKIE, otimismo sem análise material vira propaganda. ${hook?.let { HOOK_CALLOUTS.random().format(it) } ?: PESSIMIST_PUNCHLINES.random()}",
         )
-        val optimistPunch = RadioScriptLine(
+        val extraContext = RadioScriptLine(
+            RadioSpeaker.Male,
+            "${NICKY_DETAILS.forTopic(topic).random()} ${hook?.let { "E esse detalhe de $it não entrou aí por acaso." } ?: "É nesse detalhe que a notícia pesa de verdade."}",
+        )
+        val musicCall = RadioScriptLine(
             RadioSpeaker.Female,
-            OPTIMIST_PUNCHLINES.random(),
+            "$NICKY, segue o mundo torto, segue a nossa trilha. Agora a música volta na Rádio ${context.radioName}.",
         )
-        // Quem fecha o boletim alterna por notícia (hash do título) em vez de ser sempre o
-        // mesmo locutor - participação igualitária também no fechamento, não só nas falas do meio.
-        val nickyCloses = story.title.hashCode() and 1 == 0
-        val closer = if (nickyCloses) {
-            RadioScriptLine(RadioSpeaker.Male, "$FRANKIE, ${CLOSERS_NICKY.random()} Voltamos pra Rádio ${context.radioName}.")
-        } else {
-            RadioScriptLine(RadioSpeaker.Female, "$NICKY, ${CLOSERS_FRANKIE.random()} Voltamos pra Rádio ${context.radioName}.")
-        }
 
         val lines = when (context.duration) {
-            RadioBulletinDuration.Short -> listOf(opener, pessimistReaction)
-            RadioBulletinDuration.Normal -> listOf(opener, pessimistReaction, optimistCounter, closer)
-            RadioBulletinDuration.Long -> listOf(opener, pessimistReaction, optimistCounter, hookOrPunch, optimistPunch, closer)
+            RadioBulletinDuration.Short -> listOf(opener, nickyExplains, frankieProvokes, nickyCounterProvokes, musicCall)
+            RadioBulletinDuration.Normal -> listOf(opener, nickyExplains, frankieProvokes, nickyCounterProvokes, musicCall)
+            RadioBulletinDuration.Long -> listOf(opener, nickyExplains, extraContext, frankieProvokes, nickyCounterProvokes, musicCall)
         }
         return lines.fitFor(context.duration)
     }
 
     private fun List<RadioScriptLine>.fitFor(duration: RadioBulletinDuration): List<RadioScriptLine> {
         val maxWords = when (duration) {
-            RadioBulletinDuration.Short -> 55
-            RadioBulletinDuration.Normal -> 80
-            RadioBulletinDuration.Long -> 115
+            RadioBulletinDuration.Short -> 155
+            RadioBulletinDuration.Normal -> 190
+            RadioBulletinDuration.Long -> 235
         }
         var words = 0
         return mapNotNull { line ->
@@ -484,30 +605,54 @@ private class FallbackRadioScriptWriter : RadioScriptWriter {
             "olha o detalhe: %s. Ninguém repara, eu reparo.",
         )
 
+        val NICKY_DETAILS: Map<NewsTopic, List<String>> = mapOf(
+            NewsTopic.POLITICA to listOf(
+                "Quando política vira manchete, eu procuro a coalizão, o financiador e quem some da foto.",
+                "O resumo é simples: decisão pública mexe com vida real, não só com palanque e frase ensaiada.",
+            ),
+            NewsTopic.ECONOMIA to listOf(
+                "Na economia, o número bonito costuma chegar primeiro no gráfico e bem depois na geladeira.",
+                "Quando falam de mercado, eu quero saber onde isso aperta no bolso de quem vende tempo para sobreviver.",
+            ),
+            NewsTopic.CIENCIA_TECNOLOGIA to listOf(
+                "Tecnologia boa precisa resolver problema humano, não só capturar dado e render apresentação bonita.",
+                "A parte importante é separar avanço real de promessa embrulhada em brilho para agradar investidor.",
+            ),
+            NewsTopic.SAUDE to listOf(
+                "Em saúde, manchete boa só vira vitória quando chega no atendimento de verdade, não só no pitch da indústria.",
+                "O detalhe é saber se isso melhora a vida das pessoas ou só melhora o release e a margem.",
+            ),
+            NewsTopic.CULTURA_POP to listOf(
+                "Na cultura pop, o barulho conta metade da história; a outra metade é quem lucra com ele.",
+                "Fama parece leve, mas sempre tem contrato, agenda, plataforma e reputação por trás.",
+            ),
+            NewsTopic.ESPORTE to listOf(
+                "No esporte, todo lance vem com placar, pressão, patrocinador e alguém fingindo que estava tudo calculado.",
+                "O detalhe é que resultado bonito também cobra conta na próxima rodada, no corpo do atleta e no bolso do torcedor.",
+            ),
+            NewsTopic.CLIMA_NATUREZA to listOf(
+                "Quando o assunto é clima, o planeta não está opinando; está mandando recibo de um modelo predatório.",
+                "Natureza não negocia com coletiva de imprensa, lobby ou relatório de sustentabilidade bonito.",
+            ),
+            NewsTopic.CURIOSIDADE to listOf(
+                "Curiosidade parece pequena, mas costuma revelar como o mundo funciona por baixo do verniz.",
+                "Essas histórias estranhas são boas porque mostram o detalhe que a narrativa oficial deixou passar.",
+            ),
+            NewsTopic.MUNDO_CONFLITO to listOf(
+                "Em conflito internacional, toda frase diplomática carrega recurso, rota, indústria e gente comum no rodapé.",
+                "O mapa parece distante até a consequência bater na porta de alguém que nunca participou da reunião.",
+            ),
+            NewsTopic.GERAL to listOf(
+                "O ponto é olhar menos para o susto da manchete e mais para a consequência material.",
+                "Toda notícia tem uma superfície e uma conta escondida; eu sempre procuro quem paga essa conta.",
+            ),
+        )
+
         val PESSIMIST_PUNCHLINES = listOf(
-            "no fim das contas, quem paga a conta é sempre o de sempre.",
-            "aposto o troco que isso vira notícia ruim de novo semana que vem.",
-            "isso aí tem cheiro de golpe, e eu tenho faro pra golpe.",
-            "no meu bairro isso chamava atenção por motivo errado.",
-        )
-
-        val OPTIMIST_PUNCHLINES = listOf(
-            "mas eu prefiro apostar que dá certo, sempre deu até agora.",
-            "e mesmo assim eu digo: isso ainda pode virar a melhor notícia do mês.",
-            "chama de sorte, chama de fé, eu chamo de oportunidade.",
-            "no fim, quem se arrisca é quem sai contando história boa depois.",
-        )
-
-        val CLOSERS_NICKY = listOf(
-            "eu já disse o que penso, guarda essa aí.",
-            "vou ficar de olho nessa, coisa de gente desconfiada.",
-            "duvido que isso acabe do jeito que estão prometendo.",
-        )
-
-        val CLOSERS_FRANKIE = listOf(
-            "e mesmo assim, aposto que ainda vem coisa boa por aí.",
-            "guarda essa com carinho, pode virar boa história.",
-            "eu fico com a fé, sempre funcionou comigo.",
+            "no fim das contas, socializam o prejuízo e chamam o lucro de mérito.",
+            "aposto o troco que isso vira case de sucesso antes de virar solução.",
+            "isso aí tem cheiro de captura corporativa, e esse cheiro eu reconheço de longe.",
+            "quando a história vem polida demais, eu procuro a sujeira atrás do balcão.",
         )
 
         val CLOSING_LINES = listOf(

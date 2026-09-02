@@ -37,6 +37,7 @@ import com.pailer.localtune.data.LocalSong
 import com.pailer.localtune.data.MusicLibraryRepository
 import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.PendingTagChange
+import com.pailer.localtune.data.RadioLastPlayedTrack
 import com.pailer.localtune.data.RadioBulletinMode
 import com.pailer.localtune.data.RadioBulletinRepository
 import com.pailer.localtune.data.RadioBulletinSettings
@@ -45,6 +46,8 @@ import com.pailer.localtune.data.RadioScriptLine
 import com.pailer.localtune.data.RadioScriptSource
 import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageRepository
+import com.pailer.localtune.data.RadioWriterPackageRepository
+import com.pailer.localtune.data.withLastPlayedIntro
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -142,8 +145,10 @@ data class AlbumArtworkUiState(
 data class RadioBulletinUiState(
     val settings: RadioBulletinSettings = RadioBulletinSettings(),
     val localWriterInstalled: Boolean = false,
+    val localWriterImporting: Boolean = false,
     val localWriterName: String = "Redator local",
     val localWriterDetail: String = "Pacote de LLM ainda nao instalado",
+    val localWriterMessage: String? = null,
 )
 
 data class RadioVoiceUiState(
@@ -174,6 +179,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val repository = MusicLibraryRepository(application)
     private val bulletinRepository = RadioBulletinRepository(application)
     private val voicePackageRepository = RadioVoicePackageRepository(application)
+    private val writerPackageRepository = RadioWriterPackageRepository(application)
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
@@ -193,6 +199,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var speakingNews = false
     private var currentNewsHeadline = ""
     private var resumeAfterNews = false
+    private var currentRadioTrack: RadioLastPlayedTrack? = null
     private var pendingVinheta = false
     private var announcementPlayer: MediaPlayer? = null
     private var lastTestAudioFile: File? = null
@@ -208,6 +215,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var cachedUpcomingTracks: List<String> = emptyList()
     private var bulletinPrepJob: Job? = null
     private var preparedBulletinIndex = -1
+    private var preparedBulletinScript: RadioScript? = null
     private var preparedBulletinFile: File? = null
 
     var libraryState = androidx.compose.runtime.mutableStateOf(LibraryUiState())
@@ -243,16 +251,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            val completedTrack = currentRadioTrack
+            currentRadioTrack = mediaItem?.toRadioLastPlayedTrack()
             if (radioNewsEnabled && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 completedRadioSongs += 1
                 val interval = radioBulletinState.value.settings.songsBetweenBulletins.coerceAtLeast(1)
                 if (completedRadioSongs % interval == 0) {
-                    speakNextNewsBreak()
+                    speakNextNewsBreak(completedTrack)
                 } else if (interval > 1 && completedRadioSongs % interval == interval - 1) {
                     // Ultima musica antes do proximo boletim acabou de comecar: adianta a sintese
                     // da voz local em segundo plano (tem a duracao da faixa inteira disponivel),
                     // entao o boletim toca sem pausa de espera quando o intervalo fechar.
-                    prepareUpcomingBulletin()
+                    prepareUpcomingBulletin(currentRadioTrack)
                 }
             }
         }
@@ -336,6 +346,33 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setRadioBulletinPreferLocalWriter(preferLocalWriter: Boolean) {
         updateRadioBulletinSettings(radioBulletinState.value.settings.copy(preferLocalWriter = preferLocalWriter))
+    }
+
+    fun importRadioWriterPackage(uri: Uri) {
+        radioBulletinState.value = radioBulletinState.value.copy(
+            localWriterImporting = true,
+            localWriterMessage = "Importando redator local...",
+        )
+        viewModelScope.launch {
+            runCatching { writerPackageRepository.importPackage(uri) }
+                .onSuccess {
+                    radioBulletinState.value = loadRadioBulletinUiState().copy(
+                        localWriterMessage = "Redator local importado. Ele será usado no próximo boletim preparado.",
+                    )
+                    showToast("Redator local importado.")
+                }
+                .onFailure { error ->
+                    val message = error.message ?: "Não consegui importar o redator local."
+                    radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = message)
+                    showToast(message)
+                }
+        }
+    }
+
+    fun clearRadioWriterPackage() {
+        writerPackageRepository.clearPackage()
+        radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = "Redator local removido.")
+        showToast("Redator local removido.")
     }
 
     fun importRadioVoicePackage(uri: Uri) {
@@ -423,37 +460,33 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
         radioVoiceState.value = radioVoiceState.value.copy(
             isTestingBulletin = true,
-            message = "Testando boletim (dialogo com 2 locutores) em processo separado...",
+            message = "Buscando notícia real e preparando boletim com 2 locutores...",
         )
         viewModelScope.launch {
-            val script = RadioScript(
-                story = com.pailer.localtune.data.NewsStory(
-                    title = "Teste de boletim",
-                    source = "Pailer FM",
-                ),
-                source = RadioScriptSource.Fallback,
-                lines = listOf(
-                    RadioScriptLine(
-                        speaker = RadioSpeaker.Female,
-                        text = "Nicky, cola aqui: cientistas brasileiros desenvolveram uma técnica de reciclagem " +
-                            "de plástico usando bactérias marinhas.",
-                    ),
-                    RadioScriptLine(
-                        speaker = RadioSpeaker.Male,
-                        text = "Frankie, eu já desconfio de notícia boa demais, sempre tem letra miúda. " +
-                            "Mas tá aí, reduz garrafa PET em setenta por cento, quero ver.",
-                    ),
-                    RadioScriptLine(
-                        speaker = RadioSpeaker.Female,
-                        text = "Eu prefiro acreditar, sempre rendeu mais do que desconfiar. Voltamos já com mais.",
-                    ),
-                ),
+            val radioName = activeRadioName.ifBlank { "Pailer FM" }
+            val settings = radioBulletinState.value.settings.copy(mode = RadioBulletinMode.Dialogue)
+            val script = runCatching {
+                bulletinRepository.loadLiveTestScript(settings, radioName)
+            }.onFailure {
+                Log.w(TAG_RADIO_VOICE, "teste de boletim: falhou ao buscar noticia real", it)
+            }.getOrNull()?.withLastPlayedIntro(currentRadioTrack)
+
+            if (script == null) {
+                radioVoiceState.value = loadRadioVoiceUiState().copy(
+                    isTestingBulletin = false,
+                    message = "Não consegui buscar uma notícia agora. Verifique a internet e tente de novo.",
+                )
+                return@launch
+            }
+            Log.d(
+                TAG_RADIO_VOICE,
+                "teste de boletim: noticia='${script.story.title}' fonte=${script.story.source} roteiro=${script.source}",
             )
-            val result = requestLocalVoiceSynthesis(script, BULLETIN_PREP_TIMEOUT_MS)
+            val result = requestLocalVoiceSynthesis(script, LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS)
             if (result?.file != null) {
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
                     isTestingBulletin = false,
-                    message = "Boletim OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s (2 locutores).",
+                    message = "Boletim real OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s: ${script.story.title}",
                     canReplayTest = true,
                 )
                 playTestAudio(result.file)
@@ -461,7 +494,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 radioVoiceState.value = loadRadioVoiceUiState().copy(
                     isTestingBulletin = false,
                     message = result?.detail
-                        ?: "Boletim sem resposta em ${BULLETIN_PREP_TIMEOUT_MS / 1000}s.",
+                        ?: "Boletim sem resposta em ${LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS / 1000}s.",
                 )
             }
         }
@@ -1410,6 +1443,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             radioName = radioName,
             autoPlay = !playVinhetas,
         )
+        currentRadioTrack = songs.getOrNull(startIndex)?.let { RadioLastPlayedTrack(it.title, it.artist) }
         if (playVinhetas) {
             playRadioVinhetas(radioName)
         }
@@ -1427,6 +1461,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     fun togglePlayPause() {
         controller?.let {
             if (it.isPlaying) it.pause() else it.play()
+        }
+    }
+
+    // "Sair da radio" - ao contrario de so fechar a tela (que deixa a radio tocando em
+    // segundo plano, ver openActiveRadio em LocalTuneApp.kt), isso para a reproducao de
+    // verdade e esvazia a fila: mediaItemCount some, hasMedia fica false, mini player some.
+    fun stopRadio() {
+        stopRadioNewsMode()
+        playbackSource = ""
+        controller?.apply {
+            stop()
+            clearMediaItems()
         }
     }
 
@@ -1484,6 +1530,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
+        currentRadioTrack = controller?.currentMediaItem?.toRadioLastPlayedTrack()
         pendingVinheta = false
         activeRadioName = radioName
         playbackSource = "Rádio $radioName"
@@ -1521,6 +1568,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         currentNewsHeadline = ""
         resumeAfterNews = false
+        currentRadioTrack = null
         pendingVinheta = false
         activeRadioName = ""
         announcementPlayer?.release()
@@ -1582,20 +1630,36 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
-    private fun prepareUpcomingBulletin() {
+    private fun prepareUpcomingBulletin(lastPlayedTrack: RadioLastPlayedTrack? = currentRadioTrack) {
         if (newsBulletins.isEmpty()) {
             reloadNewsBulletinsIfNeeded()
             return
         }
-        if (!radioVoiceState.value.isEnabled) return
         if (bulletinPrepJob?.isActive == true) return
         val index = nextBulletinIndex % newsBulletins.size
-        val script = newsBulletins[index]
+        val baseScript = newsBulletins[index]
+        val settings = radioBulletinState.value.settings
+        val radioName = activeRadioName
         bulletinPrepJob = viewModelScope.launch {
+            Log.d(
+                TAG_RADIO_VOICE,
+                "boletim: preparando index=$index redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
+            )
+            val script = bulletinRepository
+                .enhanceScript(baseScript, settings, radioName)
+                .withLastPlayedIntro(lastPlayedTrack)
+            preparedBulletinScript = script
+            preparedBulletinIndex = index
+            Log.d(TAG_RADIO_VOICE, "boletim: roteiro preparado index=$index fonte=${script.source}")
+            if (!radioVoiceState.value.isEnabled) {
+                return@launch
+            }
             val file = synthesizeLocalVoiceSafely(script, BULLETIN_PREP_TIMEOUT_MS)
             if (file != null) {
-                preparedBulletinIndex = index
                 preparedBulletinFile = file
+                Log.d(TAG_RADIO_VOICE, "boletim: audio preparado index=$index bytes=${file.length()}")
+            } else {
+                Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio index=$index; TTS Android sera fallback")
             }
         }
     }
@@ -1604,11 +1668,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         bulletinPrepJob?.cancel()
         bulletinPrepJob = null
         preparedBulletinFile?.delete()
+        preparedBulletinScript = null
         preparedBulletinFile = null
         preparedBulletinIndex = -1
     }
 
-    private fun speakNextNewsBreak() {
+    private fun speakNextNewsBreak(lastPlayedTrack: RadioLastPlayedTrack? = currentRadioTrack) {
         if (!ttsReady || speakingNews) return
         if (newsBulletins.isEmpty()) {
             // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed fora do
@@ -1622,38 +1687,43 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val player = controller ?: return
         val bulletinIndex = nextBulletinIndex % newsBulletins.size
-        val bulletin = newsBulletins[bulletinIndex]
+        val baseBulletin = newsBulletins[bulletinIndex]
         nextBulletinIndex += 1
         val readyFile = preparedBulletinFile.takeIf { preparedBulletinIndex == bulletinIndex && it?.exists() == true }
+        val readyScript = preparedBulletinScript.takeIf { preparedBulletinIndex == bulletinIndex }
         if (preparedBulletinFile != null && readyFile == null) preparedBulletinFile?.delete()
         bulletinPrepJob?.cancel()
         bulletinPrepJob = null
+        preparedBulletinScript = null
         preparedBulletinFile = null
         preparedBulletinIndex = -1
         speakingNews = true
-        currentNewsHeadline = bulletin.displayText
+        currentNewsHeadline = baseBulletin.displayText
         controller?.let { updatePlayerState(it) }
         resumeAfterNews = player.isPlaying
         if (resumeAfterNews) player.pause()
 
         if (readyFile != null) {
+            currentNewsHeadline = baseBulletin.displayText
+            Log.d(TAG_RADIO_VOICE, "boletim: tocando audio preparado index=$bulletinIndex")
             playAnnouncementFile(readyFile) { finishNewsBreak() }
             armAnnouncementWatchdog()
             return
         }
 
         viewModelScope.launch {
-            val localFile = if (radioVoiceState.value.isEnabled) {
-                synthesizeLocalVoiceSafely(bulletin, LOCAL_VOICE_TIMEOUT_MS)
+            val bulletin = if (readyScript != null) {
+                Log.d(TAG_RADIO_VOICE, "boletim: usando roteiro preparado index=$bulletinIndex")
+                readyScript
             } else {
-                null
+                Log.w(
+                    TAG_RADIO_VOICE,
+                    "boletim: roteiro preparado nao estava pronto index=$bulletinIndex; usando base imediato",
+                )
+                baseBulletin.withLastPlayedIntro(lastPlayedTrack)
             }
             if (!speakingNews || !radioNewsEnabled) return@launch
-            if (localFile != null) {
-                playAnnouncementFile(localFile) { finishNewsBreak() }
-                armAnnouncementWatchdog()
-                return@launch
-            }
+            Log.d(TAG_RADIO_VOICE, "boletim: sem audio pronto; usando TTS Android imediato")
             val tts = textToSpeech
             val accepted = if (tts != null && ttsReady) {
                 runCatching {
@@ -1666,6 +1736,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 Log.w(TAG_RADIO_VOICE, "tts fallback rejected bulletin - resuming playback")
                 finishNewsBreak()
             } else {
+                Log.d(TAG_RADIO_VOICE, "boletim: falando via TTS Android")
                 armAnnouncementWatchdog()
             }
         }
@@ -1761,12 +1832,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             MediaPlayer().apply {
                 setDataSource(file.absolutePath)
                 setOnCompletionListener {
+                    Log.d(TAG_RADIO_VOICE, "announcement file completed bytes=${file.length()}")
                     it.release()
                     if (announcementPlayer === it) announcementPlayer = null
                     file.delete()
                     onFinished()
                 }
-                setOnErrorListener { player, _, _ ->
+                setOnErrorListener { player, what, extra ->
+                    Log.w(TAG_RADIO_VOICE, "announcement file error what=$what extra=$extra bytes=${file.length()}")
                     player.release()
                     if (announcementPlayer === player) announcementPlayer = null
                     file.delete()
@@ -1778,6 +1851,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 announcementPlayer = this
             }
         }.onFailure {
+            Log.e(TAG_RADIO_VOICE, "failed to play announcement file bytes=${file.length()}", it)
             file.delete()
             onFinished()
         }
@@ -1915,6 +1989,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 if (title.isBlank()) null else "$title${artist.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}"
             }
 
+    private fun MediaItem.toRadioLastPlayedTrack(): RadioLastPlayedTrack? {
+        val metadata = mediaMetadata
+        val title = metadata.title?.toString().orEmpty().trim()
+        if (title.isBlank()) return null
+        return RadioLastPlayedTrack(
+            title = title,
+            artist = metadata.artist?.toString().orEmpty().trim(),
+        )
+    }
+
     private fun recordCurrentSong(player: Player) {
         val mediaId = player.currentMediaItem?.mediaId ?: return
         if (mediaId == lastRecordedMediaId) return
@@ -2011,6 +2095,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val BULLETIN_PREP_TIMEOUT_MS = 175_000L
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
+        const val LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS = 90_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
