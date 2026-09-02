@@ -251,7 +251,19 @@ class MusicLibraryRepository(private val context: Context) {
     // Persistidas em metadataPrefs (mesmo SharedPreferences de overrides/sessao) como um unico
     // JSON array - lista pequena, nao precisa de schema versionado como os overrides.
 
-    data class CustomRadioDefinition(val id: String, val name: String, val sourceType: String)
+    data class CustomRadioDefinition(
+        val id: String,
+        val name: String,
+        val sourceType: String,
+        // Fontes extras adicionadas depois da criacao (ver addSourceToCustomRadio) - mesmo
+        // formato prefixado de `id` ("album:<id>"/"artist:<chave>"/"genre:<chave>"). Lista vazia
+        // por padrao: definicoes salvas antes dessa mudanca nao tem o campo no JSON e continuam
+        // funcionando igual (fonte unica).
+        val extraSourceIds: List<String> = emptyList(),
+    )
+
+    fun sourceIdForAlbum(album: LocalAlbum): String = "album:${album.id}"
+    fun sourceIdForArtist(artist: LocalArtist): String = "artist:${artist.key}"
 
     fun customRadioDefinitions(): List<CustomRadioDefinition> {
         val json = metadataPrefs.getString(KEY_CUSTOM_RADIOS, null) ?: return emptyList()
@@ -261,7 +273,16 @@ class MusicLibraryRepository(private val context: Context) {
                 val obj = array.optJSONObject(index) ?: return@mapNotNull null
                 val id = obj.optString("id")
                 if (id.isBlank()) return@mapNotNull null
-                CustomRadioDefinition(id = id, name = obj.optString("name"), sourceType = obj.optString("sourceType"))
+                val extra = obj.optJSONArray("extraSourceIds")
+                val extraIds = if (extra == null) emptyList() else {
+                    (0 until extra.length()).mapNotNull { extra.optString(it).takeIf(String::isNotBlank) }
+                }
+                CustomRadioDefinition(
+                    id = id,
+                    name = obj.optString("name"),
+                    sourceType = obj.optString("sourceType"),
+                    extraSourceIds = extraIds,
+                )
             }
         }.getOrDefault(emptyList())
     }
@@ -269,28 +290,43 @@ class MusicLibraryRepository(private val context: Context) {
     private fun saveCustomRadioDefinitions(definitions: List<CustomRadioDefinition>) {
         val array = JSONArray()
         definitions.forEach { definition ->
+            val extra = JSONArray()
+            definition.extraSourceIds.forEach(extra::put)
             array.put(
                 JSONObject()
                     .put("id", definition.id)
                     .put("name", definition.name)
                     .put("sourceType", definition.sourceType)
+                    .put("extraSourceIds", extra)
             )
         }
         metadataPrefs.edit().putString(KEY_CUSTOM_RADIOS, array.toString()).apply()
     }
 
     fun createRadioFromAlbum(album: LocalAlbum): CustomRadioDefinition {
-        val id = "album:${album.id}"
+        val id = sourceIdForAlbum(album)
         val definition = CustomRadioDefinition(id = id, name = album.title, sourceType = "album")
         saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
         return definition
     }
 
     fun createRadioFromArtist(artist: LocalArtist): CustomRadioDefinition {
-        val id = "artist:${artist.key}"
+        val id = sourceIdForArtist(artist)
         val definition = CustomRadioDefinition(id = id, name = artist.name, sourceType = "artist")
         saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
         return definition
+    }
+
+    // Adiciona um album/artista (sourceId no mesmo formato prefixado de CustomRadioDefinition.id
+    // - ver sourceIdForAlbum/sourceIdForArtist) como fonte extra de uma radio personalizada ja
+    // existente. Idempotente: repetir a mesma fonte (ou a fonte primaria) nao duplica.
+    fun addSourceToCustomRadio(customId: String, sourceId: String): CustomRadioDefinition? {
+        val definitions = customRadioDefinitions()
+        val target = definitions.firstOrNull { it.id == customId } ?: return null
+        if (sourceId == target.id || sourceId in target.extraSourceIds) return target
+        val updated = target.copy(extraSourceIds = target.extraSourceIds + sourceId)
+        saveCustomRadioDefinitions(definitions.map { if (it.id == customId) updated else it })
+        return updated
     }
 
     // genre.songs vem de dynamicGenreRadios() (groupBy radioGenreKey), entao todas as musicas
@@ -317,27 +353,39 @@ class MusicLibraryRepository(private val context: Context) {
         }
     }
 
+    // Casa um sourceId prefixado ("album:<id>"/"artist:<chave>"/"genre:<chave>") contra a
+    // biblioteca - usado tanto pra fonte primaria quanto pras extras (ver customRadiosFrom).
+    private fun matchSongsForSourceId(songs: List<LocalSong>, sourceId: String): List<LocalSong> = when {
+        sourceId.startsWith("album:") -> {
+            val albumId = sourceId.removePrefix("album:").toLongOrNull()
+            songs.filter { it.albumId == albumId }
+                .sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
+        }
+        sourceId.startsWith("artist:") -> {
+            val artistKey = sourceId.removePrefix("artist:")
+            songs.filter { primaryArtistKey(it.artist) == artistKey }
+                .sortedBy { it.title.lowercase() }
+        }
+        sourceId.startsWith("genre:") -> {
+            val genreKey = sourceId.removePrefix("genre:")
+            songs.filter { radioGenreKey(it, normalizeLookupKey(it.genre)) == genreKey }
+                .sortedBy { it.title.lowercase() }
+        }
+        else -> emptyList()
+    }
+
     private fun customRadiosFrom(songs: List<LocalSong>): List<LocalRadio> {
         val definitions = customRadioDefinitions()
         if (definitions.isEmpty()) return emptyList()
         return definitions.mapNotNull { definition ->
-            val matchedSongs = when (definition.sourceType) {
-                "album" -> {
-                    val albumId = definition.id.removePrefix("album:").toLongOrNull()
-                    songs.filter { it.albumId == albumId }
-                        .sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
-                }
-                "artist" -> {
-                    val artistKey = definition.id.removePrefix("artist:")
-                    songs.filter { primaryArtistKey(it.artist) == artistKey }
-                        .sortedBy { it.title.lowercase() }
-                }
-                "genre" -> {
-                    val genreKey = definition.id.removePrefix("genre:")
-                    songs.filter { radioGenreKey(it, normalizeLookupKey(it.genre)) == genreKey }
-                        .sortedBy { it.title.lowercase() }
-                }
-                else -> emptyList()
+            val sourceIds = listOf(definition.id) + definition.extraSourceIds
+            val matchedSongs = if (sourceIds.size == 1) {
+                // fonte unica: preserva a ordenacao por tipo (ex.: ordem de faixa de album)
+                matchSongsForSourceId(songs, definition.id)
+            } else {
+                sourceIds.flatMap { matchSongsForSourceId(songs, it) }
+                    .distinctBy { it.id }
+                    .sortedBy { it.title.lowercase() }
             }
             if (matchedSongs.isEmpty()) return@mapNotNull null
             LocalRadio(
@@ -347,6 +395,7 @@ class MusicLibraryRepository(private val context: Context) {
                 coverSongs = previewCovers(matchedSongs, "custom:${definition.id}"),
                 isCustom = true,
                 customId = definition.id,
+                hasMultipleSources = sourceIds.size > 1,
             )
         }
     }
@@ -365,12 +414,17 @@ class MusicLibraryRepository(private val context: Context) {
         // buildRadioQueue) - seed fixa pelo nome dava sempre a mesma ordem a cada "Entrar".
         // Radio personalizada de categoria continua no fluxo normal abaixo - tem tantos
         // artistas quanto a radio de genero dinamica equivalente, se beneficia do mesmo algoritmo.
-        if (radio.isCustom && radio.customId?.startsWith("album:") == true) {
+        // As duas checagens abaixo exigem fonte unica (!hasMultipleSources) - a partir da segunda
+        // fonte (ver addSourceToCustomRadio) uma radio de album/artista vira uma mistura de
+        // materiais diferentes, entao cai no fluxo generico de baixo (buildRadioQueue), igual
+        // radio de categoria - "ordem de album" ou "so esse artista sem diversidade" deixam de
+        // fazer sentido quando ha mais de uma fonte.
+        if (radio.isCustom && !radio.hasMultipleSources && radio.customId?.startsWith("album:") == true) {
             val isVariousArtists = radio.songs.map { it.artist }.distinct().size > 1
             if (!isVariousArtists) return radio.songs
             return shuffledRadioSession(radio)
         }
-        if (radio.isCustom && radio.customId?.startsWith("artist:") == true) {
+        if (radio.isCustom && !radio.hasMultipleSources && radio.customId?.startsWith("artist:") == true) {
             return shuffledRadioSession(radio)
         }
         val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)

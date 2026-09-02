@@ -64,6 +64,7 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
@@ -600,6 +601,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             radioSession = emptyList()
                             selectedRadio = null
                             isGeneratingRadio = false
+                        },
+                        artists = artists,
+                        albums = albums,
+                        // Chamada direta na thread principal, sem Dispatchers.Default - igual
+                        // onSaveMetadata/onCreateRadio logo acima. addArtistToRadio/addAlbumToRadio
+                        // chamam showToast() internamente, que exige a main thread (Toast.makeText
+                        // sem Looper.prepare() em background derruba o app - visto em teste real).
+                        onAddArtist = { artist ->
+                            viewModel.addArtistToRadio(openedRadio, artist)?.let { selectedRadio = it }
+                        },
+                        onAddAlbum = { album ->
+                            viewModel.addAlbumToRadio(openedRadio, album)?.let { selectedRadio = it }
                         },
                         listState = radioDetailListState,
                     )
@@ -3495,9 +3508,16 @@ private fun RadioDetailScreen(
     onPlaySong: (Int) -> Unit,
     onOpenPlayer: () -> Unit,
     onDeleteRadio: () -> Unit = {},
+    artists: List<LocalArtist> = emptyList(),
+    albums: List<LocalAlbum> = emptyList(),
+    onAddArtist: (LocalArtist) -> Unit = {},
+    onAddAlbum: (LocalAlbum) -> Unit = {},
     listState: LazyListState = rememberLazyListState(),
 ) {
     var showDeleteConfirm by rememberSaveable(radio.customId) { mutableStateOf(false) }
+    // So radio personalizada (isCustom) tem definicao persistida pra estender com mais
+    // artista/album - ver MusicLibraryRepository.addSourceToCustomRadio.
+    var showAddSource by rememberSaveable(radio.customId) { mutableStateOf(false) }
     LazyColumn(
         state = listState,
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
@@ -3528,6 +3548,21 @@ private fun RadioDetailScreen(
                         Icon(Icons.Filled.Close, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Sair da rádio")
+                    }
+                    if (radio.isCustom) {
+                        IconButton(
+                            onClick = { showAddSource = true },
+                            modifier = Modifier
+                                .size(52.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(PailerGunmetal.copy(alpha = 0.5f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Add,
+                                contentDescription = "Adicionar artista ou álbum a esta rádio",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
                     }
                     IconButton(
                         onClick = { showDeleteConfirm = true },
@@ -3593,6 +3628,21 @@ private fun RadioDetailScreen(
                                 Spacer(Modifier.width(8.dp))
                                 Text(if (isGenerating) "Criando..." else "Entrar")
                             }
+                            if (radio.isCustom) {
+                                IconButton(
+                                    onClick = { showAddSource = true },
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Add,
+                                        contentDescription = "Adicionar artista ou álbum a esta rádio",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            }
                             IconButton(
                                 onClick = { showDeleteConfirm = true },
                                 modifier = Modifier
@@ -3644,6 +3694,22 @@ private fun RadioDetailScreen(
                 onDeleteRadio()
             },
             onDismiss = { showDeleteConfirm = false },
+        )
+    }
+
+    if (showAddSource) {
+        AddSourceToRadioDialog(
+            artists = artists,
+            albums = albums,
+            onPickArtist = { artist ->
+                showAddSource = false
+                onAddArtist(artist)
+            },
+            onPickAlbum = { album ->
+                showAddSource = false
+                onAddAlbum(album)
+            },
+            onDismiss = { showAddSource = false },
         )
     }
 }
@@ -4028,6 +4094,113 @@ private fun DeleteConfirmDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("Cancelar")
+            }
+        },
+    )
+}
+
+// Picker de artista/album pra adicionar como fonte extra numa radio personalizada (botao "+" em
+// RadioDetailScreen) - so radio personalizada tem definicao persistida pra estender (ver
+// MusicLibraryRepository.addSourceToCustomRadio). Lista simples com busca porque nao ha um
+// picker generico reaproveitavel no app ainda.
+@Composable
+private fun AddSourceToRadioDialog(
+    artists: List<LocalArtist>,
+    albums: List<LocalAlbum>,
+    onPickArtist: (LocalArtist) -> Unit,
+    onPickAlbum: (LocalAlbum) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var showAlbums by rememberSaveable { mutableStateOf(false) }
+    var query by rememberSaveable { mutableStateOf("") }
+    val filteredArtists = remember(artists, query) {
+        if (query.isBlank()) artists else artists.filter { it.name.contains(query, ignoreCase = true) }
+    }
+    val filteredAlbums = remember(albums, query) {
+        if (query.isBlank()) albums else albums.filter {
+            it.title.contains(query, ignoreCase = true) || it.artist.contains(query, ignoreCase = true)
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+        title = { Text("Adicionar à rádio") },
+        text = {
+            Column {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (showAlbums) {
+                        OutlinedButton(onClick = { showAlbums = false }, modifier = Modifier.weight(1f)) {
+                            Text("Artistas")
+                        }
+                        Button(onClick = {}, modifier = Modifier.weight(1f)) {
+                            Text("Álbuns")
+                        }
+                    } else {
+                        Button(onClick = {}, modifier = Modifier.weight(1f)) {
+                            Text("Artistas")
+                        }
+                        OutlinedButton(onClick = { showAlbums = true }, modifier = Modifier.weight(1f)) {
+                            Text("Álbuns")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                MetadataTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = "Buscar",
+                    placeholder = if (showAlbums) "Nome do álbum ou artista" else "Nome do artista",
+                )
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
+                    if (!showAlbums) {
+                        items(filteredArtists, key = { it.key }) { artist ->
+                            RowItem(
+                                title = artist.name,
+                                subtitle = "${artist.albumCount} álbuns · ${artist.songs.size} faixas",
+                                icon = {
+                                    ArtworkBox(
+                                        artist.songs.firstOrNull { it.artworkUri != null }?.artworkUri,
+                                        Modifier.size(48.dp),
+                                    )
+                                },
+                                onClick = { onPickArtist(artist) },
+                            )
+                        }
+                        if (filteredArtists.isEmpty()) {
+                            item {
+                                Text(
+                                    "Nenhum artista encontrado.",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(12.dp),
+                                )
+                            }
+                        }
+                    } else {
+                        items(filteredAlbums, key = { it.id }) { album ->
+                            RowItem(
+                                title = album.title,
+                                subtitle = "${album.artist} · ${album.songs.size} faixas",
+                                icon = { ArtworkBox(album.artworkUri, Modifier.size(48.dp)) },
+                                onClick = { onPickAlbum(album) },
+                            )
+                        }
+                        if (filteredAlbums.isEmpty()) {
+                            item {
+                                Text(
+                                    "Nenhum álbum encontrado.",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(12.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Fechar")
             }
         },
     )

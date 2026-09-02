@@ -122,4 +122,9 @@ data class LocalRadio(
     // persistida ("album:<id>:..." ou "artist:<chave>").
     val isCustom: Boolean = false,
     val customId: String? = null,
+    // true quando a definicao personalizada tem mais de uma fonte (album/artista/categoria) -
+    // ver MusicLibraryRepository.addSourceToCustomRadio. Radio com fonte unica de album toca
+    // em ordem de faixa (ver radioSessionFrom); a partir de 2 fontes vira sempre embaralhada,
+    // nao faz mais sentido "ordem de album" misturando material de fontes diferentes.
+    val hasMultipleSources: Boolean = false,
 )

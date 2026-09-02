@@ -1366,6 +1366,27 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         showToast("Radio \"${radio.name}\" removida.")
     }
 
+    // Adiciona um artista/album como fonte extra de uma radio personalizada ja existente (botao
+    // "+" na tela da radio). Só radio personalizada (isCustom) tem definicao persistida pra
+    // estender - radio de perfil/genero/fallback nao aceita. Devolve a radio ja atualizada
+    // (recomputada na hora, igual saveAlbumMetadataEdit/saveArtistMetadataEdits) pra tela poder
+    // trocar o estado local sem esperar o rebuildLibraryContent assincrono.
+    fun addArtistToRadio(radio: LocalRadio, artist: LocalArtist): LocalRadio? {
+        val customId = radio.customId ?: return null
+        repository.addSourceToCustomRadio(customId, repository.sourceIdForArtist(artist))
+        rebuildLibraryContent()
+        showToast("${artist.name} adicionado a \"${radio.name}\".")
+        return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
+    }
+
+    fun addAlbumToRadio(radio: LocalRadio, album: LocalAlbum): LocalRadio? {
+        val customId = radio.customId ?: return null
+        repository.addSourceToCustomRadio(customId, repository.sourceIdForAlbum(album))
+        rebuildLibraryContent()
+        showToast("${album.title} adicionado a \"${radio.name}\".")
+        return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
+    }
+
     // Radios de perfil/genero (Grunge, Anos 2000, Jazz etc.) nao tem definicao persistida pra
     // apagar - sao recalculadas da biblioteca toda vez. "Apagar" aqui so tira da lista (ver
     // MusicLibraryRepository.hideRadio); a vinheta por genero continua chaveada pelo nome

@@ -31,14 +31,23 @@ artista, fixa se for álbum (tracklist não muda). Aparece primeiro na lista de 
 músicas continuam no aparelho, só a definição da rádio é removida.
 
 **Importante:** `radioSessionFrom()` pula o algoritmo de diversidade de artista
-(`buildRadioQueue`) pra rádio personalizada — esse algoritmo assume muitos artistas
-diferentes e cortaria uma rádio de artista/álbum único para poucas faixas
+(`buildRadioQueue`) pra rádio personalizada **de fonte única** — esse algoritmo assume
+muitos artistas diferentes e cortaria uma rádio de artista/álbum único para poucas faixas
 (`radioArtistLimit` pra 1 artista). Álbum de artista único toca na ordem de faixa
 (sequência proposital, tipo álbum conceitual); álbum "various artists" (várias faixas com
 artistas diferentes sob o mesmo nome de álbum — `LocalAlbum.isVariousArtists`, ver
 ADR sobre capa por-faixa em DECISIONS.md) não é uma sequência intencional de verdade,
 então embaralha igual rádio de artista (`shuffledRadioSession()`), com anti-repetição
 contra a última sessão salva.
+
+**Adicionar mais fontes a uma rádio personalizada (ADR-017):** botão "+" na tela da rádio
+(só nas personalizadas) abre um seletor de artista/álbum e chama
+`MusicLibraryRepository.addSourceToCustomRadio()`, que acrescenta o novo
+`sourceId` (mesmo formato prefixado de `CustomRadioDefinition.id`) em
+`extraSourceIds`. A partir da segunda fonte (`LocalRadio.hasMultipleSources = true`), a
+rádio deixa de tocar em ordem de faixa/shuffle simples e cai no `buildRadioQueue` genérico
+(mesmo caminho de rádio de categoria) — misturar fontes diferentes só faz sentido
+embaralhado.
 
 `radioSessionFrom(radio)` monta a fila com **anti-repetição**: gera até algumas tentativas
 com seeds aleatórias e escolhe a que menos se parece com a última sessão tocada

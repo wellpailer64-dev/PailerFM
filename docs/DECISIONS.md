@@ -519,3 +519,54 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   mesmo bug em mais um lugar. Ao mexer em `hideRadio()`/`VINHETA_BY_RADIO_KEY`, manter os
   dois desacoplados (um não deve depender do outro) — é isso que garante a vinheta
   sobreviver ao apagar/recriar.
+
+## ADR-017 — Adicionar mais artista/álbum a uma rádio personalizada já existente
+
+- **Contexto:** rádio personalizada (ADR de "Rádios personalizadas" em
+  [RADIO_PIPELINE.md](RADIO_PIPELINE.md)) nascia de **uma** fonte só (um álbum, um
+  artista ou uma categoria) — sem jeito de misturar mais material na mesma rádio depois
+  de criada, só criar outra do zero. Usuário pediu um botão "+" na tela da rádio pra
+  adicionar mais um artista ou álbum a ela.
+- **Decisão:**
+  1. `CustomRadioDefinition` ganhou `extraSourceIds: List<String>` (mesmo formato
+     prefixado de `id` — `"album:<id>"`/`"artist:<chave>"`/`"genre:<chave>"`), persistido
+     como array JSON extra. Campo ausente no JSON salvo (definições de antes dessa
+     mudança) vira lista vazia — sem migração, retrocompatível de graça.
+  2. `MusicLibraryRepository.addSourceToCustomRadio(customId, sourceId)` acrescenta uma
+     fonte extra (idempotente - repetir a mesma fonte não duplica). `customRadiosFrom()`
+     casa a fonte primária **e** todas as extras contra a biblioteca, união distinta por
+     id de faixa.
+  3. `LocalRadio.hasMultipleSources` (true quando há 2+ fontes) muda o comportamento de
+     `radioSessionFrom()`: com fonte única continua exatamente como antes (álbum de
+     artista único toca em ordem de faixa, artista único ou álbum "various artists"
+     embaralha simples); a partir de 2 fontes cai sempre no `buildRadioQueue` genérico
+     (mesmo algoritmo de diversidade das rádios de categoria) - misturar material de
+     fontes diferentes só faz sentido embaralhado, nunca "ordem de álbum".
+  4. UI: botão "+" (`Icons.Filled.Add`) do lado do "Entrar"/"Sair" e da lixeira em
+     `RadioDetailScreen`, só quando `radio.isCustom` — rádio de perfil/categoria
+     automática (Grunge, Anos 2000, "Rádio recente") não tem definição persistida pra
+     estender, então não ganhou o botão. Abre `AddSourceToRadioDialog` (novo, sem picker
+     genérico reaproveitável no app ainda): abas Artistas/Álbuns + busca, reaproveitando
+     `RowItem`/`ArtworkBox`/`MetadataTextField` já existentes. Ao escolher, a tela troca
+     `selectedRadio` pela rádio já recomputada (mesmo padrão de
+     `saveAlbumMetadataEdit`/`saveArtistMetadataEdits` — chamada síncrona na thread
+     principal, sem `Dispatchers.Default`) em vez de esperar o próximo
+     `rebuildLibraryContent()` assíncrono.
+- **Motivo:** usuário queria misturar material relacionado (ex.: dois artistas parecidos)
+  numa rádio só sem perder o que já tinha montado, e sem duplicar rádios parecidas na
+  lista.
+- **Bug de crash achado no teste real:** a primeira versão envolvia a chamada de
+  `addArtistToRadio`/`addAlbumToRadio` em `Dispatchers.Default` (pra não travar a UI
+  recomputando `radiosFrom()` na thread principal), mas essas funções chamam
+  `showToast()` internamente, que faz `Toast.makeText(...).show()` sem guarda de thread -
+  `NullPointerException: Can't toast on a thread that has not called Looper.prepare()`,
+  **derrubando o app inteiro** (`FATAL EXCEPTION: main`, processo morto). Corrigido
+  chamando direto na thread principal, igual todo outro fluxo "editar e recomputar" já
+  existente (`onSaveMetadata`, `onCreateRadio`) - nenhum deles usa `Dispatchers.Default`
+  nesse tipo de chamada, e o motivo é exatamente esse.
+- **Não mudar sem:** qualquer função de ViewModel que chama `showToast()` internamente
+  (a maioria das que fazem "editar e devolver o objeto atualizado") só pode ser chamada
+  direto da thread principal - nunca envolver em `Dispatchers.Default`/`Dispatchers.IO`
+  no call site. Se o custo de recomputar `radiosFrom()` virar um problema real de
+  performance percebida, mover o `Toast` pra fora da função (callback separado) antes de
+  mexer no threading, não o contrário.
