@@ -27,7 +27,32 @@ intro comum. Detalhes em [docs/DECISIONS.md](../docs/DECISIONS.md) (ADR-010).
 `MusicLibraryRepository.kt`, faixa 2000-2009, lido do `YEAR` do MediaStore/tag do
 arquivo). Só forma rádio se houver músicas suficientes com esse ano preenchido na tag.
 
+## Passagens (transição do boletim)
+
+`passagem_1.mp3`/`passagem_2.mp3`/`passagem_3.mp3` em `res/raw` (fonte: `passagem.mp3`/
+`passagem 2.mp3`/`passagem 3.mp3` aqui) — pontes curtas tocadas em volta do boletim de
+notícias: música → passagem → boletim → passagem → música, sem gap entre elas. Alternam
+em sequência a cada uso (`nextPassagemIndex`/`PASSAGEM_RESOURCES` em
+`LocalTuneViewModel.kt`, `playPassagem()`), volume reduzido em -8dB
+(`PASSAGEM_VOLUME`). Não são por gênero de rádio como as vinhetas acima.
+
 Pra adicionar/trocar uma vinheta: solte o `.wav`/`.mp3` aqui de novo com um nome
 descritivo e avise — eu movo para `res/raw` (nome de arquivo vira minúsculo,
 `snake_case`, sem espaço/acento) e atualizo o mapa `VINHETA_BY_RADIO_KEY` no
 ViewModel.
+
+## Música de fundo do boletim
+
+Diferente das vinhetas/passagens acima (não vão pro APK) - a música de fundo mora
+**dentro do pacote de voz** (`voice-models/supertonic-3-int8/`, ver ADR-019 em
+[DECISIONS.md](../docs/DECISIONS.md)), porque é misturada por baixo do WAV do boletim em
+`LocalRadioVoiceEngine.mixBackgroundMusic()`, não tocada como arquivo separado. Fonte
+atual: `Concrete Tunnel.mp3` e `Concrete Tunnel 2.mp3` aqui na pasta (autorais, sem
+direitos do Epidemic Sound — trocado em 04/09/2026, as antigas `ES_Save It for a Rainy
+Day - Margareta.mp3`/`ES_Devil Disguised (Instrumental Version) - Torii Wolf.mp3` foram
+apagadas), convertidos pra `bed1.pcm`/`bed2.pcm` (PCM16 mono 44100Hz sem cabeçalho, via
+`ffmpeg -ar 44100 -ac 1 -f s16le`) e alternados por boletim. `voice-models/
+Pailer-Radio-Voices-Supertonic3-Fran-Nico.zip` já foi reempacotado com os beds novos —
+falta só reimportar esse zip no app (Configurações > pacote de voz) pra valer no
+aparelho. Pra trocar de novo: solte o `.mp3` aqui e avise — reconverto e reempacoto o
+zip de voz.

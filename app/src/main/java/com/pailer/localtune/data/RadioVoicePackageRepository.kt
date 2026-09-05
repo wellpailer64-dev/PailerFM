@@ -11,56 +11,32 @@ import java.util.zip.ZipInputStream
 data class RadioVoicePackageStatus(
     val isInstalled: Boolean = false,
     val packageName: String = "Voz local",
-    val engine: String = "",
     val femaleSpeaker: String = "",
     val maleSpeaker: String = "",
     val detail: String = "Nenhum pacote de voz instalado",
 )
 
+// Motor unico suportado: Supertonic 3 (sherpa-onnx). Piper (vits/vits-dual) e Kokoro foram
+// removidos - ver DECISIONS.md ADR-018 - o pacote testado e aprovado e sempre um par de vozes
+// do mesmo voice.bin do Supertonic (Fran/Nico), nao mais modelos separados por locutor.
 data class RadioVoicePackageConfig(
     val rootDir: File,
     val name: String,
-    val engine: String,
     val femaleSpeakerName: String,
     val maleSpeakerName: String,
     val femaleSpeakerId: Int,
     val maleSpeakerId: Int,
     val speed: Float,
-    val vits: VitsConfig?,
-    val femaleVits: VitsConfig?,
-    val maleVits: VitsConfig?,
-    val kokoro: KokoroConfig?,
-    // femaleKokoro/maleKokoro + femaleEngine/maleEngine: so usados quando engine == "mixed"
-    // (ver ADR-014) - cada slot roda seu proprio motor (ex.: slot feminino em vits/piper, slot
-    // masculino em kokoro), diferente de vits-dual/piper-dual onde os dois slots sao sempre o
-    // mesmo motor.
-    val femaleKokoro: KokoroConfig?,
-    val maleKokoro: KokoroConfig?,
-    val femaleEngine: String?,
-    val maleEngine: String?,
-    val supertonic: SupertonicConfig?,
-)
-
-data class VitsConfig(
-    val model: String,
-    val tokens: String,
-    val lexicon: String = "",
-    val dataDir: String = "",
-    val dictDir: String = "",
-    val noiseScale: Float = 0.667f,
-    val noiseScaleW: Float = 0.8f,
-    val lengthScale: Float = 1.0f,
-)
-
-data class KokoroConfig(
-    val model: String,
-    val voices: String,
-    val tokens: String,
-    val dataDir: String = "",
-    val lexicon: String = "",
-    val lang: String = "pt-br",
-    val dictDir: String = "",
-    val lengthScale: Float = 1.0f,
+    val numSteps: Int,
+    val lang: String,
+    val supertonic: SupertonicConfig,
+    // Opcional: beds de musica bem baixinho por baixo do boletim (ver ADR-018/
+    // LocalRadioVoiceEngine.mixBackgroundMusic) - um sorteado por boletim quando ha mais de um,
+    // pra nao repetir sempre o mesmo. PCM16 mono headerless (sem cabecalho WAV) no MESMO sample
+    // rate que o motor de voz gera - hoje 44100Hz (Supertonic), sem reamostragem. Lista vazia =
+    // sem musica de fundo; pacotes antigos sem esse campo continuam funcionando normalmente.
+    val backgroundMusic: List<String> = emptyList(),
+    val backgroundMusicVolume: Float = 0.05623f,
 )
 
 data class SupertonicConfig(
@@ -161,166 +137,53 @@ class RadioVoicePackageRepository(private val context: Context) {
     private fun parsePackageConfig(json: String, rootDir: File): RadioVoicePackageConfig {
         val manifest = JSONObject(json)
         val name = manifest.optString("name").ifBlank { "Voz local" }
-        val engine = manifest.optString("engine").ifBlank { "vits" }.lowercase()
         val female = manifest.optString("femaleSpeaker").ifBlank { manifest.optString("female").ifBlank { "Locutora" } }
         val male = manifest.optString("maleSpeaker").ifBlank { manifest.optString("male").ifBlank { "Locutor" } }
-        val voicesJson = manifest.optJSONObject("voices")
+        val supertonicJson = manifest.optJSONObject("supertonic") ?: error("Manifest sem configuracao supertonic.")
         return RadioVoicePackageConfig(
             rootDir = rootDir,
             name = name,
-            engine = engine,
             femaleSpeakerName = female,
             maleSpeakerName = male,
             femaleSpeakerId = manifest.optInt("femaleSpeakerId", manifest.optInt("femaleId", 0)),
             maleSpeakerId = manifest.optInt("maleSpeakerId", manifest.optInt("maleId", 1)),
             speed = manifest.optDouble("speed", 1.0).toFloat().coerceIn(0.65f, 1.35f),
-            vits = manifest.optJSONObject("vits")?.let {
-                VitsConfig(
-                    model = it.optString("model"),
-                    tokens = it.optString("tokens"),
-                    lexicon = it.optString("lexicon"),
-                    dataDir = it.optString("dataDir"),
-                    dictDir = it.optString("dictDir"),
-                    noiseScale = it.optDouble("noiseScale", 0.667).toFloat(),
-                    noiseScaleW = it.optDouble("noiseScaleW", 0.8).toFloat(),
-                    lengthScale = it.optDouble("lengthScale", 1.0).toFloat(),
-                )
-            } ?: if (engine == "vits" || engine == "piper") {
-                VitsConfig(
-                    model = manifest.optString("model"),
-                    tokens = manifest.optString("tokens"),
-                    lexicon = manifest.optString("lexicon"),
-                    dataDir = manifest.optString("dataDir"),
-                    dictDir = manifest.optString("dictDir"),
-                )
-            } else {
-                null
-            },
-            femaleVits = voicesJson?.optJSONObject("female")?.optJSONObject("vits")?.toVitsConfig(),
-            maleVits = voicesJson?.optJSONObject("male")?.optJSONObject("vits")?.toVitsConfig(),
-            femaleKokoro = voicesJson?.optJSONObject("female")?.optJSONObject("kokoro")?.toKokoroConfig(),
-            maleKokoro = voicesJson?.optJSONObject("male")?.optJSONObject("kokoro")?.toKokoroConfig(),
-            femaleEngine = voicesJson?.optJSONObject("female")?.optString("engine")?.lowercase()?.ifBlank { null },
-            maleEngine = voicesJson?.optJSONObject("male")?.optString("engine")?.lowercase()?.ifBlank { null },
-            kokoro = manifest.optJSONObject("kokoro")?.let {
-                KokoroConfig(
-                    model = it.optString("model"),
-                    voices = it.optString("voices"),
-                    tokens = it.optString("tokens"),
-                    dataDir = it.optString("dataDir"),
-                    lexicon = it.optString("lexicon"),
-                    lang = it.optString("lang").ifBlank { "pt-br" },
-                    dictDir = it.optString("dictDir"),
-                    lengthScale = it.optDouble("lengthScale", 1.0).toFloat(),
-                )
-            },
-            supertonic = manifest.optJSONObject("supertonic")?.let {
-                SupertonicConfig(
-                    durationPredictor = it.optString("durationPredictor"),
-                    textEncoder = it.optString("textEncoder"),
-                    vectorEstimator = it.optString("vectorEstimator"),
-                    vocoder = it.optString("vocoder"),
-                    ttsJson = it.optString("ttsJson"),
-                    unicodeIndexer = it.optString("unicodeIndexer"),
-                    voiceStyle = it.optString("voiceStyle"),
-                )
-            },
+            numSteps = manifest.optInt("numSteps", 10),
+            lang = manifest.optString("lang").ifBlank { "pt" },
+            backgroundMusic = manifest.optJSONArray("backgroundMusic")?.let { array ->
+                (0 until array.length()).mapNotNull { array.optString(it).ifBlank { null } }
+            } ?: manifest.optString("backgroundMusic").ifBlank { null }?.let { listOf(it) }.orEmpty(),
+            backgroundMusicVolume = manifest.optDouble("backgroundMusicVolume", 0.05623).toFloat(),
+            supertonic = SupertonicConfig(
+                durationPredictor = supertonicJson.optString("durationPredictor"),
+                textEncoder = supertonicJson.optString("textEncoder"),
+                vectorEstimator = supertonicJson.optString("vectorEstimator"),
+                vocoder = supertonicJson.optString("vocoder"),
+                ttsJson = supertonicJson.optString("ttsJson"),
+                unicodeIndexer = supertonicJson.optString("unicodeIndexer"),
+                voiceStyle = supertonicJson.optString("voiceStyle"),
+            ),
         )
     }
 
     private fun RadioVoicePackageConfig.toStatus(): RadioVoicePackageStatus =
         RadioVoicePackageStatus(
             packageName = name,
-            engine = engine,
             femaleSpeaker = femaleSpeakerName,
             maleSpeaker = maleSpeakerName,
         )
 
     private fun validatePackageFiles(config: RadioVoicePackageConfig) {
-        when (config.engine) {
-            "vits", "piper" -> {
-                val vits = config.vits ?: error("Manifest sem configuracao vits.")
-                validateVitsFiles(config.rootDir, vits)
-            }
-            "vits-dual", "piper-dual" -> {
-                validateVitsFiles(config.rootDir, config.femaleVits ?: error("Manifest sem voz feminina."))
-                validateVitsFiles(config.rootDir, config.maleVits ?: error("Manifest sem voz masculina."))
-            }
-            "mixed" -> {
-                validateMixedSlot(config.rootDir, "feminino", config.femaleEngine, config.femaleVits, config.femaleKokoro)
-                validateMixedSlot(config.rootDir, "masculino", config.maleEngine, config.maleVits, config.maleKokoro)
-            }
-            "kokoro" -> {
-                val kokoro = config.kokoro ?: error("Manifest sem configuracao kokoro.")
-                requirePackageFile(config.rootDir, kokoro.model, "modelo .onnx")
-                requirePackageFile(config.rootDir, kokoro.voices, "voices")
-                requirePackageFile(config.rootDir, kokoro.tokens, "tokens")
-            }
-            "supertonic" -> {
-                val supertonic = config.supertonic ?: error("Manifest sem configuracao supertonic.")
-                listOf(
-                    supertonic.durationPredictor,
-                    supertonic.textEncoder,
-                    supertonic.vectorEstimator,
-                    supertonic.vocoder,
-                    supertonic.ttsJson,
-                    supertonic.unicodeIndexer,
-                    supertonic.voiceStyle,
-                ).forEach { requirePackageFile(config.rootDir, it, "arquivo do Supertonic") }
-            }
-            else -> error("Motor de voz nao suportado: ${config.engine}.")
-        }
-    }
-
-    private fun JSONObject.toVitsConfig(): VitsConfig =
-        VitsConfig(
-            model = optString("model"),
-            tokens = optString("tokens"),
-            lexicon = optString("lexicon"),
-            dataDir = optString("dataDir"),
-            dictDir = optString("dictDir"),
-            noiseScale = optDouble("noiseScale", 0.667).toFloat(),
-            noiseScaleW = optDouble("noiseScaleW", 0.8).toFloat(),
-            lengthScale = optDouble("lengthScale", 1.0).toFloat(),
-        )
-
-    private fun JSONObject.toKokoroConfig(): KokoroConfig =
-        KokoroConfig(
-            model = optString("model"),
-            voices = optString("voices"),
-            tokens = optString("tokens"),
-            dataDir = optString("dataDir"),
-            lexicon = optString("lexicon"),
-            lang = optString("lang").ifBlank { "pt-br" },
-            dictDir = optString("dictDir"),
-            lengthScale = optDouble("lengthScale", 1.0).toFloat(),
-        )
-
-    private fun validateMixedSlot(
-        rootDir: File,
-        label: String,
-        engine: String?,
-        vits: VitsConfig?,
-        kokoro: KokoroConfig?,
-    ) {
-        when (engine) {
-            "vits", "piper" -> validateVitsFiles(rootDir, vits ?: error("Slot $label (mixed/$engine) sem configuracao vits."))
-            "kokoro" -> {
-                val cfg = kokoro ?: error("Slot $label (mixed/kokoro) sem configuracao kokoro.")
-                requirePackageFile(rootDir, cfg.model, "modelo .onnx do slot $label")
-                requirePackageFile(rootDir, cfg.voices, "voices do slot $label")
-                requirePackageFile(rootDir, cfg.tokens, "tokens do slot $label")
-            }
-            else -> error("Slot $label sem motor valido no modo mixed (engine ausente ou nao suportado: '$engine').")
-        }
-    }
-
-    private fun validateVitsFiles(rootDir: File, vits: VitsConfig) {
-        requirePackageFile(rootDir, vits.model, "modelo .onnx")
-        requirePackageFile(rootDir, vits.tokens, "tokens")
-        if (vits.lexicon.isNotBlank()) requirePackageFile(rootDir, vits.lexicon, "lexicon")
-        if (vits.dataDir.isNotBlank()) requirePackageFile(rootDir, vits.dataDir, "dataDir")
-        if (vits.dictDir.isNotBlank()) requirePackageFile(rootDir, vits.dictDir, "dictDir")
+        listOf(
+            config.supertonic.durationPredictor,
+            config.supertonic.textEncoder,
+            config.supertonic.vectorEstimator,
+            config.supertonic.vocoder,
+            config.supertonic.ttsJson,
+            config.supertonic.unicodeIndexer,
+            config.supertonic.voiceStyle,
+        ).forEach { requirePackageFile(config.rootDir, it, "arquivo do Supertonic") }
+        config.backgroundMusic.forEach { requirePackageFile(config.rootDir, it, "musica de fundo") }
     }
 
     private fun requirePackageFile(rootDir: File, relativePath: String, label: String) {

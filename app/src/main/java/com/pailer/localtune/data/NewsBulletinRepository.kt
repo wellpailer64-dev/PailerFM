@@ -135,16 +135,28 @@ class NewsBulletinRepository(private val context: Context) {
     private companion object {
         const val NETWORK_TIMEOUT_MS = 4500
         const val ITEMS_PER_FEED = 4
-        const val NEWS_LIMIT = 8
+        // 2 por feed (8 feeds abaixo) - subiu de 8 pra 16 junto da diversificacao de feeds
+        // (pedido do usuario 04/09/2026: quer fatos historicos/bizarros/cientificos/curiosidades
+        // de mundo e Brasil, nao so noticia do dia) pra cada categoria nova garantir espaco no
+        // round-robin de interleave() em vez de ser cortada por take() antes da 2a rodada. Ver
+        // ADR-021.
+        const val NEWS_LIMIT = 16
         const val SUMMARY_MAX_CHARS = 220
 
-        // Metade G1 (2 feeds), metade fora do G1 (3 feeds) - antes eram 4 feeds, todos G1, e o
-        // boletim saia repetitivo demais na mesma linha editorial. Super/Olhar Digital cobrem o
-        // pedido de "curiosidades e novidades"; BBC Brasil da um angulo diferente de mundo.
+        // 8 feeds cobrindo os temas pedidos (04/09/2026): historia/bizarro/cientifico/mundo/
+        // Brasil, alem do que ja existia (mundo, ciencia-saude, tecnologia). Generico
+        // "super.abril.com.br/feed/" (todas as editorias misturadas) foi trocado pelas 2
+        // editorias especificas de Super abaixo - historia e mundo-estranho, mais precisas que o
+        // feed geral e verificadas manualmente (URL retorna RSS valido com itens reais, nao pagina
+        // de erro/SPA). "g1/planeta-bizarro" e "g1/brasil" tambem verificados manualmente -
+        // "g1/curiosidades" existe mas devolve canal vazio (0 itens), por isso nao entrou.
         val FEEDS = listOf(
             NewsFeed("g1 Mundo", "https://g1.globo.com/rss/g1/mundo"),
             NewsFeed("g1 Ciencia e saude", "https://g1.globo.com/rss/g1/ciencia-e-saude"),
-            NewsFeed("Super", "https://super.abril.com.br/feed/"),
+            NewsFeed("g1 Brasil", "https://g1.globo.com/rss/g1/brasil"),
+            NewsFeed("g1 Planeta Bizarro", "https://g1.globo.com/rss/g1/planeta-bizarro"),
+            NewsFeed("Super Historia", "https://super.abril.com.br/historia/feed/"),
+            NewsFeed("Super Mundo Estranho", "https://super.abril.com.br/mundo-estranho/feed/"),
             NewsFeed("Olhar Digital", "https://olhardigital.com.br/feed/"),
             NewsFeed("BBC Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml"),
         )

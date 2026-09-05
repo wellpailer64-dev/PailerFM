@@ -56,130 +56,89 @@ filesDir/radio_voice_package/
 └── package.ready      ← marcador escrito após import validado
 ```
 
-### manifest.json (exemplo vits-dual)
+### manifest.json (motor único: Supertonic 3)
 
 ```json
 {
-  "name": "Vozes PT-BR int8",
-  "engine": "vits-dual",
-  "femaleSpeaker": "Locutora",
-  "maleSpeaker": "Locutor",
+  "name": "Fran e Nico (Supertonic 3)",
+  "femaleSpeaker": "Fran",
+  "maleSpeaker": "Nico",
+  "femaleSpeakerId": 1,
+  "maleSpeakerId": 5,
   "speed": 1.0,
-  "voices": {
-    "female": { "vits": { "model": "pt_BR-female-medium.onnx", "tokens": "tokens.txt" } },
-    "male":   { "vits": { "model": "pt_BR-male-medium.onnx",   "tokens": "tokens.txt" } }
+  "numSteps": 6,
+  "lang": "pt",
+  "backgroundMusic": ["bed1.pcm", "bed2.pcm"],
+  "backgroundMusicVolume": 0.05623,
+  "supertonic": {
+    "durationPredictor": "duration_predictor.int8.onnx",
+    "textEncoder": "text_encoder.int8.onnx",
+    "vectorEstimator": "vector_estimator.int8.onnx",
+    "vocoder": "vocoder.int8.onnx",
+    "ttsJson": "tts.json",
+    "unicodeIndexer": "unicode_indexer.bin",
+    "voiceStyle": "voice.bin"
   }
 }
 ```
 
-### Motores suportados
+`femaleSpeaker`/`maleSpeaker` são só nomes de exibição; quem seleciona a voz de fato são
+`femaleSpeakerId`/`maleSpeakerId` — o `sid` (0-9) dentro do `voice.bin` do Supertonic
+(único arquivo, 10 vozes: `F1..F5 = sid 0-4`, `M1..M5 = sid 5-9`, ordem alfabética de
+montagem — ver `generate_voices_bin.py` do sherpa-onnx). `numSteps` é o número de passos
+de denoising (qualidade x velocidade, default oficial do modelo é 5 — usado aqui também,
+depois de medir em campo que `numThreads` mais alto piorava por throttling térmico, ver
+ADR-018/019); `lang` tem que ser `"pt"` — sem isso o motor cai no default `"en"` do C++
+(bug encontrado e corrigido na ADR-018).
 
-| `engine` | Config exigida | Vozes |
-|---|---|---|
-| `vits` / `piper` | `vits` (ou campos soltos `model`/`tokens`) | multi-speaker via `femaleSpeakerId` / `maleSpeakerId` |
-| `vits-dual` / `piper-dual` | `voices.female.vits` + `voices.male.vits` | um modelo por locutor (sid sempre 0) |
-| `kokoro` | `kokoro`: model, voices, tokens (+ dataDir/lexicon/dictDir opcionais) | speaker id por locutor |
-| `supertonic` | `supertonic`: durationPredictor, textEncoder, vectorEstimator, vocoder, ttsJson, unicodeIndexer, voiceStyle | voiceStyle por locutor |
-| `mixed` (ADR-015) | `voices.female.engine` + config própria (`vits` ou `kokoro`); idem `voices.male` | cada locutor roda seu proprio motor — usado quando os dois locutores nao vem do mesmo pacote/motor (ex.: hoje, Frankie em Piper e Nicky em Kokoro) |
+`backgroundMusic`/`backgroundMusicVolume` são opcionais — bed de música baixinho por
+baixo do boletim inteiro (`LocalRadioVoiceEngine.mixBackgroundMusic()`, ver ADR-019).
+`backgroundMusic` é uma **lista** de arquivos **PCM16 mono sem cabeçalho WAV** (não é
+`.wav`), no mesmo sample rate que o motor gera (44100Hz pro Supertonic, sem reamostragem
+em runtime) — gerar com `ffmpeg -i bed.mp3 -ar 44100 -ac 1 -f s16le -acodec pcm_s16le
+bed.pcm`. Com mais de um arquivo, um é sorteado por boletim num índice que sobrevive
+entre requests (companion object, ver `nextBackgroundMusicIndex`) pra não repetir sempre
+o mesmo. Aceita também uma string única (compatibilidade). `backgroundMusicVolume` é
+ganho linear (não dB) — `0.05623` ≈ -25dB, o valor aprovado depois de testar fora do app
+com ffmpeg. Lista vazia = pacote funciona exatamente como antes (sem custo, sem música).
 
-### Pacote ativo hoje: Frankie (Piper Faber) + Nicky (Piper Cadu) — `vits-dual`, ADR-015
+### Motor suportado: `supertonic` (ADR-018)
 
-O motor `mixed` (Frankie/Piper + Nicky/Kokoro) foi testado em boletim real e estourou
-`BULLETIN_PREP_TIMEOUT_MS` (175s) — o Kokoro sozinho já era marginal (ADR-013/014), com
-dois motores na mesma síntese ficou pior ainda. Decisão final: **Kokoro abandonado**,
-os dois locutores em Piper puro (`vits-dual`), leve e rápido. Manifest real:
+Piper (`vits`/`vits-dual`/`piper-dual`) e Kokoro (`kokoro`), incluindo o modo `mixed`
+(ADR-015) que rodava um motor por locutor, foram **removidos** — ver ADR-018 para o
+histórico completo dos candidatos testados (Kokoro, Piper com várias vozes, VITS-Coqui,
+OmniVoice, Pocket TTS) e o motivo de cada rejeição. Hoje só existe um `SupertonicConfig`
+(`durationPredictor`, `textEncoder`, `vectorEstimator`, `vocoder`, `ttsJson`,
+`unicodeIndexer`, `voiceStyle`), compartilhado pelos dois locutores via `sid` diferente.
 
-```json
-{
-  "name": "Frankie e Nicky (Piper leve)",
-  "engine": "vits-dual",
-  "femaleSpeaker": "Frankie",
-  "maleSpeaker": "Nicky",
-  "speed": 0.78,
-  "voices": {
-    "female": { "vits": { "model": "frankie/pt_BR-faber-medium.onnx", "tokens": "frankie/tokens.txt", "dataDir": "espeak-ng-data", "lengthScale": 1.0 } },
-    "male":   { "vits": { "model": "nicky/pt_BR-cadu-medium.onnx",    "tokens": "nicky/tokens.txt",   "dataDir": "espeak-ng-data", "lengthScale": 1.0 } }
-  }
-}
-```
+### Pacote ativo: Fran (F2) e Nico (M1) — Supertonic 3 int8
 
-- Nicky passou por Kokoro `pm_alex` (rejeitado por lentidão) → Piper `pt_BR-jeff-medium`
-  (desempenho aprovado, timbre rejeitado) → Piper `pt_BR-miro-high` (também rejeitado) →
-  **Piper `pt_BR-cadu-medium`** (mesmo dataset CC0 do Faber, ainda não testado antes
-  desta rodada). Se ainda não for a definitiva, só sobra `Edresson` (qualidade "low",
-  não baixado ainda) no pacote leve pt-BR conhecido, ou o não testado
-  `vits-coqui-pt-cv` (Common Voice, multi-falante, pipeline bem diferente).
-- `espeak-ng-data` fica uma única vez na raiz do pacote e é referenciado pelos dois
-  slots — confirmado byte-a-byte idêntico entre todos os pacotes Piper testados.
-- Fonte: `voice-models/piper_only_package/`; zip pronto pra importar:
-  `voice-models/Pailer-Radio-Voices-FrankieFaber-NickyCadu.zip` (~36 MB, contra ~137 MB
-  do pacote `mixed` original).
-- Medido localmente (PC, não aparelho): os dois motores carregados + as 6 falas de um
-  diálogo "Longo" inteiro sintetizadas em ~11s — folga enorme sobre os 175s de timeout,
-  mesmo considerando que o aparelho real é mais lento que a máquina de teste.
-- O motor `mixed` (código em `RadioVoicePackageRepository.kt`/`LocalRadioVoiceEngine.kt`,
-  ver tabela acima) continua implementado e funcional, só não é mais o caminho ativo —
-  ver ADR-015 antes de reativá-lo ou remover.
-- Antes de trocar de voz de novo: ver ADR-015 pra lista de candidatos já testados e
-  rejeitados/aprovados, e a explicação de que problemas de acentuação/pronúncia quase
-  sempre são bug de texto sem acento, não do motor — testar sempre com frase acentuada.
+Escolhidos numa comparação às cegas com 4 duplas homem+mulher conversando (M2+F2, M5+F3,
+M3+F4, M1+F5); o usuário preferiu a dupla 4 mas pediu a voz F2 (não a F5) pareada com o
+M1. Descrições oficiais do fabricante: **F2** "alegre, jovem, brincalhona"; **M1**
+"animado, confiante, tom padrão".
 
-### Histórico: pacotes Kokoro (Dora→Santa) e mixed (Faber+Kokoro) — ADR-013/014/015
-
-Trocado do Piper vits-dual pro Kokoro em 26/08/2026 (voz aprovada pelo usuário depois de
-ouvir no aparelho). Em 28/08/2026 (ADR-014) o slot `femaleSpeaker` — antes `pf_dora`
-(ID 42), voz que o usuário achou ruim — trocou pra `pm_santa` (ID 44), a terceira voz
-masculina do mesmo pacote (antes não usada). Motivo de reaproveitar o Kokoro em vez de
-voltar pro Piper: o Piper já tinha sido testado e rejeitado antes por soar "fraco, sem
-personalidade" (ver ADR-013) — trocar só o ID de um slot no manifest existente resolve
-sem reabrir esse problema. Manifest real:
-
-```json
-{
-  "name": "Kokoro Frankie e Nicky",
-  "engine": "kokoro",
-  "femaleSpeaker": "Frankie",
-  "maleSpeaker": "Nicky",
-  "femaleSpeakerId": 44,
-  "maleSpeakerId": 43,
-  "speed": 0.85,
-  "kokoro": {
-    "model": "model.int8.onnx",
-    "voices": "voices.bin",
-    "tokens": "tokens.txt",
-    "dataDir": "espeak-ng-data",
-    "lang": "pt-br",
-    "lengthScale": 1.0
-  }
-}
-```
-
-- `femaleSpeaker`/`maleSpeaker` são só nomes de **slot** (mesmo campo que
-  `RadioVoicePackageRepository` e `LocalRadioVoiceEngine` usam pra escolher modelo/ID —
-  ver `RadioSpeaker.Female`/`Male` em `RadioBulletin.kt`), não implicam gênero da voz.
-  Frankie (otimista) fala pelo slot Female, Nicky (pessimista) pelo slot Male — os dois
-  com vozes masculinas do mesmo pacote.
-- Origem: `kokoro-multi-lang-v1_0` do sherpa-onnx (não o `v1_1`, que **não** tem vozes
-  pt-BR — ver ADR-013), modelo quantizado pra int8 localmente (326 MB → 114 MB).
-- Antes de trocar o ID 44 pra produção, sintetizado localmente com o pacote Python
-  `sherpa-onnx` (mesma cautela do ADR-013) — RMS/pico saudáveis, comparáveis aos IDs
-  42/43, nenhum sinal de áudio degenerado. Ainda não teve aprovação por ouvido humano
-  no aparelho — validar depois de importar o pacote novo.
-- `speed` caiu de 0.92 pra 0.85 (locutores mais lentos, pedido do usuário) — ~9% mais
-  samples de áudio pro mesmo texto, `BULLETIN_PREP_TIMEOUT_MS` subiu de 160s pra 175s
-  de acordo (ver comentário em `LocalTuneViewModel.kt`).
-- **Muito mais lento que o Piper**: ~9-10s pra carregar cada locutor (sem cache entre
-  requests, ADR-003) + ~2 caracteres/s de geração (mais com `speed` mais baixo). Um
-  diálogo "Curta" (2 falas no bate-bola novo, ver
-  [RADIO_PIPELINE.md](RADIO_PIPELINE.md)) fica na faixa de 150-160s. Durações
-  Normal/Longa tendem a estourar esse prazo e cair pra voz do Android no boletim ao
-  vivo.
-- Fonte/script de build do pacote: `voice-models/kokoro/` no workspace (fora do git,
-  grande demais — reconstrutível: baixar `kokoro-multi-lang-v1_0.tar.bz2`, quantizar,
-  reempacotar só com `model.int8.onnx` + `voices.bin` + `tokens.txt` +
-  `espeak-ng-data/` + este `manifest.json`). Zip pronto pra importar pela UI:
-  `voice-models/kokoro/Pailer-Radio-Voices-Kokoro-FrankieNicky.zip` (o zip anterior,
-  `Pailer-Radio-Voices-Kokoro-PTBR.zip`, continua no workspace como rollback).
+- Fonte: `voice-models/supertonic-3-int8/` (o próprio `manifest.json` + os arquivos do
+  modelo + `bed1.pcm`/`bed2.pcm` da música de fundo — essa pasta *é* a raiz do zip, sem
+  wrapper). Zip pronto pra importar:
+  `voice-models/Pailer-Radio-Voices-Supertonic3-Fran-Nico.zip` (~165 MB). Scripts usados
+  nos testes (comparação de duplas, ajuste de pausa/acentuação) em
+  `voice-models/supertonic-3-int8-scripts/`.
+- Download original: `wget https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2`
+  (reconstrutível a qualquer momento, é release oficial do k2-fsa/sherpa-onnx).
+- `speed=1.0` (dentro da faixa 0,9-1,5 recomendada oficialmente — não herdar o `0.78`
+  usado antes pro Piper). `numSteps` começou em 10 (mais qualidade, RTF≈0,28 medido em
+  PC), caiu pra 5 (default oficial) depois de medir em campo (ver ADR-019) e subiu de
+  novo pra **6** depois que a queda de tempo se confirmou boa o bastante pra sobrar
+  margem de qualidade. `numThreads` também foi ajustado em campo: 2→4 **piorou**
+  (throttling térmico), landing em **3**.
+- **Uma pendência conhecida, documentada em detalhe na ADR-018** (a outra — sentenças
+  curtas isoladas saindo atropeladas — foi corrigida em produção, ver ADR-019):
+  Palavras de hiato mal pronunciadas (ex. "tardio" → soa como ditongo, sem separar o
+  "i"). Sem parâmetro de motor pra isso — é o texto do boletim que precisa grafar com
+  acento forçado (`tardío`) quando o problema aparecer.
+- Música de fundo (bed baixinho por baixo do boletim) **implementada** (ADR-019) —
+  `backgroundMusic`/`backgroundMusicVolume` no manifest, ver seção do manifest acima.
 
 ### Validações no import (`RadioVoicePackageRepository.importPackage`)
 
@@ -194,13 +153,15 @@ sem reabrir esse problema. Manifest real:
 
 ## Geração (`LocalRadioVoiceEngine.synthesize`)
 
-- Uma chamada sherpa por linha do script (`generateWithConfig`);
-- Parâmetros globais: `speed` do manifest (coerido 0.65–1.35), `silenceScale = 0.6`,
-  `numThreads = 2`, provider `cpu`, `maxNumSentences = 1`;
+- Uma chamada sherpa por linha do script (`generateWithConfig`), variando só `sid`
+  (feminino/masculino) — o mesmo `OfflineTts` (Supertonic) atende os dois locutores;
+- Parâmetros globais: `speed`/`numSteps`/`lang` do manifest (`speed` coerido
+  0.65–1.35), `silenceScale = 0.6` na config do engine, `numThreads = 2`, provider
+  `cpu`, `maxNumSentences = 1`;
 - Amostras concatenadas com **gap de silêncio de 0,18 s** entre falas;
 - WAV PCM 16-bit mono escrito à mão (sem dependência de encoder) em `cacheDir`;
-- Engines cacheados num map **por request** (chave = raiz+motor+speaker+modelo);
-  liberados no fim do request.
+- Engine cacheado num map **por request** (chave = `rootDir` do pacote); liberado no
+  fim do request.
 
 ## Diagnóstico
 

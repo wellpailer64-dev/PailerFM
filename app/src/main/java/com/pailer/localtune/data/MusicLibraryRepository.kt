@@ -329,17 +329,53 @@ class MusicLibraryRepository(private val context: Context) {
         return updated
     }
 
-    // genre.songs vem de dynamicGenreRadios() (groupBy radioGenreKey), entao todas as musicas
-    // ali compartilham a mesma chave - basta recalcular a partir de uma delas pra persistir a
-    // chave interna (que pode diferir do nome de exibicao) sem precisar carregar LocalRadio
-    // com um campo novo so pra isso.
+    // Remove um artista/album adicionado depois (extraSourceIds) de uma radio personalizada -
+    // botao "-" na tela da radio. A fonte ORIGINAL (target.id, que deu nome/criou a radio) nao
+    // pode ser removida por aqui de proposito - evita a radio ficar sem nenhuma fonte e evita ter
+    // que "promover" outra fonte a principal (customId muda de identidade em toda parte que o usa).
+    fun removeSourceFromCustomRadio(customId: String, sourceId: String): CustomRadioDefinition? {
+        val definitions = customRadioDefinitions()
+        val target = definitions.firstOrNull { it.id == customId } ?: return null
+        if (sourceId !in target.extraSourceIds) return target
+        val updated = target.copy(extraSourceIds = target.extraSourceIds - sourceId)
+        saveCustomRadioDefinitions(definitions.map { if (it.id == customId) updated else it })
+        return updated
+    }
+
+    // genre.name e o nome de exibicao que dynamicGenreRadios() computou pra essa categoria
+    // (GenreHit.display mais comum, ou GENRE_DISPLAY_NAMES) - normalizar de volta reproduz a
+    // mesma chave usada la (ver genreEntriesFor), sem precisar carregar LocalRadio com um campo
+    // novo so pra isso.
     fun createRadioFromGenre(genre: LocalRadio): CustomRadioDefinition? {
-        val sample = genre.songs.firstOrNull() ?: return null
-        val genreKey = radioGenreKey(sample, normalizeLookupKey(sample.genre))
+        if (genre.songs.isEmpty()) return null
+        val genreKey = normalizeLookupKey(genre.name)
         val id = "genre:$genreKey"
         val definition = CustomRadioDefinition(id = id, name = genre.name, sourceType = "genre")
         saveCustomRadioDefinitions(customRadioDefinitions().filterNot { it.id == id } + definition)
         return definition
+    }
+
+    // Renomeia uma radio personalizada (botao de lapis na tela da radio) - so album/artista, nao
+    // categoria (sourceType "genre"): ver comentario em RadioDetailScreen sobre por que o nome de
+    // categoria fica fixo. Nome vazio ou igual ao atual e no-op (devolve a definicao sem gravar).
+    fun renameCustomRadio(customId: String, newName: String): CustomRadioDefinition? {
+        val definitions = customRadioDefinitions()
+        val target = definitions.firstOrNull { it.id == customId } ?: return null
+        if (target.sourceType == "genre") return null
+        val trimmed = newName.trim()
+        if (trimmed.isBlank() || trimmed == target.name) return target
+        val updated = target.copy(name = trimmed)
+        saveCustomRadioDefinitions(definitions.map { if (it.id == customId) updated else it })
+        // Sessao salva e chaveada pelo NOME (lastRadioSessionKey normaliza o nome) - migra a
+        // entrada pro nome novo em vez de deixar orfa, mesmo espirito de deleteCustomRadio abaixo
+        // limpando a sessao quando a radio some de vez.
+        metadataPrefs.getString(lastRadioSessionKey(target.name), null)?.let { session ->
+            metadataPrefs.edit()
+                .remove(lastRadioSessionKey(target.name))
+                .putString(lastRadioSessionKey(trimmed), session)
+                .apply()
+        }
+        return updated
     }
 
     fun deleteCustomRadio(customId: String) {
@@ -368,7 +404,7 @@ class MusicLibraryRepository(private val context: Context) {
         }
         sourceId.startsWith("genre:") -> {
             val genreKey = sourceId.removePrefix("genre:")
-            songs.filter { radioGenreKey(it, normalizeLookupKey(it.genre)) == genreKey }
+            songs.filter { song -> genreEntriesFor(song).any { it.first == genreKey } }
                 .sortedBy { it.title.lowercase() }
         }
         else -> emptyList()
@@ -425,7 +461,7 @@ class MusicLibraryRepository(private val context: Context) {
             return shuffledRadioSession(radio)
         }
         if (radio.isCustom && !radio.hasMultipleSources && radio.customId?.startsWith("artist:") == true) {
-            return shuffledRadioSession(radio)
+            return albumDiverseRadioSession(radio)
         }
         val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)
             ?.split(",")
@@ -452,9 +488,11 @@ class MusicLibraryRepository(private val context: Context) {
     }
 
     // Embaralha com anti-repeticao (varias tentativas, fica com a mais diferente da ultima
-    // sessao salva) sem passar pelo buildRadioQueue de diversidade por artista - usado por
-    // radio de artista e de album "various artists" em radioSessionFrom(), onde a lista de
-    // artistas ja e pequena/fechada de proposito.
+    // sessao salva) sem passar pelo buildRadioQueue de diversidade por artista - usado so por
+    // album "various artists" em radioSessionFrom(), onde a lista de artistas ja e pequena/fechada
+    // de proposito (cada artista costuma ter 1 faixa no album, entao o shuffle puro raramente
+    // repete artista em sequencia por acaso). Radio de artista unico usa albumDiverseRadioSession
+    // abaixo, que garante diversidade de album (nao ha diversidade de artista pra garantir aqui).
     private fun shuffledRadioSession(radio: LocalRadio): List<LocalSong> {
         val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)
             ?.split(",")
@@ -462,6 +500,30 @@ class MusicLibraryRepository(private val context: Context) {
             .orEmpty()
         val attempts = (0 until RADIO_SESSION_ATTEMPTS).map { attempt ->
             radio.songs.shuffled(Random(stableHash("${radio.name}:${System.nanoTime()}:${Random.nextLong()}:$attempt")))
+        }
+        val session = if (previousIds.isEmpty()) {
+            attempts.first()
+        } else {
+            attempts.minByOrNull { radioSequenceSimilarity(it, previousIds) }.orEmpty()
+        }
+        metadataPrefs.edit()
+            .putString(lastRadioSessionKey(radio.name), session.joinToString(",") { it.id.toString() })
+            .apply()
+        return session
+    }
+
+    // Mesmo esquema de tentativas + anti-repeticao contra a sessao anterior de
+    // shuffledRadioSession, so que a ordem de cada tentativa vem de buildAlbumDiverseQueue
+    // (diversidade de ALBUM) em vez de um shuffle puro - usado so pra radio de artista unico
+    // (radioSessionFrom), onde o usuario quer as faixas variando de album em album em vez de
+    // deixar varias faixas do mesmo album em sequencia por puro acaso do shuffle.
+    private fun albumDiverseRadioSession(radio: LocalRadio): List<LocalSong> {
+        val previousIds = metadataPrefs.getString(lastRadioSessionKey(radio.name), null)
+            ?.split(",")
+            ?.mapNotNull { it.toLongOrNull() }
+            .orEmpty()
+        val attempts = (0 until RADIO_SESSION_ATTEMPTS).map { attempt ->
+            buildAlbumDiverseQueue(radio.songs, "${radio.name}:${System.nanoTime()}:${Random.nextLong()}:$attempt")
         }
         val session = if (previousIds.isEmpty()) {
             attempts.first()
@@ -492,7 +554,7 @@ class MusicLibraryRepository(private val context: Context) {
             .sortedBy { it.lowercase() }
 
     fun availableGenres(songs: List<LocalSong>): List<String> =
-        (songs.map { it.genre.trim() }.filter { it.isNotBlank() } + DEFAULT_GENRE_CHOICES)
+        (songs.flatMap { splitGenreTags(it.genre) }.map(::capitalizeGenreTag) + GENRE_TAG_CATALOG)
             .distinctBy { it.lowercase() }
             .sortedBy { it.lowercase() }
 
@@ -992,7 +1054,10 @@ class MusicLibraryRepository(private val context: Context) {
                     primaryArtistKey = primaryArtistKey(song.artist),
                     artistKeys = artistKeys(song.artist),
                     albumKey = "${song.albumId}:${song.album.lowercase()}",
-                    genreKey = radioGenreKey(song, normalizeLookupKey(song.genre)),
+                    // So usado aqui pra evitar tocar musicas do mesmo genero em sequencia
+                    // (heuristico de diversidade abaixo) - uma so chave representativa basta,
+                    // nao precisa das N categorias de genreEntriesFor (ver dynamicGenreRadios).
+                    genreKey = genreEntriesFor(song).firstOrNull()?.first ?: "sem genero",
                 )
             }
 
@@ -1026,7 +1091,16 @@ class MusicLibraryRepository(private val context: Context) {
                     seed = seed,
                 )
             }
-            val nextArtist = rankedArtists.randomFromTop(random, RADIO_ARTIST_CHOICE_POOL) ?: break
+            // Restricao DURA, nao so pontuacao: nunca repete o artista tocado por ultimo, a nao
+            // ser que seja a unica opcao restante. So a penalidade de 200_000 em radioArtistScore
+            // nao bastava - com poucos artistas disponiveis (comum perto do fim da sessao, ou em
+            // categorias pequenas) o pool "top N" de randomFromTop passa a incluir TODOS os
+            // artistas disponiveis, inclusive o recem-tocado, e o sorteio dentro do pool e
+            // uniforme (ignora a diferenca de pontuacao) - o mesmo artista podia repetir em
+            // sequencia por puro acaso do sorteio.
+            val previousArtist = queue.lastOrNull()?.primaryArtistKey
+            val artistChoices = rankedArtists.filterNot { it == previousArtist }.ifEmpty { rankedArtists }
+            val nextArtist = artistChoices.randomFromTop(random, RADIO_ARTIST_CHOICE_POOL) ?: break
 
             val nextSongs = artistQueues.getValue(nextArtist)
             val nextSong = pickSongForArtist(nextSongs, queue, seed)
@@ -1036,6 +1110,47 @@ class MusicLibraryRepository(private val context: Context) {
             if (nextSongs.isEmpty()) artistQueues.remove(nextArtist)
         }
         return queue.map { it.song }
+    }
+
+    // Mesma ideia de buildRadioQueue (round-robin com pontuacao + restricao dura contra repetir
+    // o grupo tocado por ultimo), so agrupando por ALBUM em vez de artista - usado por
+    // albumDiverseRadioSession pra radio de artista unico, onde a diversidade que importa e de
+    // album (so ha 1 artista, entao o agrupamento por artista de buildRadioQueue seria um no-op).
+    private fun buildAlbumDiverseQueue(songs: List<LocalSong>, seed: String): List<LocalSong> {
+        val random = Random(stableHash(seed))
+        val candidates = songs.distinctBy { it.id }
+        if (candidates.isEmpty()) return emptyList()
+
+        fun albumKeyOf(song: LocalSong) = "${song.albumId}:${song.album.lowercase()}"
+
+        val albumQueues = candidates
+            .groupBy(::albumKeyOf)
+            .mapValues { (_, albumSongs) ->
+                albumSongs.sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
+                    .shuffled(random)
+                    .toMutableList()
+            }
+            .toMutableMap()
+
+        val queue = mutableListOf<LocalSong>()
+        while (albumQueues.isNotEmpty()) {
+            val previousAlbum = queue.lastOrNull()?.let(::albumKeyOf)
+            val recentAlbums = queue.takeLast(3).map(::albumKeyOf).toSet()
+            val rankedAlbums = albumQueues.keys.sortedBy { albumKey ->
+                (if (albumKey in recentAlbums) 40_000 else 0) +
+                    (stableHash("$seed:$albumKey:${queue.size}") % 1_000)
+            }
+            // Mesma restricao dura de buildRadioQueue: nunca repete o album tocado por ultimo, a
+            // nao ser que seja a unica opcao restante.
+            val albumChoices = rankedAlbums.filterNot { it == previousAlbum }.ifEmpty { rankedAlbums }
+            val nextAlbum = albumChoices.randomFromTop(random, RADIO_ARTIST_CHOICE_POOL) ?: break
+
+            val nextSongs = albumQueues.getValue(nextAlbum)
+            val nextSong = nextSongs.removeAt(0)
+            queue += nextSong
+            if (nextSongs.isEmpty()) albumQueues.remove(nextAlbum)
+        }
+        return queue
     }
 
     private fun radioArtistScore(
@@ -1167,21 +1282,27 @@ class MusicLibraryRepository(private val context: Context) {
         return (byAlbum + byArtist + songs).distinct().take(4)
     }
 
+    // Cada tag vira sua propria categoria (ver GenreTags.kt/splitGenreTags) - uma musica com N
+    // tags entra em ate N categorias diferentes. Antes disso a categorizacao passava por
+    // genreBucket(), um esquema de ~25 "baldes" amplos (Rock, Metal, Funk etc.) que escondia
+    // subgeneros especificos uns dos outros mesmo depois de digitados (ex.: "Space Rock" sumia
+    // dentro de "Rock", "Funk Carioca" sumia dentro de "Soul / funk") - removido de proposito,
+    // decisao explicita do usuario em troca de fragmentar generos legados mal escritos que ainda
+    // nao passaram pelo editor de tags novo (ex.: "Alt Rock" e "Alternative Rock" agora viram 2
+    // categorias em vez de 1 so).
     private fun dynamicGenreRadios(songs: List<LocalSong>): List<LocalRadio> {
-        val eligibleSongs = songs.filter { it.genre.isNotBlank() }
-        // Muitas musicas compartilham o mesmo texto de genero (ex.: "Rock" repetido centenas de
-        // vezes); normalizar por valor distinto em vez de por musica evita milhares de chamadas
-        // redundantes a Normalizer.normalize e era o maior gargalo do carregamento da biblioteca.
-        val normalizedGenreByRawGenre = eligibleSongs.map { it.genre }.distinct()
-            .associateWith { normalizeLookupKey(it) }
-        return eligibleSongs
-            .groupBy { radioGenreKey(it, normalizedGenreByRawGenre.getValue(it.genre)) }
-            .mapNotNull { (genreKey, genreSongs) ->
-                if (isUnknownGenreValue(genreKey)) return@mapNotNull null
-                val uniqueSongs = genreSongs.distinctBy { it.id }
+        data class GenreHit(val song: LocalSong, val key: String, val display: String)
+
+        val hits = songs.flatMap { song -> genreEntriesFor(song).map { (key, display) -> GenreHit(song, key, display) } }
+
+        return hits.groupBy { it.key }
+            .mapNotNull { (genreKey, group) ->
+                val uniqueSongs = group.map { it.song }.distinctBy { it.id }
                 if (uniqueSongs.size < MIN_RADIO_SIZE) return@mapNotNull null
 
-                val name = radioGenreName(genreKey, uniqueSongs)
+                val name = GENRE_DISPLAY_NAMES[genreKey]
+                    ?: group.groupingBy { it.display }.eachCount().maxByOrNull { it.value }?.key
+                    ?: genreKey.replaceFirstChar { it.titlecase() }
                 // Contagem de artistas distintos calculada uma unica vez aqui: o comparador do
                 // sortedWith abaixo roda O(n log n) vezes, e recalcular isso por comparacao
                 // (Normalizer.normalize por musica) travava o carregamento com bibliotecas grandes.
@@ -1214,28 +1335,32 @@ class MusicLibraryRepository(private val context: Context) {
         )
     }
 
-    private fun radioGenreName(genreKey: String, songs: List<LocalSong>): String =
-        GENRE_DISPLAY_NAMES[genreKey]
-            ?: songs.map { it.genre.trim() }
-                .filter { it.isNotBlank() }
-                .groupingBy { it }
-                .eachCount()
-                .maxByOrNull { it.value }
-                ?.key
-            ?: genreKey.replaceFirstChar { it.titlecase() }
-
     // Tokens sao constantes; normalizar uma vez (lazy) evita renormalizar as mesmas ~30 palavras
     // para cada musica com genero "Unknown" (era o maior gargalo restante do carregamento).
     private val normalizedMetadataGenreHints: List<Pair<String, String>> by lazy {
         METADATA_GENRE_HINTS.map { (token, genre) -> normalizeLookupKey(token) to genre }
     }
 
-    private fun radioGenreKey(song: LocalSong, normalizedGenre: String): String {
-        if (normalizedGenre.isNotBlank() && !isUnknownGenreValue(normalizedGenre)) return genreBucket(normalizedGenre)
+    // Retorna cada (chave normalizada, texto de exibicao) que essa musica preenche - uma entrada
+    // por tag (splitGenreTags), entao uma musica com N tags preenche ate N categorias. Sem
+    // NENHUMA tag reconhecida, tenta adivinhar UMA categoria por titulo/artista/album
+    // (METADATA_GENRE_HINTS, mesmo fallback de sempre) - so gera uma entrada porque nao ha tags
+    // multiplas nesse caminho. Usado por dynamicGenreRadios (monta as categorias),
+    // matchSongsForSourceId (resolve musicas de uma categoria persistida) e buildRadioQueue
+    // (heuristico de diversidade de genero no embaralhamento).
+    private fun genreEntriesFor(song: LocalSong): List<Pair<String, String>> {
+        val tagEntries = splitGenreTags(song.genre)
+            .map { tag -> capitalizeGenreTag(tag) to normalizeLookupKey(tag) }
+            .filter { (_, key) -> key.isNotBlank() && !isUnknownGenreValue(key) }
+            .distinctBy { (_, key) -> key }
+            .map { (display, key) -> key to display }
+        if (tagEntries.isNotEmpty()) return tagEntries
 
         val metadata = normalizeLookupKey("${song.title} ${song.artist} ${song.album}")
-        return normalizedMetadataGenreHints.firstOrNull { (normalizedToken, _) -> metadata.contains(normalizedToken) }?.second
-            ?: "sem genero"
+        val guessedKey = normalizedMetadataGenreHints.firstOrNull { (token, _) -> metadata.contains(token) }?.second
+            ?: return emptyList()
+        val display = GENRE_DISPLAY_NAMES[guessedKey] ?: guessedKey.replaceFirstChar { it.titlecase() }
+        return listOf(guessedKey to display)
     }
 
     private fun isUnknownGenreValue(normalizedGenre: String): Boolean =
@@ -1244,39 +1369,6 @@ class MusicLibraryRepository(private val context: Context) {
             normalizedGenre == "desconhecido" ||
             normalizedGenre == "genero desconhecido" ||
             normalizedGenre == "sem genero"
-
-    private fun genreBucket(normalizedGenre: String): String = when {
-        normalizedGenre.contains("nu metal") -> "nu metal"
-        normalizedGenre.contains("thrash") -> "thrash metal"
-        normalizedGenre.contains("death metal") -> "death metal"
-        normalizedGenre.contains("black metal") -> "black metal"
-        normalizedGenre.contains("doom") || normalizedGenre.contains("stoner") || normalizedGenre.contains("sludge") -> "doom stoner"
-        normalizedGenre.contains("heavy metal") || normalizedGenre.contains("metal") -> "metal"
-        normalizedGenre.contains("post punk") || normalizedGenre.contains("cold wave") || normalizedGenre.contains("coldwave") ||
-            normalizedGenre.contains("darkwave") || normalizedGenre.contains("goth") -> "post punk cold wave"
-        normalizedGenre.contains("grunge") -> "grunge"
-        normalizedGenre.contains("shoegaze") || normalizedGenre.contains("dream pop") -> "shoegaze dream pop"
-        normalizedGenre.contains("psychedelic") || normalizedGenre.contains("psicodel") || normalizedGenre.contains("psych") -> "indie psicodelico"
-        normalizedGenre.contains("indie") -> "indie"
-        normalizedGenre.contains("alternative") || normalizedGenre.contains("alt rock") -> "alternative"
-        normalizedGenre.contains("hard rock") -> "hard rock"
-        normalizedGenre.contains("punk") -> "punk"
-        normalizedGenre.contains("rock") -> "rock"
-        normalizedGenre.contains("rap nacional") || normalizedGenre.contains("brazilian rap") -> "rap nacional"
-        normalizedGenre.contains("hip hop") || normalizedGenre == "rap" -> "hip hop rap"
-        normalizedGenre.contains("mpb") -> "mpb"
-        normalizedGenre.contains("samba") -> "samba"
-        normalizedGenre.contains("bossa") -> "bossa"
-        normalizedGenre.contains("house") -> "house"
-        normalizedGenre.contains("techno") -> "techno"
-        normalizedGenre.contains("ambient") -> "ambient"
-        normalizedGenre.contains("electronic") || normalizedGenre.contains("electronica") || normalizedGenre.contains("edm") ||
-            normalizedGenre.contains("dance") -> "eletronica house"
-        normalizedGenre.contains("jazz") -> "jazz"
-        normalizedGenre.contains("soul") || normalizedGenre.contains("funk") || normalizedGenre.contains("r b") -> "soul funk"
-        normalizedGenre.contains("pop") -> "pop"
-        else -> normalizedGenre
-    }
 
     private fun normalizeLookupKey(value: String): String =
         asciiFold(value)
@@ -1358,26 +1450,6 @@ class MusicLibraryRepository(private val context: Context) {
         val DIACRITICS_REGEX = Regex("\\p{Mn}+")
         val LOOKUP_CLEANUP_REGEX = Regex("[^a-z0-9]+")
         val ARTIST_NOISE_WORDS = setOf("various artists", "vários artistas", "varios artistas", "unknown")
-        val DEFAULT_GENRE_CHOICES = listOf(
-            "Rock",
-            "Alternative",
-            "Rap nacional",
-            "Hip-Hop/Rap",
-            "MPB",
-            "Eletronica / house",
-            "Metal",
-            "Nu Metal",
-            "Thrash Metal",
-            "Grunge",
-            "Indie / psicodelico",
-            "Post-punk / cold wave",
-            "Jazz",
-            "Soul / funk",
-            "Pop",
-            "Punk",
-            "Samba",
-        )
-
         val GENRE_DISPLAY_NAMES = mapOf(
             "nu metal" to "Nu Metal",
             "thrash metal" to "Thrash Metal",
@@ -1404,6 +1476,7 @@ class MusicLibraryRepository(private val context: Context) {
             "ambient" to "Ambient",
             "eletronica house" to "Eletronica / house",
             "jazz" to "Jazz",
+            "funk carioca" to "Funk Carioca",
             "soul funk" to "Soul / funk",
             "pop" to "Pop",
         )

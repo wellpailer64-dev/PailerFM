@@ -11,11 +11,17 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDecay
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.ScrollScope
+import kotlin.math.abs
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -29,9 +35,13 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -68,6 +78,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -86,6 +97,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Search
@@ -143,6 +155,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Constraints
@@ -161,11 +174,14 @@ import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
 import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.PendingTagChange
-import com.pailer.localtune.data.RadioBulletinMode
+import com.pailer.localtune.data.capitalizeGenreTag
+import com.pailer.localtune.data.joinGenreTags
+import com.pailer.localtune.data.splitGenreTags
 import com.pailer.localtune.player.LocalTuneViewModel
 import com.pailer.localtune.player.AlbumArtworkUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
+import com.pailer.localtune.player.RadioBulletinBufferUiState
 import com.pailer.localtune.player.RadioBulletinUiState
 import com.pailer.localtune.player.RadioVoiceUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
@@ -204,6 +220,35 @@ private enum class SettingsPage {
     Artists,
     RadioBulletins,
     AlbumArtwork,
+}
+
+// Fling mais suave/macio pra rolagem do app inteiro (pedido do usuario 04/09/2026) - o default
+// do Compose (ScrollableDefaults.flingBehavior(), spline-based) desacelera rapido e para meio
+// seco. exponentialDecay com frictionMultiplier bem abaixo do padrao real do sistema (~4-5 numa
+// tela normal) deixa a lista "flutuar" mais depois do gesto, sem perder o controle (nao e
+// fisica livre, so um atrito menor). Implementacao manual de FlingBehavior (em vez de reusar
+// DefaultFlingBehavior, que e `internal` no compose-foundation desta versao - nao compila fora
+// do modulo deles) copiando o mesmo padrao documentado pelo Google pra fling customizado.
+// Usado em todo LazyColumn/LazyVerticalGrid/verticalScroll do arquivo pra nao ficar
+// inconsistente (uma tela macia, outra seca).
+@Composable
+private fun rememberSoftFlingBehavior(): FlingBehavior {
+    val flingDecay = exponentialDecay<Float>(frictionMultiplier = 1.4f)
+    return remember(flingDecay) {
+        object : FlingBehavior {
+            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+                val animationState = AnimationState(initialValue = 0f, initialVelocity = initialVelocity)
+                var lastValue = 0f
+                animationState.animateDecay(flingDecay) {
+                    val delta = value - lastValue
+                    val consumed = scrollBy(delta)
+                    lastValue = value
+                    if (abs(delta - consumed) > 0.5f) cancelAnimation()
+                }
+                return animationState.velocity
+            }
+        }
+    }
 }
 
 @Composable
@@ -306,7 +351,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // da entidade aberta pra resetar o scroll quando o usuario abre uma entidade DIFERENTE,
     // mas preservar quando volta pra mesma (ex.: abriu um album de dentro do artista e voltou).
     val artistsScrollState = rememberScrollState()
-    val albumsListState = rememberLazyGridState()
+    val albumsScrollState = rememberScrollState()
     val songsListState = rememberLazyGridState()
     val genresListState = rememberLazyGridState()
     val radiosListState = rememberLazyGridState()
@@ -397,6 +442,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         if (albumArtwork.appliedVersion > 0) artworkMemoryCache.evictAll()
     }
     val radioBulletins = viewModel.radioBulletinState.value
+    val radioBulletinBuffer = viewModel.radioBulletinBufferState.value
     val radioVoice = viewModel.radioVoiceState.value
     val songs = content.songs
     val albums = content.albums
@@ -566,10 +612,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onCreateRadio = { viewModel.createRadioFromArtist(openedArtist) },
                         listState = artistDetailListState,
                     )
-                    openedRadio != null -> RadioDetailScreen(
+                    openedRadio != null -> {
+                    // Fontes extras (adicionadas via "+") da radio aberta, resolvidas contra as
+                    // listas artists/albums ja carregadas - recalculado a cada recomposicao (nao
+                    // memoizado), entao some/aparece sozinho ao adicionar/remover fonte.
+                    val openedRadioExtraSourceIds = viewModel.radioExtraSourceIds(openedRadio)
+                    val openedRadioExtraArtists = artists.filter { "artist:${it.key}" in openedRadioExtraSourceIds }
+                    val openedRadioExtraAlbums = albums.filter { "album:${it.id}" in openedRadioExtraSourceIds }
+                    RadioDetailScreen(
                         radio = openedRadio,
                         player = player,
                         sessionSongs = radioSession,
+                        songsBetweenBulletins = radioBulletins.settings.songsBetweenBulletins,
                         isGenerating = isGeneratingRadio,
                         onBack = {
                             // So chamado pelo botao "Sair da radio" agora (a tela nao tem mais
@@ -614,8 +668,20 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onAddAlbum = { album ->
                             viewModel.addAlbumToRadio(openedRadio, album)?.let { selectedRadio = it }
                         },
+                        extraArtists = openedRadioExtraArtists,
+                        extraAlbums = openedRadioExtraAlbums,
+                        onRemoveArtist = { artist ->
+                            viewModel.removeArtistFromRadio(openedRadio, artist)?.let { selectedRadio = it }
+                        },
+                        onRemoveAlbum = { album ->
+                            viewModel.removeAlbumFromRadio(openedRadio, album)?.let { selectedRadio = it }
+                        },
+                        onRenameRadio = { newName ->
+                            viewModel.renameRadio(openedRadio, newName)?.let { selectedRadio = it }
+                        },
                         listState = radioDetailListState,
                     )
+                    }
                     openedGenre != null -> GenreDetailScreen(
                         genre = openedGenre,
                         artists = openedGenreArtists,
@@ -655,7 +721,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         albums = albums,
                         onOpenAlbum = { selectedAlbum = it },
                         onDeleteAlbum = { pendingDeleteAlbum = it },
-                        listState = albumsListState,
+                        favoriteAlbumKeys = library.favoriteAlbumKeys,
+                        scrollState = albumsScrollState,
                     )
                     selectedTab == LibraryTab.Songs -> SongsScreen(
                         songs = songs,
@@ -697,6 +764,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             metadata = metadata,
             albumArtwork = albumArtwork,
             radioBulletins = radioBulletins,
+            radioBulletinBuffer = radioBulletinBuffer,
             radioVoice = radioVoice,
             batteryProtected = viewModel.isIgnoringBatteryOptimizations(),
             onRequestBatteryExemption = {
@@ -720,17 +788,21 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onCloseArtworkSearch = viewModel::closeArtworkSearch,
             onSelectArtworkCandidate = viewModel::selectArtworkCandidate,
             onApplyArtwork = requestApplyArtwork,
-            onSetRadioBulletinMode = viewModel::setRadioBulletinMode,
             onSetRadioBulletinPreferLocalWriter = viewModel::setRadioBulletinPreferLocalWriter,
             onImportRadioWriterPackage = { writerPackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioWriterPackage = viewModel::clearRadioWriterPackage,
+            onSaveGeminiApiKey = viewModel::saveGeminiApiKey,
+            onClearGeminiApiKey = viewModel::clearGeminiApiKey,
             onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
             onTestRadioVoicePackage = viewModel::testRadioVoicePackage,
-            onTestRadioBulletin = viewModel::testRadioBulletin,
             onReplayTestAudio = viewModel::replayLastTestAudio,
             onTestAndroidVoice = viewModel::testAndroidVoiceBulletin,
+            onPauseBulletinPreparation = viewModel::pauseBulletinPreparation,
+            onResumeBulletinPreparation = viewModel::resumeBulletinPreparation,
+            onResetBulletinBuffer = viewModel::resetBulletinBuffer,
+            onPlayReadyBulletin = viewModel::playReadyBufferedBulletin,
             hasHiddenRadios = viewModel.hasHiddenRadios(),
             onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
         )
@@ -895,6 +967,7 @@ private fun SettingsDrawer(
     metadata: MetadataUiState,
     albumArtwork: AlbumArtworkUiState,
     radioBulletins: RadioBulletinUiState,
+    radioBulletinBuffer: RadioBulletinBufferUiState,
     radioVoice: RadioVoiceUiState,
     batteryProtected: Boolean,
     onRequestBatteryExemption: () -> Unit,
@@ -914,17 +987,21 @@ private fun SettingsDrawer(
     onCloseArtworkSearch: () -> Unit,
     onSelectArtworkCandidate: (ArtworkCandidate) -> Unit,
     onApplyArtwork: (LocalAlbum) -> Unit,
-    onSetRadioBulletinMode: (RadioBulletinMode) -> Unit,
     onSetRadioBulletinPreferLocalWriter: (Boolean) -> Unit,
     onImportRadioWriterPackage: () -> Unit,
     onClearRadioWriterPackage: () -> Unit,
+    onSaveGeminiApiKey: (String) -> Unit,
+    onClearGeminiApiKey: () -> Unit,
     onImportRadioVoicePackage: () -> Unit,
     onClearRadioVoicePackage: () -> Unit,
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
     onTestRadioVoicePackage: () -> Unit,
-    onTestRadioBulletin: () -> Unit,
     onReplayTestAudio: () -> Unit,
     onTestAndroidVoice: () -> Unit,
+    onPauseBulletinPreparation: () -> Unit,
+    onResumeBulletinPreparation: () -> Unit,
+    onResetBulletinBuffer: () -> Unit,
+    onPlayReadyBulletin: (Int) -> Unit,
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
 ) {
@@ -1013,19 +1090,24 @@ private fun SettingsDrawer(
                         )
                         SettingsPage.RadioBulletins -> RadioBulletinSettingsPanel(
                             radioBulletins = radioBulletins,
+                            bulletinBuffer = radioBulletinBuffer,
                             radioVoice = radioVoice,
                             onBack = { onPageChange(SettingsPage.Main) },
-                            onSetMode = onSetRadioBulletinMode,
                             onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
                             onImportWriterPackage = onImportRadioWriterPackage,
                             onClearWriterPackage = onClearRadioWriterPackage,
+                            onSaveGeminiApiKey = onSaveGeminiApiKey,
+                            onClearGeminiApiKey = onClearGeminiApiKey,
                             onImportVoicePackage = onImportRadioVoicePackage,
                             onClearVoicePackage = onClearRadioVoicePackage,
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
                             onTestVoicePackage = onTestRadioVoicePackage,
-                            onTestRadioBulletin = onTestRadioBulletin,
                             onReplayTestAudio = onReplayTestAudio,
                             onTestAndroidVoice = onTestAndroidVoice,
+                            onPauseBulletinPreparation = onPauseBulletinPreparation,
+                            onResumeBulletinPreparation = onResumeBulletinPreparation,
+                            onResetBulletinBuffer = onResetBulletinBuffer,
+                            onPlayReadyBulletin = onPlayReadyBulletin,
                         )
                         SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
                             state = albumArtwork,
@@ -1149,26 +1231,31 @@ private fun SettingsMainPanel(
 @Composable
 private fun RadioBulletinSettingsPanel(
     radioBulletins: RadioBulletinUiState,
+    bulletinBuffer: RadioBulletinBufferUiState,
     radioVoice: RadioVoiceUiState,
     onBack: () -> Unit,
-    onSetMode: (RadioBulletinMode) -> Unit,
     onSetPreferLocalWriter: (Boolean) -> Unit,
     onImportWriterPackage: () -> Unit,
     onClearWriterPackage: () -> Unit,
+    onSaveGeminiApiKey: (String) -> Unit,
+    onClearGeminiApiKey: () -> Unit,
     onImportVoicePackage: () -> Unit,
     onClearVoicePackage: () -> Unit,
     onSetVoiceEnabled: (Boolean) -> Unit,
     onTestVoicePackage: () -> Unit,
-    onTestRadioBulletin: () -> Unit,
     onReplayTestAudio: () -> Unit,
     onTestAndroidVoice: () -> Unit,
+    onPauseBulletinPreparation: () -> Unit,
+    onResumeBulletinPreparation: () -> Unit,
+    onResetBulletinBuffer: () -> Unit,
+    onPlayReadyBulletin: (Int) -> Unit,
 ) {
     val settings = radioBulletins.settings
     Column(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
             .padding(horizontal = 18.dp, vertical = 22.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1197,28 +1284,17 @@ private fun RadioBulletinSettingsPanel(
             style = MaterialTheme.typography.bodySmall,
         )
 
-        Text("Modo", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        RadioBulletinChoiceRow(
-            title = "Desativado",
-            subtitle = "A radio toca sem noticias",
-            selected = settings.mode == RadioBulletinMode.Off,
-            onClick = { onSetMode(RadioBulletinMode.Off) },
+        RadioBulletinBufferStatusCard(
+            bulletinBuffer = bulletinBuffer,
+            onPause = onPauseBulletinPreparation,
+            onResume = onResumeBulletinPreparation,
+            onReset = onResetBulletinBuffer,
+            onPlay = onPlayReadyBulletin,
         )
-        RadioBulletinChoiceRow(
-            title = "So manchetes",
-            subtitle = "Entrada curta usando a voz atual do Android",
-            selected = settings.mode == RadioBulletinMode.Headlines,
-            onClick = { onSetMode(RadioBulletinMode.Headlines) },
-        )
-        RadioBulletinChoiceRow(
-            title = "Conversa dos locutores",
-            subtitle = "Roteiro em bate-bola, preparado para o redator local",
-            selected = settings.mode == RadioBulletinMode.Dialogue,
-            onClick = { onSetMode(RadioBulletinMode.Dialogue) },
-        )
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(16.dp))
 
-        Spacer(Modifier.height(18.dp))
         Text("Redator local", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
         RadioBulletinChoiceRow(
             title = radioBulletins.localWriterName,
@@ -1271,6 +1347,45 @@ private fun RadioBulletinSettingsPanel(
         Spacer(Modifier.height(20.dp))
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         Spacer(Modifier.height(16.dp))
+        Text("Redator via Gemini (nuvem)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Text(
+            text = if (radioBulletins.geminiConfigured) {
+                "Chave salva: o Gemini escreve o boletim primeiro (mais rapido), e o redator local so entra se ele falhar."
+            } else {
+                "Opcional: cole sua chave de API gratuita do Gemini pra escrever o boletim na nuvem em vez do redator local. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
+            },
+            modifier = Modifier.padding(top = 8.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(10.dp))
+        if (radioBulletins.geminiConfigured) {
+            TextButton(onClick = onClearGeminiApiKey) {
+                Text("Remover chave do Gemini", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            var geminiKeyInput by remember { mutableStateOf("") }
+            MetadataTextField(
+                value = geminiKeyInput,
+                onValueChange = { geminiKeyInput = it },
+                label = "Chave de API do Gemini",
+                placeholder = "AIza...",
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    onSaveGeminiApiKey(geminiKeyInput)
+                    geminiKeyInput = ""
+                },
+                enabled = geminiKeyInput.isNotBlank(),
+            ) {
+                Text("Salvar chave")
+            }
+        }
+
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(16.dp))
         Text("Voz local", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Surface(
@@ -1292,7 +1407,7 @@ private fun RadioBulletinSettingsPanel(
                         )
                         Text(
                             text = if (radioVoice.isInstalled) {
-                                "${radioVoice.engine.ifBlank { "Motor local" }} · ${radioVoice.femaleSpeaker.ifBlank { "Locutora" }} / ${radioVoice.maleSpeaker.ifBlank { "Locutor" }}"
+                                "${radioVoice.femaleSpeaker.ifBlank { "Locutora" }} / ${radioVoice.maleSpeaker.ifBlank { "Locutor" }}"
                             } else {
                                 radioVoice.detail
                             },
@@ -1321,7 +1436,7 @@ private fun RadioBulletinSettingsPanel(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = onImportVoicePackage,
-                        enabled = !radioVoice.isImporting && !radioVoice.isTesting && !radioVoice.isTestingBulletin,
+                        enabled = !radioVoice.isImporting && !radioVoice.isTesting,
                     ) {
                         if (radioVoice.isImporting) {
                             CircularProgressIndicator(
@@ -1336,7 +1451,7 @@ private fun RadioBulletinSettingsPanel(
                     if (radioVoice.isInstalled) {
                         Button(
                             onClick = onTestVoicePackage,
-                            enabled = !radioVoice.isTesting && !radioVoice.isTestingBulletin,
+                            enabled = !radioVoice.isTesting,
                         ) {
                             if (radioVoice.isTesting) {
                                 CircularProgressIndicator(
@@ -1352,28 +1467,19 @@ private fun RadioBulletinSettingsPanel(
                 }
                 if (radioVoice.isInstalled) {
                     Spacer(Modifier.height(8.dp))
+                    // Testar o redator local/boletim acontece pelo card do buffer (ver
+                    // RadioBulletinBufferStatusCard "Reproduzir boletim pronto") - pedido do
+                    // usuario (03/09/2026): um caminho de teste so, ja que o preparo automatico
+                    // do buffer serve como teste em si (e evita duas geracoes concorrentes
+                    // disputando CPU, uma pelo botao manual e outra pelo preparo de fundo).
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = onTestRadioBulletin,
-                            enabled = !radioVoice.isTesting && !radioVoice.isTestingBulletin,
-                        ) {
-                            if (radioVoice.isTestingBulletin) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.onPrimary,
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(if (radioVoice.isTestingBulletin) "Buscando..." else "Testar notícia real")
-                        }
                         TextButton(onClick = onClearVoicePackage) {
                             Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                    }
-                    if (radioVoice.canReplayTest) {
-                        TextButton(onClick = onReplayTestAudio) {
-                            Text("Tocar de novo", color = MaterialTheme.colorScheme.primary)
+                        if (radioVoice.canReplayTest) {
+                            TextButton(onClick = onReplayTestAudio) {
+                                Text("Tocar de novo", color = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     }
                 }
@@ -1400,6 +1506,173 @@ private fun RadioBulletinSettingsPanel(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+// Status do buffer de boletins prontos (ADR-019) em tempo real - pedido do usuario
+// (03/09/2026): acompanhar quantos boletins ja estao prontos/sendo escritos, alem de poder
+// pausar (cancela o preparo e nao deixa comecar outro) e resetar (apaga o que tem e comeca de
+// novo) o preparo em segundo plano.
+@Composable
+private fun RadioBulletinBufferStatusCard(
+    bulletinBuffer: RadioBulletinBufferUiState,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onReset: () -> Unit,
+    onPlay: (Int) -> Unit,
+) {
+    // Pulso lento (1400ms, mais devagar que o "radioLivePulse"/"playerLivePulse" de 820ms usados
+    // em "ao vivo" pela UI) na bolinha que esta sendo escrita agora - pedido do usuario
+    // (03/09/2026): quer ver visualmente qual boletim esta em andamento, piscando devagar.
+    val pulseTransition = rememberInfiniteTransition(label = "bulletinBufferPulse")
+    val pulse by pulseTransition.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1400),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "bulletinBufferPulseAlpha",
+    )
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = PailerSurface.copy(alpha = 0.9f),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Boletins em buffer",
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "${bulletinBuffer.readyCount}/${bulletinBuffer.targetCount} prontos" +
+                            if (bulletinBuffer.isPaused) " · pausado" else "",
+                        modifier = Modifier.padding(top = 3.dp),
+                        color = if (bulletinBuffer.isPaused) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (bulletinBuffer.isPreparing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            // Um "ponto" por vaga do buffer: preenchido = pronto (clicavel, toca aquele boletim
+            // especifico), translucido = sendo escrito agora, vazio = ainda por fazer - da pra
+            // acompanhar de relance sem ler numero. Antes so o botao abaixo tocava o primeiro item
+            // - pedido do usuario (03/09/2026): "os outros que ficam pronto, nao sei como
+            // reproduzir eles" - agora cada bolinha preenchida toca a posicao correspondente.
+            Row(
+                modifier = Modifier.padding(top = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                repeat(bulletinBuffer.targetCount) { slot ->
+                    val filled = slot < bulletinBuffer.readyCount
+                    val preparing = !filled && slot == bulletinBuffer.readyCount && bulletinBuffer.isPreparing
+                    val clickable = filled && !bulletinBuffer.isPlayingPreview
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .then(if (preparing) Modifier.alpha(pulse) else Modifier)
+                            .clip(CircleShape)
+                            .then(if (clickable) Modifier.clickable { onPlay(slot) } else Modifier)
+                            .background(
+                                when {
+                                    filled -> MaterialTheme.colorScheme.primary
+                                    preparing -> MaterialTheme.colorScheme.primary
+                                    else -> Color.White.copy(alpha = 0.14f)
+                                },
+                            ),
+                    )
+                }
+            }
+            bulletinBuffer.statusMessage?.let { message ->
+                // Mensagens de erro (RadioBulletinRepository.enhanceScript ou o catch generico
+                // de refillBulletinBuffer) comecam com "Erro"/"falhou" de proposito - destaca em
+                // vermelho pra ficar visivel na hora, sem precisar abrir o logcat.
+                val isError = message.startsWith("Erro", ignoreCase = true) || message.contains("falhou", ignoreCase = true)
+                // Percentual real - na escrita vem do callback nativo por token do redator local
+                // (ver LlamaProgressListener), na sintese de voz vem do servico (ver
+                // RadioBulletinBufferUiState.progressPercent).
+                val text = bulletinBuffer.progressPercent?.let { percent -> "$message ($percent%)" } ?: message
+                Text(
+                    text = text,
+                    modifier = Modifier.padding(top = 8.dp),
+                    color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = if (isError) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (bulletinBuffer.isPaused) {
+                    Button(onClick = onResume) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Retomar")
+                    }
+                } else {
+                    Button(onClick = onPause) {
+                        Icon(Icons.Filled.Pause, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Pausar")
+                    }
+                }
+                TextButton(onClick = onReset) {
+                    Icon(
+                        Icons.Filled.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Resetar", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            // Reproduz o primeiro boletim ja pronto direto aqui, sem precisar entrar numa radio
+            // pra testar (pedido do usuario 03/09/2026) - linha propria (nao cabia junto de
+            // Pausar/Resetar sem estourar a largura da tela, empurrando o Resetar pra fora - bug
+            // visto ao vivo 03/09/2026) - so acende quando tem pelo menos 1 pronto. Virou o
+            // caminho PRINCIPAL de teste do redator local (03/09/2026): substituiu o antigo botao
+            // "Testar noticia real", que gerava sob demanda sem passar pelo llmGenerationMutex e
+            // podia rodar concorrente com o preparo de fundo, disputando CPU/threads.
+            OutlinedButton(
+                onClick = { onPlay(0) },
+                enabled = bulletinBuffer.hasPlayableAudio && !bulletinBuffer.isPlayingPreview,
+                modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
+            ) {
+                if (bulletinBuffer.isPlayingPreview) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Filled.GraphicEq, contentDescription = null, modifier = Modifier.size(18.dp))
+                }
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    when {
+                        bulletinBuffer.isPlayingPreview -> "Tocando..."
+                        // Nivel 2 (bulletinBuffer) vazio mas Nivel 1 (nucleo) tem algo pronto -
+                        // deixa claro que e so previa do miolo, sem abertura/fechamento (que
+                        // dependem de radio real tocando - ver playReadyBufferedBulletin).
+                        bulletinBuffer.hasCorePreview -> "Reproduzir prévia (só o miolo)"
+                        else -> "Reproduzir boletim pronto"
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -1634,6 +1907,7 @@ private fun AlbumArtworkSettingsPanel(
             } else {
                 LazyColumn(
                     modifier = Modifier.weight(1f),
+                    flingBehavior = rememberSoftFlingBehavior(),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     contentPadding = PaddingValues(bottom = 24.dp),
                 ) {
@@ -1721,6 +1995,7 @@ private fun ArtworkSearchOverlay(
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     else -> LazyRow(
+                        flingBehavior = rememberSoftFlingBehavior(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         items(state.candidates, key = { it.previewUrl }) { candidate ->
@@ -1873,6 +2148,7 @@ private fun TagWriterSettingsPanel(
         Spacer(Modifier.height(16.dp))
         LazyColumn(
             modifier = Modifier.weight(1f),
+            flingBehavior = rememberSoftFlingBehavior(),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(bottom = 24.dp),
         ) {
@@ -1962,6 +2238,7 @@ private fun ArtistCleanupSettingsPanel(
         Spacer(Modifier.height(16.dp))
         LazyColumn(
             modifier = Modifier.weight(1f),
+            flingBehavior = rememberSoftFlingBehavior(),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(bottom = 24.dp),
         ) {
@@ -2259,6 +2536,7 @@ private fun MetadataReviewCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(max = 340.dp),
+            flingBehavior = rememberSoftFlingBehavior(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(bottom = 6.dp),
@@ -2304,7 +2582,11 @@ private fun HomeScreen(
     val homeFavoriteAlbums = remember(favoriteAlbums) { favoriteAlbums.take(6) }
     val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
 
-    LazyColumn(contentPadding = PaddingValues(bottom = 18.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+    LazyColumn(
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(bottom = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
         if (radioIsActive) {
             item {
                 LiveNowRadioCard(
@@ -2345,6 +2627,7 @@ private fun HomeScreen(
             }
             LazyRow(
                 state = recentAlbumsListState,
+                flingBehavior = rememberSoftFlingBehavior(),
                 contentPadding = PaddingValues(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -2356,6 +2639,7 @@ private fun HomeScreen(
         item {
             SectionTitle("Ouvir de novo", modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp))
             LazyRow(
+                flingBehavior = rememberSoftFlingBehavior(),
                 contentPadding = PaddingValues(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -2370,6 +2654,7 @@ private fun HomeScreen(
         item {
             SectionTitle("Albuns sugeridos para voce", modifier = Modifier.padding(horizontal = 18.dp))
             LazyRow(
+                flingBehavior = rememberSoftFlingBehavior(),
                 contentPadding = PaddingValues(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -2382,6 +2667,7 @@ private fun HomeScreen(
             item {
                 SectionTitle("Albuns curtidos", modifier = Modifier.padding(horizontal = 18.dp))
                 LazyRow(
+                    flingBehavior = rememberSoftFlingBehavior(),
                     contentPadding = PaddingValues(horizontal = 18.dp),
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
@@ -2432,19 +2718,23 @@ private fun ArtistsScreen(
 ) {
     // Bento: favoritos ocupam bloco 2x2 de verdade, os demais fluem 1x1 ao redor - por isso
     // isso nao e mais LazyVerticalGrid (GridItemSpan so estica largura dentro da MESMA linha,
-    // nao da pra reservar altura extra com vizinhos preenchendo do lado). Ver BentoArtistGrid.
+    // nao da pra reservar altura extra com vizinhos preenchendo do lado). Ver BentoGrid.
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(scrollState)
+            .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
             .padding(horizontal = 18.dp, vertical = 12.dp),
     ) {
-        BentoArtistGrid(
-            artists = artists,
+        BentoGrid(
+            items = artists,
             isFavorite = { it.key in favoriteArtistKeys },
-            onOpenArtist = onOpenArtist,
-            onDeleteArtist = onDeleteArtist,
-        )
+        ) { artist ->
+            ArtistGridCard(
+                artist = artist,
+                onClick = { onOpenArtist(artist) },
+                onLongClick = { onDeleteArtist(artist) },
+            )
+        }
     }
 }
 
@@ -2499,24 +2789,25 @@ private fun packBentoGrid(isBig: List<Boolean>, columns: Int): List<BentoPlaceme
     return placements
 }
 
-// Grade bento pra artistas: favoritos (isFavorite) ganham um bloco 2x2, os demais ficam 1x1 -
-// os dois usam o MESMO ArtistGridCard, so muda a largura que ele recebe (fillMaxWidth() dele
-// escala capa/texto proporcionalmente). Layout customizado porque LazyVerticalGrid nao suporta
-// item ocupando varias LINHAS com vizinhos preenchendo ao redor (so estica coluna na mesma
-// linha) - ver packBentoGrid(). Nao e lazy: mede todos os cards de uma vez (aceitavel pro
-// tamanho tipico de biblioteca pessoal; from a MUCH bigger library, valeria a pena revisar).
+// Grade bento generica: favoritos (isFavorite) ganham um bloco 2x2, os demais ficam 1x1 - usada
+// tanto por artistas (ArtistGridCard) quanto por albuns (AlbumGridCard, pedido do usuario
+// 04/09/2026 pra ter a mesma sensacao de "capa maior pro favorito" nos dois lugares), os dois
+// escalam capa/texto proporcionalmente porque o card recebido em `itemContent` e sempre
+// fillMaxWidth(). Layout customizado porque LazyVerticalGrid nao suporta item ocupando varias
+// LINHAS com vizinhos preenchendo ao redor (so estica coluna na mesma linha) - ver
+// packBentoGrid(). Nao e lazy: mede todos os cards de uma vez (aceitavel pro tamanho tipico de
+// biblioteca pessoal; numa biblioteca MUITO maior, valeria a pena revisar).
 @Composable
-private fun BentoArtistGrid(
-    artists: List<LocalArtist>,
-    isFavorite: (LocalArtist) -> Boolean,
-    onOpenArtist: (LocalArtist) -> Unit,
-    onDeleteArtist: (LocalArtist) -> Unit,
+private fun <T> BentoGrid(
+    items: List<T>,
+    isFavorite: (T) -> Boolean,
     modifier: Modifier = Modifier,
     columns: Int = 3,
     gap: Dp = 12.dp,
+    itemContent: @Composable (T) -> Unit,
 ) {
-    val bigFlags = artists.map(isFavorite)
-    val placements = remember(artists, bigFlags) { packBentoGrid(bigFlags, columns) }
+    val bigFlags = items.map(isFavorite)
+    val placements = remember(items, bigFlags) { packBentoGrid(bigFlags, columns) }
     val rowCount = placements.maxOfOrNull { it.row + it.span } ?: 0
 
     SubcomposeLayout(modifier = modifier.fillMaxWidth()) { constraints ->
@@ -2524,25 +2815,19 @@ private fun BentoArtistGrid(
         val totalWidth = constraints.maxWidth
         val cellWidth = (totalWidth - gapPx * (columns - 1)) / columns
 
-        // ArtistGridCard nao e quadrado (capa 1:1 + duas linhas de texto embaixo) - pra saber
-        // a altura de 1 celula sem cravar um numero de dp fixo (que quebraria com fonte do
-        // sistema maior), mede um card de amostra a parte pela subcomposicao "probe", nao
-        // colocado na tela. Compose so deixa medir cada Measurable uma vez, entao a grade de
-        // verdade abaixo usa uma subcomposicao separada da sonda.
-        val cellHeight = artists.firstOrNull()?.let { sampleArtist ->
+        // Card tipico nao e quadrado (capa 1:1 + linhas de texto embaixo) - pra saber a altura
+        // de 1 celula sem cravar um numero de dp fixo (que quebraria com fonte do sistema
+        // maior), mede um card de amostra a parte pela subcomposicao "probe", nao colocado na
+        // tela. Compose so deixa medir cada Measurable uma vez, entao a grade de verdade abaixo
+        // usa uma subcomposicao separada da sonda.
+        val cellHeight = items.firstOrNull()?.let { sampleItem ->
             subcompose("bento-probe") {
-                ArtistGridCard(artist = sampleArtist, onClick = {}, onLongClick = {})
+                itemContent(sampleItem)
             }.first().measure(Constraints(minWidth = cellWidth, maxWidth = cellWidth)).height
         } ?: cellWidth
 
         val placedChildren = subcompose("bento-grid") {
-            artists.forEach { artist ->
-                ArtistGridCard(
-                    artist = artist,
-                    onClick = { onOpenArtist(artist) },
-                    onLongClick = { onDeleteArtist(artist) },
-                )
-            }
+            items.forEach { item -> itemContent(item) }
         }.mapIndexed { index, measurable ->
             val placement = placements[index]
             val width = (cellWidth * placement.span + gapPx * (placement.span - 1)).coerceAtLeast(0)
@@ -2576,6 +2861,7 @@ private fun GenreDetailScreen(
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
         state = listState,
+        flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -2692,6 +2978,7 @@ private fun ArtistDetailScreen(
         LazyVerticalGrid(
             columns = GridCells.Fixed(3),
             state = listState,
+            flingBehavior = rememberSoftFlingBehavior(),
             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -2886,6 +3173,7 @@ private fun ArtistMetadataEditorOverlay(
         ) {
             LazyColumn(
                 modifier = Modifier.padding(16.dp),
+                flingBehavior = rememberSoftFlingBehavior(),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 contentPadding = PaddingValues(bottom = 8.dp),
             ) {
@@ -2953,11 +3241,10 @@ private fun ArtistMetadataEditorOverlay(
                             label = "Nome do album",
                         )
                         Spacer(Modifier.height(8.dp))
-                        MetadataTextField(
+                        GenreTagField(
                             value = draft.genre,
                             onValueChange = { value -> drafts = drafts + (album.key to draft.copy(genre = value)) },
-                            label = "Genero",
-                            placeholder = availableGenres.take(4).joinToString(" / "),
+                            suggestions = availableGenres,
                         )
                     }
                 }
@@ -3030,21 +3317,156 @@ private fun MetadataTextField(
     )
 }
 
+// Campo de genero com tags multi-select + autocomplete - substitui o TextField livre de genero
+// nos editores de album/artista. Guarda o valor como string unica delimitada (ver
+// GENRE_TAG_SEPARATOR/splitGenreTags/joinGenreTags em GenreTags.kt) porque o campo real gravado
+// no ID3 do arquivo (FieldKey.GENRE, ver MusicLibraryRepository.writeTagsToAudioFile) e uma
+// string simples - nao precisou mudar tipo em nenhum lugar da cadeia de persistencia.
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GenreTagField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    suggestions: List<String>,
+    label: String = "Gênero",
+) {
+    var input by remember { mutableStateOf("") }
+    val tags = remember(value) { splitGenreTags(value) }
+
+    fun commitTag(raw: String) {
+        val trimmed = capitalizeGenreTag(raw.trim().trim(';', ',', '/'))
+        if (trimmed.isBlank() || tags.any { it.equals(trimmed, ignoreCase = true) }) {
+            input = ""
+            return
+        }
+        onValueChange(joinGenreTags(tags + trimmed))
+        input = ""
+    }
+
+    val filteredSuggestions = remember(input, suggestions, tags) {
+        if (input.isBlank()) {
+            emptyList()
+        } else {
+            suggestions.filter { suggestion ->
+                suggestion.contains(input, ignoreCase = true) &&
+                    tags.none { it.equals(suggestion, ignoreCase = true) }
+            }.take(6)
+        }
+    }
+
+    Column(Modifier.fillMaxWidth()) {
+        if (tags.isNotEmpty()) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+            ) {
+                tags.forEach { tag ->
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(PailerSurfaceHighest)
+                            .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            tag,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                        IconButton(
+                            onClick = { onValueChange(joinGenreTags(tags.filterNot { it.equals(tag, ignoreCase = true) })) },
+                            modifier = Modifier.size(22.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Remover tag $tag",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        TextField(
+            value = input,
+            onValueChange = { text ->
+                if (text.endsWith(";") || text.endsWith(",")) {
+                    commitTag(text.dropLast(1))
+                } else {
+                    input = text
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text(label) },
+            placeholder = { Text("Digite pra buscar ou criar uma tag", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { commitTag(input) }),
+            shape = RoundedCornerShape(8.dp),
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = PailerSurfaceHighest,
+                unfocusedContainerColor = PailerSurfaceHighest,
+                focusedTextColor = MaterialTheme.colorScheme.onBackground,
+                unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
+                cursorColor = MaterialTheme.colorScheme.primary,
+                focusedLabelColor = MaterialTheme.colorScheme.primary,
+                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+            ),
+        )
+        if (filteredSuggestions.isNotEmpty()) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                color = PailerSurfaceHighest,
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                Column {
+                    filteredSuggestions.forEach { suggestion ->
+                        Text(
+                            suggestion,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { commitTag(suggestion) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            color = MaterialTheme.colorScheme.onBackground,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun AlbumsScreen(
     albums: List<LocalAlbum>,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onDeleteAlbum: (LocalAlbum) -> Unit = {},
-    listState: LazyGridState = rememberLazyGridState(),
+    favoriteAlbumKeys: Set<String> = emptySet(),
+    scrollState: ScrollState = rememberScrollState(),
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
-        state = listState,
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+    // Mesmo bento de ArtistsScreen (ver BentoGrid) - pedido do usuario (04/09/2026): favoritar
+    // um album tambem deve dar capa maior, igual ja acontecia so pra artista.
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
+            .padding(horizontal = 18.dp, vertical = 12.dp),
     ) {
-        gridItems(albums, key = { it.key }) { album ->
+        BentoGrid(
+            items = albums,
+            isFavorite = { it.key in favoriteAlbumKeys },
+        ) { album ->
             AlbumGridCard(
                 album = album,
                 onClick = { onOpenAlbum(album) },
@@ -3081,6 +3503,7 @@ private fun AlbumDetailScreen(
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
+            flingBehavior = rememberSoftFlingBehavior(),
             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -3323,11 +3746,10 @@ private fun AlbumMetadataEditorOverlay(
                 }
                 MetadataTextField(value = title, onValueChange = { title = it }, label = "Nome do album")
                 MetadataTextField(value = artist, onValueChange = { artist = it }, label = "Nome do artista")
-                MetadataTextField(
+                GenreTagField(
                     value = genre,
                     onValueChange = { genre = it },
-                    label = "Genero",
-                    placeholder = availableGenres.take(4).joinToString(" / "),
+                    suggestions = availableGenres,
                 )
                 OutlinedButton(onClick = onFixArtwork, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Filled.Image, contentDescription = null)
@@ -3440,6 +3862,7 @@ private fun SongsScreen(
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
         state = listState,
+        flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(18.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -3469,6 +3892,7 @@ private fun PlaylistsScreen(
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
         state = listState,
+        flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(18.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -3502,6 +3926,9 @@ private fun RadioDetailScreen(
     radio: LocalRadio,
     player: PlayerUiState,
     sessionSongs: List<LocalSong>,
+    // Mesmo default de RadioBulletinSettings.songsBetweenBulletins (RadioBulletin.kt) - so usado
+    // se algum chamador nao passar o valor real das configuracoes de boletim.
+    songsBetweenBulletins: Int = 3,
     isGenerating: Boolean,
     onBack: () -> Unit,
     onEnterRadio: () -> Unit,
@@ -3512,14 +3939,26 @@ private fun RadioDetailScreen(
     albums: List<LocalAlbum> = emptyList(),
     onAddArtist: (LocalArtist) -> Unit = {},
     onAddAlbum: (LocalAlbum) -> Unit = {},
+    extraArtists: List<LocalArtist> = emptyList(),
+    extraAlbums: List<LocalAlbum> = emptyList(),
+    onRemoveArtist: (LocalArtist) -> Unit = {},
+    onRemoveAlbum: (LocalAlbum) -> Unit = {},
+    onRenameRadio: (String) -> Unit = {},
     listState: LazyListState = rememberLazyListState(),
 ) {
     var showDeleteConfirm by rememberSaveable(radio.customId) { mutableStateOf(false) }
     // So radio personalizada (isCustom) tem definicao persistida pra estender com mais
     // artista/album - ver MusicLibraryRepository.addSourceToCustomRadio.
     var showAddSource by rememberSaveable(radio.customId) { mutableStateOf(false) }
+    var showManageSources by rememberSaveable(radio.customId) { mutableStateOf(false) }
+    var showRenameDialog by rememberSaveable(radio.customId) { mutableStateOf(false) }
+    // Radio criada de categoria (customId "genre:...") tambem e isCustom - so nao pode renomear,
+    // ver MusicLibraryRepository.renameCustomRadio.
+    val canRename = radio.isCustom && radio.customId?.startsWith("genre:") != true
+    val canManageSources = radio.isCustom && (extraArtists.isNotEmpty() || extraAlbums.isNotEmpty())
     LazyColumn(
         state = listState,
+        flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -3560,6 +3999,36 @@ private fun RadioDetailScreen(
                             Icon(
                                 Icons.Filled.Add,
                                 contentDescription = "Adicionar artista ou álbum a esta rádio",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
+                    }
+                    if (canManageSources) {
+                        IconButton(
+                            onClick = { showManageSources = true },
+                            modifier = Modifier
+                                .size(52.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(PailerGunmetal.copy(alpha = 0.5f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Remove,
+                                contentDescription = "Remover artista ou álbum desta rádio",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
+                    }
+                    if (canRename) {
+                        IconButton(
+                            onClick = { showRenameDialog = true },
+                            modifier = Modifier
+                                .size(52.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(PailerGunmetal.copy(alpha = 0.5f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "Renomear rádio",
                                 tint = MaterialTheme.colorScheme.onBackground,
                             )
                         }
@@ -3643,6 +4112,36 @@ private fun RadioDetailScreen(
                                     )
                                 }
                             }
+                            if (canManageSources) {
+                                IconButton(
+                                    onClick = { showManageSources = true },
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Remove,
+                                        contentDescription = "Remover artista ou álbum desta rádio",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            }
+                            if (canRename) {
+                                IconButton(
+                                    onClick = { showRenameDialog = true },
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Edit,
+                                        contentDescription = "Renomear rádio",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            }
                             IconButton(
                                 onClick = { showDeleteConfirm = true },
                                 modifier = Modifier
@@ -3665,13 +4164,29 @@ private fun RadioDetailScreen(
             item {
                 SectionTitle("Sequencia ao vivo")
             }
-            items(sessionSongs, key = { it.id }) { song ->
-                val index = sessionSongs.indexOf(song)
-                RadioTrackRow(
-                    index = index + 1,
-                    song = song,
-                    onClick = { onPlaySong(index) },
-                )
+            // Boletim nunca vira item de fila de verdade no ExoPlayer (toca por cima via
+            // announcementPlayer, ver LocalTuneViewModel) - o indice de sessionSongs bate direto
+            // com player.currentMediaItemIndex/queueIndex. Card "Noticia" aqui e so uma marcacao
+            // visual de ONDE o boletim entra (a cada `interval` musicas, mesmo calculo de
+            // completedRadioSongs/songsBetweenBulletins no ViewModel), pedido do usuario
+            // (04/09/2026) pra visualizar tocando/ja tocada/proximo boletim sem abrir o player.
+            val interval = songsBetweenBulletins.coerceAtLeast(1)
+            sessionSongs.forEachIndexed { index, song ->
+                val position = index + 1
+                item(key = song.id) {
+                    RadioTrackRow(
+                        index = position,
+                        song = song,
+                        isPlaying = isInSession && position == player.queueIndex,
+                        isPlayed = isInSession && position < player.queueIndex,
+                        onClick = { onPlaySong(index) },
+                    )
+                }
+                if (position % interval == 0) {
+                    item(key = "news_break_$position") {
+                        RadioNewsBreakCard()
+                    }
+                }
             }
         } else {
             item {
@@ -3712,6 +4227,27 @@ private fun RadioDetailScreen(
             onDismiss = { showAddSource = false },
         )
     }
+
+    if (showManageSources) {
+        ManageRadioSourcesDialog(
+            extraArtists = extraArtists,
+            extraAlbums = extraAlbums,
+            onRemoveArtist = onRemoveArtist,
+            onRemoveAlbum = onRemoveAlbum,
+            onDismiss = { showManageSources = false },
+        )
+    }
+
+    if (showRenameDialog) {
+        RenameRadioDialog(
+            currentName = radio.name,
+            onConfirm = { newName ->
+                showRenameDialog = false
+                onRenameRadio(newName)
+            },
+            onDismiss = { showRenameDialog = false },
+        )
+    }
 }
 
 @Composable
@@ -3744,34 +4280,60 @@ private fun LiveRadioBadge(isActive: Boolean) {
 }
 
 @Composable
-private fun RadioTrackRow(index: Int, song: LocalSong, onClick: () -> Unit) {
+private fun RadioTrackRow(
+    index: Int,
+    song: LocalSong,
+    onClick: () -> Unit,
+    isPlaying: Boolean = false,
+    isPlayed: Boolean = false,
+) {
+    // Contraste em 3 niveis pedido pelo usuario (04/09/2026): tocando agora em destaque, ja
+    // tocada apagada/cinza, proxima no tom normal - mesmo padrao visual de AlbumTrackRow
+    // (icone GraphicEq + cor primaria quando toca), so com o estado "ja tocada" novo aqui.
+    val contentAlpha = if (isPlayed) 0.5f else 1f
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
+            .then(
+                if (isPlaying) {
+                    Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
+                } else {
+                    Modifier
+                }
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            index.toString(),
-            modifier = Modifier.width(30.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
+        if (isPlaying) {
+            Icon(
+                Icons.Filled.GraphicEq,
+                contentDescription = "Tocando agora",
+                modifier = Modifier.width(30.dp).size(18.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        } else {
+            Text(
+                index.toString(),
+                modifier = Modifier.width(30.dp).alpha(contentAlpha),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         ArtworkBox(
             uri = song.artworkUri,
             embeddedSourceUri = song.contentUri,
-            modifier = Modifier.size(48.dp),
+            modifier = Modifier.size(48.dp).alpha(contentAlpha),
         )
         Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
+        Column(Modifier.weight(1f).alpha(contentAlpha)) {
             Text(
                 song.title,
-                color = MaterialTheme.colorScheme.onBackground,
+                color = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                fontWeight = FontWeight.Normal,
+                fontWeight = if (isPlaying) FontWeight.SemiBold else FontWeight.Normal,
             )
             Text(
                 song.artist,
@@ -3781,6 +4343,43 @@ private fun RadioTrackRow(index: Int, song: LocalSong, onClick: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        Text(
+            formatDuration(song.durationMs),
+            modifier = Modifier.alpha(contentAlpha),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
+}
+
+// Marca visual de onde o boletim entra na "Sequencia ao vivo" (a cada `songsBetweenBulletins`
+// musicas, ver RadioDetailScreen) - pedido do usuario (04/09/2026): "3 musicas, um card de
+// noticia, 3 musicas, um card de noticia" pra demarcar os intervalos sem precisar abrir o
+// player. Nao e clicavel (o boletim so toca no momento certo pela radio ao vivo de verdade).
+@Composable
+private fun RadioNewsBreakCard() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(PailerSurfaceHigh)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Filled.Campaign,
+            contentDescription = null,
+            modifier = Modifier.size(16.dp),
+            tint = PailerRed,
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "Notícia",
+            color = PailerRed,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
     }
 }
 
@@ -4152,7 +4751,10 @@ private fun AddSourceToRadioDialog(
                     placeholder = if (showAlbums) "Nome do álbum ou artista" else "Nome do artista",
                 )
                 Spacer(Modifier.height(8.dp))
-                LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 360.dp),
+                    flingBehavior = rememberSoftFlingBehavior(),
+                ) {
                     if (!showAlbums) {
                         items(filteredArtists, key = { it.key }) { artist ->
                             RowItem(
@@ -4201,6 +4803,118 @@ private fun AddSourceToRadioDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("Fechar")
+            }
+        },
+    )
+}
+
+// Lista de artistas/albuns adicionados depois (botao "-" em RadioDetailScreen) com botao de
+// remover em cada linha - so mostra fontes extras (ver MusicLibraryRepository.removeSourceFromCustomRadio),
+// a fonte original que criou a radio nao aparece aqui porque nao pode ser removida.
+@Composable
+private fun ManageRadioSourcesDialog(
+    extraArtists: List<LocalArtist>,
+    extraAlbums: List<LocalAlbum>,
+    onRemoveArtist: (LocalArtist) -> Unit,
+    onRemoveAlbum: (LocalAlbum) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.Remove, contentDescription = null) },
+        title = { Text("Remover da rádio") },
+        text = {
+            if (extraArtists.isEmpty() && extraAlbums.isEmpty()) {
+                Text(
+                    "Nada pra remover.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 360.dp),
+                    flingBehavior = rememberSoftFlingBehavior(),
+                ) {
+                    items(extraArtists, key = { "artist:${it.key}" }) { artist ->
+                        RowItem(
+                            title = artist.name,
+                            subtitle = "${artist.albumCount} álbuns · ${artist.songs.size} faixas",
+                            icon = {
+                                ArtworkBox(
+                                    artist.songs.firstOrNull { it.artworkUri != null }?.artworkUri,
+                                    Modifier.size(48.dp),
+                                )
+                            },
+                            onClick = { onRemoveArtist(artist) },
+                            trailing = {
+                                IconButton(onClick = { onRemoveArtist(artist) }) {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = "Remover ${artist.name} desta rádio",
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            },
+                        )
+                    }
+                    items(extraAlbums, key = { "album:${it.id}" }) { album ->
+                        RowItem(
+                            title = album.title,
+                            subtitle = "${album.artist} · ${album.songs.size} faixas",
+                            icon = { ArtworkBox(album.artworkUri, Modifier.size(48.dp)) },
+                            onClick = { onRemoveAlbum(album) },
+                            trailing = {
+                                IconButton(onClick = { onRemoveAlbum(album) }) {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = "Remover ${album.title} desta rádio",
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Fechar")
+            }
+        },
+    )
+}
+
+// Diálogo simples de renomear rádio personalizada - so aparece pra radio de album/artista, nao
+// de categoria (ver RadioDetailScreen.canRename / MusicLibraryRepository.renameCustomRadio).
+@Composable
+private fun RenameRadioDialog(
+    currentName: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by rememberSaveable(currentName) { mutableStateOf(currentName) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+        title = { Text("Renomear rádio") },
+        text = {
+            MetadataTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = "Nome da rádio",
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(name) },
+                enabled = name.isNotBlank(),
+            ) {
+                Text("Salvar")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancelar")
             }
         },
     )
@@ -4663,7 +5377,7 @@ private fun FullPlayer(
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .windowInsetsPadding(WindowInsets.navigationBars)
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
                 .padding(22.dp),
         ) {
             Row(

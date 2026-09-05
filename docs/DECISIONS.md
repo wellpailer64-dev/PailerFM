@@ -109,6 +109,27 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   pro redator. Avaliar mover `LocalLlamaTextGenerator`/`OptionalLocalLlmRadioScriptWriter`
   pro processo `:radio_voice` (ou um processo próprio) antes de confiar no redator local
   como algo mais que "enhancement opcional que não pode derrubar a rádio".
+- **Atualização (02/09/2026, reflexão do Nico deixou de ser banco fixo):** usuário reportou
+  que a reflexão existencialista/absurdista do Nico (`NICO_REFLECTIONS_LIGHT`/`_DEEP` em
+  `RadioBulletin.kt`, ~5 frases cada) soava repetitiva/genérica - "queria algo efêmero, um
+  comentário com conhecimento baseado nessa filosofia, e não frases prontas". Como o banco
+  fixo é sempre uma lista curta sorteada, não tem como ficar "efêmero" sem gerar de
+  verdade - só o redator local (LLM) consegue isso. `buildPrompt()` agora pede **5 falas**
+  em vez de 4: a 5ª (Male/Nico) é o comentário existencialista/absurdista, gerado em cima
+  da matéria específica (Camus/Sartre/Nietzsche/Kafka/Beckett/Cioran como inspiração, nome
+  do pensador só se a atribuição for certa) - exemplo few-shot atualizado com uma 5ª linha
+  pro estilo esperado (mesma lição do ADR anterior: modelo pequeno precisa de exemplo
+  concreto). `withPhilosophicalCloser()` usa essa 5ª fala como reflexão quando
+  `source == LocalLlm` e ela existe; só cai pro banco fixo quando o roteiro veio do
+  fallback determinístico ou o LLM não emplacou a 5ª fala dessa vez - o banco fixo continua
+  existindo só como rede de segurança, nunca mais como caminho principal quando o redator
+  local está instalado e funcionando.
+  - **Ainda não testado em campo** (só compilado) - falta confirmar se o Qwen3 1.7B segue
+    bem a instrução da 5ª fala na prática, e se o prompt maior (mais uma linha de exemplo +
+    mais instrução) precisa de mais tempo/tokens do que os timeouts atuais permitem.
+  - Isso só tem efeito com o pacote do redator local instalado (`filesDir/radio_writer/
+    model.ready`) - sem ele, a rádio continua no fallback determinístico e a reflexão
+    continua vindo do banco fixo, sem solução "efêmera" possível sem LLM.
 
 ## ADR-003 — Engine TTS criado por request (sem cache persistente entre boletins)
 
@@ -570,3 +591,451 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   no call site. Se o custo de recomputar `radiosFrom()` virar um problema real de
   performance percebida, mover o `Toast` pra fora da função (callback separado) antes de
   mexer no threading, não o contrário.
+
+## ADR-018 — Motor de voz único: Supertonic 3 (Piper e Kokoro removidos)
+
+- **Contexto:** usuário pediu pra testar alternativas mais realistas de voz (VITS
+  genérico via sherpa-onnx, Supertonic, OmniVoice, Pocket TTS) além do Piper/Kokoro já
+  documentados (ADR-013/014/015). Testado fora do app, em Python (`sherpa-onnx` PyPI,
+  mesma versão `1.13.6` do `.aar` vendido em `app/libs/`), com o mesmo texto acentuado
+  usado nos testes anteriores e comparações de dupla (homem+mulher conversando).
+- **Candidatos testados e rejeitados:**
+  - `vits-coqui-pt-cv` (Common Voice pt-BR, single-speaker): qualidade rejeitada de
+    ouvido ("terrível") antes mesmo de chegar a testar profundamente.
+  - OmniVoice (k2-fsa, zero-shot, 600+ idiomas): descartado sem nem baixar - não tem
+    export oficial pro sherpa-onnx/Android (issue aberta e sem resposta no repo oficial),
+    roda em PyTorch+GPU, sem variante CPU/mobile.
+  - Pocket TTS Portuguese 24L (Kyutai, `pip install pocket-tts`): testado de verdade
+    (biblioteca oficial, voz `rafael`). Mais lento que tempo real neste PC (RTF≈1,46,
+    contra ≈0,28 do Supertonic) rodando em PyTorch com só 2 threads - sinal ruim pro
+    aparelho. E o bundle `portuguese_24l` da Kyutai usa formato de arquivo diferente do
+    único pacote Pocket TTS que o sherpa-onnx publica oficialmente (inglês, formato
+    antigo) - não dá pra simplesmente declarar no manifest, precisaria de motor novo.
+- **Decisão:** adotar **Supertonic 3 int8** (`sherpa-onnx-supertonic-3-tts-int8-2026-05-11`,
+  release oficial do k2-fsa/sherpa-onnx, ~145 MB) como **único** motor de voz do app.
+  Piper (`vits`/`vits-dual`/`piper`/`piper-dual`) e Kokoro (`kokoro`) removidos de
+  `RadioVoicePackageRepository.kt` e `LocalRadioVoiceEngine.kt` - inclusive o modo
+  `mixed` (ADR-015) e o hack de `ç→ss`/siglas do espeak-ng (`speakable()`), que eram
+  específicos do fonemizador do Piper e não fazem sentido pro Supertonic (que já lê "ç"
+  nativamente sem tratamento). `RadioVoicePackageConfig` perdeu `engine`/`vits`/`kokoro`/
+  slots "mixed" - agora é sempre um `SupertonicConfig` só, com `femaleSpeakerId`/
+  `maleSpeakerId` selecionando o `sid` (0-9) do mesmo `voice.bin`.
+  - Locutores: **Fran** (antes "Frankie", trocou de gênero) = voz `F2` (sid 1, "alegre,
+    jovem"); **Nico** = voz `M1` (sid 5, "animado, confiante"). Escolhidos numa
+    comparação as cegas com 4 duplas (M2+F2, M5+F3, M3+F4, M1+F5) - o usuário pediu essa
+    combinação especificamente depois de ouvir a dupla 4 (M1+F5) e gostar mais do M1 com
+    o F2 do que com o F5.
+  - Mapa `sid`→voz confirmado batendo pitch médio dos áudios de teste contra a ordem
+    alfabética de montagem do `voice.bin` (script `generate_voices_bin.py` do próprio
+    sherpa-onnx): `F1..F5 = sid 0..4`, `M1..M5 = sid 5..9`.
+  - `speed` do manifest não é mais herdado do valor do Piper (`0,78`) - Supertonic
+    recomenda oficialmente `0,9-1,5`; pacote atual usa `1,0`. `numSteps` (qualidade x
+    velocidade do denoising, default oficial 5) subiu pra `10` no manifest.
+  - Pacote fonte: `voice-models/supertonic-3-int8/` (modelo + `manifest.json`, é
+    literalmente a raiz do zip); importável: `voice-models/Pailer-Radio-Voices-
+    Supertonic3-Fran-Nico.zip` (~124 MB). Scripts de teste em
+    `voice-models/supertonic-3-int8-scripts/`.
+- **Bug sério achado durante a limpeza:** o código do Supertonic existia desde antes
+  (`SupertonicConfig`, branch em `loadEngine`) mas **nunca setava `lang`/`numSteps`** na
+  chamada real (`GenerationConfig` só tinha `speed`/`sid`/`silenceScale`) - `extra["lang"]`
+  ausente cai no default `"en"` do C++ (`offline-tts-supertonic-impl.cc`), então a
+  primeira vez que esse motor rodasse de verdade teria sintetizado em modo inglês pra
+  texto em português, sem nenhum erro visível. Corrigido junto com a limpeza:
+  `GenerationConfig(numSteps = config.numSteps, extra = mapOf("lang" to config.lang))`.
+- **Limpeza de disco:** removidos ~2,7 GB de artefatos Piper/Kokoro do workspace
+  (`voice-models/kokoro/` sozinho era 1,6 GB) - tudo reconstruível a partir de fontes
+  públicas (receita de quantização do Kokoro já documentada no histórico deste arquivo,
+  ADR-013), então apagado direto em vez de arquivado.
+- **Pendências conhecidas, não resolvidas nesta ADR:**
+  1. **Hiato/acentuação:** Supertonic é *character-level* (sem fonemizador/regras por
+     idioma - só NFKD, ver `offline-tts-supertonic-unicode-processor.cc`), então não tem
+     parâmetro que force acentuação. A palavra "tardio" saiu sem separar o hiato
+     (tar-diô em vez de tar-DI-o); forçar a grafia pra "tardío" no texto corrigiu.
+     Enquanto não há uma lista de palavras problemáticas, isso é responsabilidade de
+     quem escreve o texto do boletim (`RadioBulletin.kt`/`FallbackRadioScriptWriter`),
+     não do motor - vale revisar se aparecerem outras palavras de hiato mal pronunciadas.
+  2. **Fragmentos curtos instáveis:** sentenças isoladas com ≤4 palavras (ex.: "Viu?",
+     "Bora pra próxima notícia.") saem atropeladas/distorcidas quando sintetizadas
+     sozinhas - o motor precisa de contexto textual mínimo pra estabilizar a duração.
+     `LocalRadioVoiceEngine.kt` **ainda faz uma chamada só por linha do script**, sem
+     quebrar em sentenças nem aplicar essa regra de merge - só foi validado em Python
+     (`voice-models/supertonic-3-int8-scripts/run_test_supertonic_m1f2_v3.py`). Se o
+     roteirista (`FallbackRadioScriptWriter`/redator local) gerar falas muito curtas,
+     replicar essa lógica de split+merge+pausa no motor antes de considerar resolvido.
+  3. **Música de fundo:** testada e aprovada fora do app (ffmpeg, `-25dB`, fade in/out,
+     bed `vinhetas/ES_Monday Moonwalk - Guustavv.mp3`) mas **ainda não implementada**
+     no pipeline real - plano é misturar em `LocalRadioVoiceEngine.synthesize()` antes do
+     `writeWav()`, com um bed pré-convertido pra WAV no sample rate do motor (evita
+     decodificar MP3 em runtime).
+
+## ADR-019 — Passagens entre música e boletim, modo do boletim fixo, buffer de 3 boletins
+
+- **Contexto:** três pedidos do usuário na mesma sessão, todos sobre deixar o pipeline do
+  boletim mais robusto/redondo depois da troca pro Supertonic (ADR-018): (1) uma
+  transição curta em volta do boletim em vez de corte seco música→voz→música; (2) tirar
+  a escolha de "modo" do boletim, já que sempre vai ser bate-bola; (3) manter um buffer
+  de boletins prontos em vez de preparar só 1 com 1 música de antecedência.
+- **Decisão — passagens:** `passagem.mp3`/`passagem 2.mp3` (soltos por vídeo o usuário em
+  `vinhetas/`) viraram `res/raw/passagem_1.mp3`/`passagem_2.mp3`. `LocalTuneViewModel.
+  playPassagem()` alterna entre as duas (`nextPassagemIndex`, incrementa a cada uso, não
+  reseta) e reaproveita `playVinhetaResource()` (mesmo `MediaPlayer.create` de recurso,
+  sem gap). Entra em dois pontos: início de `speakNextNewsBreak()` (envolve os dois
+  caminhos - áudio do buffer e fallback TTS Android, porque entra antes da bifurcação) e
+  início de `finishNewsBreak()`.
+  - **Cuidado de robustez:** `finishNewsBreak()` só zerava `speakingNews` de imediato; como
+    agora ela dispara a passagem final antes de liberar a música, isso desarmava o
+    watchdog (ADR-009) bem na janela em que a passagem podia travar. Adicionada guarda de
+    reentrância (`newsBreakEnding`) e `speakingNews` só vira `false` depois da passagem
+    tocar - o watchdog continua cobrindo essa janela.
+- **Decisão — modo fixo:** removida a seção "Modo" (Desativado/Só manchetes/Conversa dos
+  locutores) da tela "Boletins da rádio" e `setRadioBulletinMode()`.
+  `loadRadioBulletinUiState()` agora **ignora** qualquer valor salvo em
+  `KEY_RADIO_BULLETIN_MODE` e força sempre `RadioBulletinMode.Dialogue` - inclusive pra
+  quem já tinha "Desativado" salvo de uma sessão anterior, sem precisar de UI pra
+  corrigir. O enum `RadioBulletinMode` continua existindo (`Off`/`Headlines` viram código
+  morto, não removido agora) porque `RadioBulletinRepository.loadScripts()` ainda faz
+  `when` sobre ele.
+- **Decisão — buffer de 3:** trocado `preparedBulletinScript`/`preparedBulletinFile`/
+  `preparedBulletinIndex` (slot único, só 1 boletim preparado com 1 música de
+  antecedência) por `bulletinBuffer: ArrayDeque<PreparedBulletin>` (`script` + `file?`),
+  mantido em `BULLETIN_BUFFER_TARGET = 3` via `refillBulletinBuffer()`:
+  1. Prepara **um de cada vez** (nunca dois engines de voz carregados juntos, mesma
+     cautela de TTS.md/ADR-003), em loop dentro de uma única coroutine até encher.
+  2. Disparada em três pontos: fim da carga inicial de `newsBulletins` em
+     `startRadioNewsMode()`, logo após consumir um item em `speakNextNewsBreak()` (repõe
+     assim que gasta), e depois de `reloadNewsBulletinsIfNeeded()` recuperar feeds que
+     tinham falhado. O antigo gatilho "1 música antes do boletim" (`onMediaItemTransition`,
+     checkpoint `interval - 1`) foi removido - o buffer fica cheio continuamente em vez de
+     just-in-time.
+  3. **Previsão de contexto (intro "você acaba de ouvir" / fechamento "próxima música")
+     pra itens 2 e 3 do buffer:** como esses boletins são preparados bem antes de saber de
+     verdade qual música vai tocar quando chegarem a vez, `refillBulletinBuffer()` calcula
+     `songsUntilFire` (quantas músicas faltam até esse item específico do buffer disparar,
+     a partir de `completedRadioSongs % songsBetweenBulletins` + posição no buffer) e
+     espia a fila fixa da sessão (`player.getMediaItemAt(currentMediaItemIndex +
+     songsUntilFire - 1)` pro "último tocado", `+ songsUntilFire` pro "próximo") -
+     extensão do mesmo truque de 1-música-de-antecedência que `prepareUpcomingBulletin()`
+     já fazia (ADR anterior), só que agora precisa alcançar 2-3 músicas à frente.
+  4. **Risco aceito:** se o usuário pular música manualmente entre o preparo e a hora de
+     tocar, a previsão fica desatualizada e a Fran pode citar o artista errado na chamada
+     de música - degrada pra frase genérica sem citar artista quando o índice previsto cai
+     fora da fila (`buildFranCloser`), nunca quebra o boletim. Não verificado contra a
+     faixa real no momento de tocar (manteria a mesma tolerância a risco que o sistema de
+     1-música-de-antecedência já tinha).
+  5. **Buffer vazio (sessão recém-começada, feed ainda carregando, ou consumo mais rápido
+     que o preparo):** `speakNextNewsBreak()` cai pro mesmo comportamento de emergência de
+     antes - monta o boletim ao vivo direto do `baseBulletin` (sem `enhanceScript`/redator
+     local, lento demais pra essa hora), só com `withLastPlayedIntro`/
+     `withPhilosophicalCloser` usando o contexto real de agora (sem previsão, sem risco).
+- **Não mudar sem:** ler `refillBulletinBuffer()` inteira antes de mexer no timing de
+  boletim - a previsão de índice de fila (item 3 acima) é a parte mais frágil, fácil de
+  quebrar com off-by-one se `songsBetweenBulletins` ou a lógica de `completedRadioSongs`
+  mudar de forma. Ainda não testado num aparelho real com sessão longa (várias trocas de
+  música) - só compilado e revisado.
+- **Atualização (02/09/2026, buffer não reagia à chavinha da voz local):** confirmado em
+  teste real - usuário ligou a voz local no meio de uma rádio já tocando e os 3 boletins
+  seguintes continuaram saindo com a voz do Android. Causa: `setRadioVoiceEnabled()` só
+  atualizava a preferência salva; `refillBulletinBuffer()` só reconsulta
+  `radioVoiceState.value.isEnabled` quando prepara um item **novo**, então os 3 itens já
+  prontos no buffer (preparados com o valor antigo) ficavam intocados até serem consumidos
+  um a um. Corrigido chamando `clearBulletinBuffer()` + `refillBulletinBuffer()` direto em
+  `setRadioVoiceEnabled()` - qualquer mudança na chavinha descarta o buffer e prepara tudo
+  de novo do zero com o valor atual, então o próximo boletim (não o 4º) já reflete a troca.
+- **Atualização (02/09/2026, ajuste de performance + música de fundo implementada):**
+  medido em campo (Motorola Edge 40): `numThreads=2` → 410s pra sintetizar um boletim de
+  6 falas; subir pra `numThreads=4` **piorou** pra 496s, com variância enorme entre falas
+  (42-144s cada) - sinal de throttling térmico, não falta de paralelismo (RAM não é
+  gargalo: app usa ~1,44GB PSS num aparelho com ~4GB livres). Ajustado pra `numThreads=3`
+  e `numSteps` de 10 pra **5** (default do próprio Supertonic) como meio-termo
+  velocidade/qualidade - ainda sem medição de campo desses dois juntos.
+  - **Música de fundo (ADR-018, pendência 3) implementada de verdade**: pacote de voz
+    ganhou campo opcional `backgroundMusic` (PCM16 mono **sem cabeçalho WAV**, no mesmo
+    sample rate do motor - hoje 44100Hz, sem reamostragem) + `backgroundMusicVolume`
+    (linear, 0,05623 ≈ -25dB). `LocalRadioVoiceEngine.mixBackgroundMusic()` soma o bed por
+    cima da voz já sintetizada (fade in 1,5s / fade out 3s, repete em loop se o boletim for
+    mais longo que o bed) antes de escrever o WAV final. Sem `backgroundMusic` no
+    manifest, comportamento idêntico a antes (nenhum custo). `backgroundMusic` é uma
+    **lista** (aceita string única por compatibilidade) - com mais de um arquivo, um é
+    sorteado por boletim via índice num companion object (`nextBackgroundMusicIndex`,
+    sobrevive entre requests dentro do mesmo processo `:radio_voice`). Beds atuais:
+    `voice-models/supertonic-3-int8/bed1.pcm` (`ES_Save It for a Rainy Day - Margareta`)
+    e `bed2.pcm` (`ES_Devil Disguised - Torii Wolf`), convertidos via
+    `ffmpeg -ar 44100 -ac 1 -f s16le` - o bed original (`Monday Moonwalk`) foi trocado
+    pelo usuário por esses dois.
+  - **Teste de boletim (`testRadioBulletin()`) não tinha passagem nem música**: passagem
+    porque só existia em `speakNextNewsBreak()`/`finishNewsBreak()` (fluxo da rádio ao
+    vivo), nunca no botão de teste - corrigido com `playTestAudioWithPassagem()`
+    (envolve `playPassagem()` antes/depois, igual o boletim real). Música de fundo
+    simplesmente não existia ainda em lugar nenhum - resolvido pela implementação acima,
+    que vale pros dois caminhos (rádio ao vivo e teste) porque mora dentro do
+    `LocalRadioVoiceEngine.synthesize()` compartilhado.
+- **Atualização (02/09/2026, timeout do teste de boletim + progresso ao vivo):** usuário
+  reportou que o teste de boletim (`testRadioBulletin()`) às vezes esbarrava no timeout
+  antigo de 90s, e depois que 180s **também não bastou** pra uma notícia real (RSS +
+  redator local + síntese de todas as falas) - `LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS`
+  subiu pra **300s**. Esse teste roda isolado (não usa `armAnnouncementWatchdog`), então
+  não interage com o timeout de 90s do watchdog geral da rádio ao vivo
+  (`ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS`), que continua o mesmo - a folga aqui é de graça.
+  Junto, pedido do usuário de mostrar progresso real durante o teste ("pra eu saber que
+  não travou"): `loadLiveTestScript`/`enhanceScript` (`RadioBulletin.kt`) e
+  `requestLocalVoiceSynthesis` (`LocalTuneViewModel.kt`) ganharam um parâmetro
+  `onProgress: (String) -> Unit`, e `RadioVoiceSynthesisService` ganhou um novo código de
+  resultado `RESULT_PROGRESS` (nunca resolve a coroutine que espera o resultado final, só
+  `RESULT_OK`/`RESULT_FAILED` fazem isso) enviado uma vez por fala sintetizada -
+  `LocalRadioVoiceEngine.synthesize()` agora aceita um callback `onLineDone(index, total)`
+  pra isso. `testRadioBulletin()` liga tudo: "Buscando notícia" → "Escrevendo com o
+  redator local..." (só se instalado) → "Sintetizando vozes: fala N de M..." Mensagens
+  reais, não simuladas - nenhuma etapa fake só pra parecer progresso.
+- **Atualização (02-03/09/2026, ajuste fino de numSteps + fragmentos curtos corrigidos em
+  produção):** depois de confirmar em campo que `numSteps=5`/`numThreads=3` reduziu bem
+  o tempo de síntese, `numSteps` subiu pra **6** (ainda bem abaixo do 10 original, sobra
+  de margem pra um pouco mais de qualidade sem voltar ao custo de antes).
+  - **Pendência 2 da ADR-018 corrigida em produção**: `LocalRadioVoiceEngine.synthesize()`
+    agora quebra cada fala em sentenças (`splitIntoSentences`), funde de volta as com
+    ≤4 palavras na vizinha (`mergeShortSentences`, mesmo algoritmo validado em Python -
+    `run_test_supertonic_m1f2_v3.py`) e sintetiza cada sentença separada com uma pausa
+    pequena (`INTRA_LINE_GAP_S=0,15s`) entre elas - a pausa maior entre falas de
+    personagens diferentes continua vindo do gap de 0,18s já existente. Faz por fala
+    (`synthesizeLine()`), então o resto do pipeline (progresso por fala, gap entre
+    personagens) não mudou.
+  - **Verificação da qualidade do redator local**: rodado um teste real em campo pra
+    conferir pontuação/acentuação. O texto que o Qwen3 gerou saiu correto onde chegou a
+    gerar (acentos e pontuação certos, ex.: "...uma embarcação que, segundo o governo
+    americano, era usada como estação de abastecimento..."), mas **esse teste específico
+    falhou estruturalmente**: o modelo devolveu só 1 objeto JSON solto (sem colchetes de
+    array), `parseGeneratedLines` não conseguiu reconstruir o array e caiu no
+    `JSONException` → fallback determinístico, exatamente como o design já previa (ver
+    ADR-002, "variância normal do modelo... não é bug"). Não é uma regressão introduzida
+    pela 5ª fala (reflexão) - já era um comportamento conhecido, só não tinha sido pego
+    num teste ao vivo com log até agora.
+
+## ADR-020 — Diagnóstico de desempenho do redator local (Qwen3 4B) + persistência do buffer + limpeza de threads
+
+- **Contexto:** depois da troca de motor do redator local pro Qwen3 4B (2,4x mais
+  parâmetros que o 1.7B, ADR-002), o usuário reportou geração muito lenta e um teste real
+  que falhou, mesmo depois de subir `threads` de 2 pra 5 no manifest do pacote. Pediu
+  acompanhamento em tempo real (logs no celular) pra diagnosticar. Sessão inteira (dia
+  03/09/2026, ~5h) girou em torno disso, com vários achados encadeados.
+- **Instrumentação adicionada primeiro** (pré-requisito pra qualquer diagnóstico real):
+  `pailer_llama_jni.cpp` passou a logar `perf:` por fase - tempo de carga do modelo,
+  tokens do prompt, prefill (tempo+tok/s), progresso do decode a cada token (tokens
+  gerados/teto, tok/s, trecho do texto parcial a cada 3s) e motivo de parada
+  (`json_closed`/`eog`/`timeout`/`decode_error`/`predict_cap`). Callback `LlamaProgressListener`
+  (antes `fun interface` só com `onProgress(current,max)`, virou interface com
+  `onPhase(phase,elapsedMs)` + `onProgress(current,max,elapsedMs)`) leva isso pra Kotlin,
+  que agora expõe fase real ("Lendo a matéria...", "Escrevendo... NN% (Xs)") no
+  `RadioBulletinBufferStatusCard`, substituindo a mensagem estática de antes.
+- **Achado 1 — teto de threads mudo:** `pailer_llama_jni.cpp` travava threads em
+  `min(threads, 4)` **sem log nenhum avisando** - o `threads=5` do manifest nunca teve
+  efeito real no decode. Corrigido pra acompanhar o range liberado no Kotlin
+  (`RadioWriterPackageRepository.coerceIn(1,8)`), com log `threads pedidos=X usados=Y`
+  pra nunca mais isso passar despercebido.
+- **Achado 2 — teto de tokens mudo:** mesmo padrão, `predict` travava em `min(max_tokens,
+  260)` mesmo com o manifest pedindo até 420 (depois 380) - risco de truncar o roteiro
+  antes do JSON fechar. Corrigido pra `min(max_tokens, 420)`.
+- **Achado 3 — causa raiz real da lentidão era concorrência, não threads:** o botão
+  antigo "Testar notícia real" (`testRadioBulletin()`/`loadLiveTestScript()`) chamava o
+  redator local **sem passar pelo `llmGenerationMutex`** que já serializa o preparo de
+  fundo (Nível 1 `prewarmCoreBuffer`/Nível 2 `refillBulletinBuffer`). Rodando o teste
+  manual enquanto o preparo automático também gerava, as duas chamadas nativas
+  disputavam CPU/threads ao mesmo tempo - dado real capturado em campo (duas cargas de
+  modelo por Qwen3 4B ~9s uma da outra, mesmo processo). **Decisão:** removido o botão de
+  teste manual inteiro (`testRadioBulletin`, `loadLiveTestScript`,
+  `LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS`) - o card do buffer (`RadioBulletinBufferStatusCard`,
+  botão "Reproduzir boletim pronto"/bolinhas por posição) virou o único caminho de teste,
+  porque o preparo automático que ele expõe já passa pelo mutex certo. Sem essa
+  concorrência, 5 threads sozinho já resolveu: da rodada seguinte em diante, nenhuma
+  geração estourou timeout.
+- **Achado 4 — mais threads não ajuda nesse aparelho, pode piorar bastante:** com a
+  concorrência eliminada, testado threads=8 (núcleos totais do Dimensity 1200, `adb
+  shell nproc`) tanto no redator quanto na síntese de voz:
+  - Redator: prefill não mudou (191-213s em 5, 6 ou 8 threads - mesma faixa), mas o
+    **decode colapsou** de ~2,0-2,6 tok/s (5 threads) pra 0,3-1,3 tok/s (8 threads,
+    variando bastante e caindo ao longo da geração - sinal de throttling térmico, não
+    falta de paralelismo). Duas rodadas reais com 8 threads **estouraram o timeout
+    interno de 340s** (`motivo=decode_error` porque o abort por timeout pegou o
+    `llama_decode` no meio da chamada, não entre tokens - o motivo deveria ter sido
+    "timeout"; ver pendência abaixo), a primeira falha real de timeout do dia inteiro.
+  - Voz (Supertonic): uma única fala de 159 caracteres levou 136s com 8 threads, contra
+    a média de ~68-83s/fala já registrada no teste de campo antigo (2 threads=410s/6
+    falas, 4 threads=496s/6 falas, ver ADR anterior sobre threads da voz). Confirma o
+    mesmo padrão "mais threads = mais calor = pior" já suspeitado, agora de forma mais
+    extrema.
+  - **Decisão final:** redator voltou pra **threads=5** (manifest do pacote
+    `radio-writer-models/qwen3-4b-q4km/manifest.json`, reempacotado e reimportado no
+    aparelho - único valor com dado real bom depois da correção da concorrência). Voz
+    voltou pra **numThreads=2** (`LocalRadioVoiceEngine.kt`) - o único valor da própria
+    história do projeto com medição real boa; o "3" que estava em produção antes desta
+    sessão nunca foi medido de verdade, era só um meio-termo escolhido sem dado. Teto
+    máximo no código (Kotlin `coerceIn`/nativo `min`) ficou em 8 como limite de segurança,
+    não como recomendação - não subir de novo sem medir com log por fase primeiro.
+- **Achado 5 — prefill pesa mais que o decode:** com o prompt do redator em ~1150-1190
+  tokens (o exemplo few-shot grande do ADR-002/pendência de "eco da instrução"), o
+  prefill (~190-210s) consistentemente pesa mais no tempo total que o decode
+  (~90-130s, gerando de ~200 a ~280 tokens). Quem quiser reduzir tempo de verdade no
+  futuro, encolher o prompt tem mais efeito que ajustar threads.
+- **Bug de crash achado implementando persistência:** `LocalTuneViewModel.init{}` tentou
+  ler `radioBulletinBufferState` (Compose `mutableStateOf`) de dentro de
+  `viewModelScope.launch(Dispatchers.Default)` logo na abertura do app -
+  `IllegalStateException: Reading a state that was created after the snapshot was taken`,
+  **crash em 100% das aberturas** (visto em campo, revertido rápido). Lição: nunca ler/
+  escrever Compose State de fora do dispatcher padrão do `viewModelScope`
+  (`Main.immediate`) logo na construção do ViewModel, mesmo que pareça inofensivo - ver
+  também `[[feedback_pailer_fm_viewmodel_mainthread]]` (mesma classe de bug do
+  `showToast()`, agora pra leitura de `State` em vez de UI direta).
+- **Novo: persistência do buffer do Nível 1 em disco.** Antes, `coreBuffer` (núcleo
+  pré-aquecido) e os `.wav` da síntese ficavam só em memória/`cacheDir` - qualquer
+  reinício do processo (crash, `adb install -r`, Android matando por memória) perdia
+  tudo, mesmo boletins já prontos. Agora:
+  - Áudio do núcleo vai pra `filesDir/radio_bulletins_ready/` (não `cacheDir`) -
+    `LocalRadioVoiceEngine.CORE_BUFFER_DIR_NAME`, único nome compartilhado com o
+    ViewModel. `filesDir` é privado do app e não é limpo automaticamente pelo Android
+    (só em "Limpar dados", bem mais deliberado que "Limpar cache").
+  - `LocalTuneViewModel.saveCoreBufferManifest()`/`loadCoreBufferManifest()` gravam/leem
+    um `manifest.json` (JSON simples, sem lib de serialização) nessa mesma pasta,
+    espelhando o `coreBuffer` inteiro (script + falas + nomes dos `.wav`). Salva depois
+    de toda mudança (item novo, item consumido); carrega uma vez no `init` do ViewModel,
+    validando que cada `.wav` referenciado ainda existe em disco antes de restaurar.
+  - Varredura de órfão: toda vez que salva, apaga do disco qualquer `.wav` na pasta que
+    não esteja mais referenciado por nenhum item do `coreBuffer` atual (item consumido/
+    substituído).
+  - **Só o Nível 1 é persistido**, de propósito - o Nível 2 (`bulletinBuffer`) é
+    específico da rádio ativa e sempre limpo em `startRadioNewsMode()`, não sobreviveria
+    a uma nova sessão mesmo se fosse salvo.
+- **Novo: prévia com fala de abertura + feedback claro sem áudio.** O botão de
+  reproduzir prévia tocava só o "miolo" (falas 2-5) - o usuário relatou que a prévia
+  "não tinha pé nem cabeça" porque faltava a fala 1 (a Fran apresentando o assunto da
+  notícia). Como o Nível 1 gera a fala 1 **sem** referência a faixa real (prompt já
+  trata "faixa desconhecida" como "emenda direto pra notícia"), ela já sai genérica e
+  utilizável fora de contexto de rádio - `prewarmCoreBuffer()` agora sintetiza essa fala
+  sozinha também (`PreparedNewsCore.introFile`, reaproveitando `requestCoreSynthesis`
+  com uma lista de 1 linha, sem caminho novo no serviço de voz) e a prévia toca
+  intro→núcleo em sequência. Também corrigido bug onde tocar a prévia num item sem
+  áudio (ex.: roteiro caiu pro fallback determinístico, que nunca tem `coreFile`) não
+  fazia **nada visível** - `readyCount` contava "texto pronto" mas o botão parecia
+  habilitado; separado em `hasPlayableAudio` (áudio de verdade) pro botão, e mensagem
+  clara ("Esse boletim não tem áudio pronto...") em vez de silêncio.
+- **Novo: corte de frase mais inteligente.** `limitWords()` (usado em `RadioScriptLine.text`
+  entre outros) cortava sempre no limite exato de palavras, deixando frases penduradas
+  tipo "...pede que alguém a dê a porta de uma cela, como." quando a fala saía mais longa
+  que o normal. Agora tenta achar a última frase completa (`.`/`!`/`?`) que ainda cabe no
+  limite antes de cortar; só cai no corte bruto por palavra se nem a primeira frase
+  inteira couber (comportamento idêntico ao anterior pros casos sem pontuação, ex.:
+  título/nome de faixa).
+- **Novo: cooldown de 3 minutos entre boletins consecutivos do Nível 1**
+  (`COOLDOWN_BETWEEN_BULLETINS_MS` em `LocalTuneViewModel`), com status regressivo a
+  cada 15s. Só espera se ainda falta preparar mais item (não trava 3min à toa depois do
+  último). Motivação: throttling térmico visto se acumulando em sessões de geração
+  seguida (prefill caindo de 7,3 pra 5,6 tok/s ao longo de rodadas consecutivas).
+- **Pendências não resolvidas nesta sessão:**
+  1. **`stop_reason="decode_error"` mascara timeout real** - quando o abort por deadline
+     expira **dentro** de uma chamada `llama_decode()` (não entre tokens, onde o
+     `expired()` já é checado explicitamente), `llama_decode` retorna erro e o motivo
+     registrado é "decode_error" em vez de "timeout" - visto em campo com
+     `total=340024ms`/`340004ms`, batendo exatamente no timeout interno. Log continua
+     útil (dá pra inferir pelo `total_ms`), mas vale corrigir a categorização certa.
+  2. **Job duplicado em reset rápido consecutivo:** `pauseBulletinPreparation`/reset
+     cancela `corePrepJob` e zera a referência, mas cancelamento de coroutine é
+     cooperativo - se o job antigo estiver bloqueado numa chamada nativa síncrona (JNI),
+     `corePrepJob?.isActive` já volta `false` assim que `.cancel()` é chamado (mesmo com
+     o corpo ainda rodando), então um reset logo em seguida inicia um job novo **de
+     verdade em paralelo** com o antigo ainda terminando. `llmGenerationMutex`/
+     `voiceSynthesisMutex` evitam que os dois rodem o motor nativo ao mesmo tempo (sem
+     risco de crash/corrupção), mas cada job tem seu próprio cooldown e contagem de
+     `coreBuffer.size` - visto em campo pulando o cooldown de 3min (só ~63s) e
+     restaurando manifest "0/0" depois de um reinício nessa janela. Precisa de
+     `job.cancelAndJoin()` (ou equivalente) esperando o job antigo terminar de verdade
+     antes de iniciar um novo, não só verificar `isActive`.
+  3. **Vazamento raro de token não-português:** uma geração produziu "警报" (caracteres
+     chineses) no meio de uma fala em português - não travou nada (`hasAccentuation()`
+     ainda passou), mas seria pronunciado errado pelo sintetizador. Sem solução
+     aplicada; se virar frequente, considerar checagem de script Han/Latin na validação
+     de `parseGeneratedLines`, mesma família de rede de segurança do
+     `hasAccentuation()`.
+
+## ADR-021 — Bed do boletim sem direitos autorais, volume do boletim, buffer de 5 e personalidade de Fran/Nico
+
+- **Contexto:** quatro pedidos do usuário na mesma sessão (04/09/2026): (1) as duas
+  músicas de fundo do boletim eram do Epidemic Sound (direitos autorais reais, não só
+  hipotético) e precisavam sair; (2) o boletim tocava visivelmente mais baixo que a
+  música normal, obrigando o usuário a reajustar o volume toda vez; (3) buffer de
+  boletins prontos pequeno demais pra cobrir a variedade de assunto que ele queria; (4)
+  Fran e Nico soavam sempre com o mesmo registro sério/cínico, sem humor nem
+  personalidade própria.
+- **Decisão — bed sem direitos autorais:** `ES_Save It for a Rainy Day - Margareta.mp3`/
+  `ES_Devil Disguised - Torii Wolf.mp3` (Epidemic Sound, ver ADR-019) apagados de
+  `vinhetas/`. Substituídos por `Concrete Tunnel.mp3`/`Concrete Tunnel 2.mp3` (autorais,
+  geradas pelo usuário), convertidas com o mesmo comando de sempre
+  (`ffmpeg -ar 44100 -ac 1 -f s16le`) pra `voice-models/supertonic-3-int8/bed1.pcm`/
+  `bed2.pcm`. `manifest.json` não mudou (já referenciava só os nomes de arquivo).
+  `voice-models/Pailer-Radio-Voices-Supertonic3-Fran-Nico.zip` reempacotado com os PCMs
+  novos (via `zipfile` do Python, só substituindo as 2 entradas - `zip`/`7z` não
+  disponíveis no ambiente) - falta o usuário reimportar esse zip no app (fluxo manual
+  de sempre, Configurações > pacote de voz) pra valer no aparelho.
+- **Decisão — volume do boletim:** `LocalRadioVoiceEngine` não tinha NENHUM ganho na
+  voz sintetizada (só o bed de fundo tinha `backgroundMusicVolume`) - o pico de
+  amplitude que sai do Supertonic é bem mais baixo que uma faixa mixada/masterizada.
+  Adicionado `normalizeVoiceLevel()`, chamado no fim de `synthesizeLine()` (ponto único
+  por onde toda fala passa, incluindo `spliceEdges`): normaliza por PICO (não ganho
+  fixo) até `VOICE_TARGET_PEAK = 0.95f`, com teto `VOICE_MAX_GAIN = 4f` (12dB) pra não
+  amplificar demais um trecho quase mudo por erro de síntese. Normalizar por linha
+  (não no áudio final já com bed) significa que o "núcleo" pré-aquecido
+  (`synthesizeCore`, sem contexto de faixa ainda) já sai no nível certo, e
+  `spliceEdges` não precisa recalcular nada ao colar as pontas.
+- **Decisão — buffer de 5:** `BULLETIN_BUFFER_TARGET` (ADR-019) subiu de 3 pra 5 em
+  `LocalTuneViewModel.kt`. Nenhuma outra mudança de lógica - `refillBulletinBuffer()`
+  já era genérico o bastante pra qualquer tamanho de alvo.
+- **Decisão — feeds diversificados:** `NewsBulletinRepository.FEEDS` trocou o feed
+  genérico `super.abril.com.br/feed/` (todas as editorias misturadas) por 6 feeds mais
+  específicos, cobrindo os temas pedidos - fatos históricos, bizarros, científicos,
+  curiosidades de mundo e do Brasil - sem inventar fato nenhum (continuam sendo notícia
+  real de RSS, só de fonte/editoria diferente):
+  `g1.globo.com/rss/g1/brasil`, `g1.globo.com/rss/g1/planeta-bizarro`,
+  `super.abril.com.br/historia/feed/`, `super.abril.com.br/mundo-estranho/feed/`,
+  mantendo `g1 Mundo`/`g1 Ciência e saúde`/`Olhar Digital`/`BBC Brasil` de antes (8
+  feeds no total). Cada URL foi testada manualmente (`curl`) antes de entrar na lista -
+  `aventurasnahistoria.uol.com.br` (não resolve DNS), `megacurioso.com.br/feed`
+  (SPA React, não RSS de verdade) e `g1.globo.com/rss/g1/curiosidades` (canal existe mas
+  devolve 0 itens) foram descartados por não funcionarem de verdade, não só por
+  suposição. `NEWS_LIMIT` subiu de 8 pra 16 (2 por feed) porque com exatamente 8 feeds
+  e limite 8, o `interleave()` (round-robin) parava na 1ª rodada e nunca dava uma 2ª
+  chance pra nenhum feed.
+- **Decisão — personalidade de Fran/Nico:** `buildSystemInstructions()` (compartilhada
+  entre redator local Qwen3 e Gemini, ver ADR-002/ADR-020) ganhou um parágrafo de
+  personalidade antes da estrutura de 6 falas: Fran tem senso de humor, faz alívio
+  cômico, traz informação útil/relevante e levanta o astral; Nico continua cético/
+  sério/político (mantém o conhecimento de capitalismo/imperialismo/lobby da ADR-014)
+  mas ganhou humor ácido/seco que "cutuca a ferida" do assunto (nunca da Fran) e uma
+  atitude de "porra-louca"/motoqueiro de jaqueta de couro que já viveu bastante - via
+  tom, não citação literal repetida. As falas 2-4 e 6 da estrutura ganharam permissão
+  explícita pra humor/sarcasmo (antes só falavam em "leitura crítica"/"otimismo
+  realista"/"provocação"). O exemplo few-shot (matéria fictícia de trânsito) foi
+  reescrito pra DEMONSTRAR esse tom novo, não só descrevê-lo -
+  [[feedback_small_llm_fewshot]] (memória) confirma que modelo pequeno precisa de
+  exemplo concreto, descrição abstrata sozinha não bastava mesmo antes.
+  - **Fora de escopo, deliberado:** os bancos fixos de fallback
+    (`TOPIC_BANK`/`NICO_DETAILS`/etc, usados só quando LLM local E Gemini falham os
+    dois) continuam no tom sério/cético antigo, sem o humor novo - ver comentário
+    acima de `TOPIC_BANK` no código. Esse caminho é raro o bastante (rede de segurança)
+    pra não justificar reescrever ~15 categorias x otimista/pessimista agora.
+- **Atualização (04/09/2026, cooldown térmico pulado quando escreve via Gemini):**
+  usuário observou que o cooldown de 3min entre boletins (`COOLDOWN_BETWEEN_BULLETINS_MS`,
+  ADR-020) foi criado pensando no esforço do redator LOCAL (Qwen3) + síntese de voz
+  somados, mas hoje boa parte da escrita sai pelo Gemini (nuvem) - achou que o cooldown
+  não fazia mais sentido. Verificado antes de mexer: a síntese de voz (Supertonic)
+  continua **sempre** local mesmo com Gemini (decisão de privacidade, ver
+  `enhanceScript`/ADR-020 - "a síntese de voz continua 100% local... o áudio final nunca
+  sai do aparelho") e foi UMA DAS DUAS causas originais do throttling medido (2t=410s/
+  4t=496s) - cortar o cooldown sempre arriscaria voltar ao throttling só com a síntese,
+  mesmo sem o redator local rodando. Perguntado ao usuário com as opções (remover
+  sempre / remover só com Gemini / só reduzir tempo / manter) - escolheu **remover só
+  quando o Gemini escreveu essa matéria especificamente**, mantendo o cooldown normal
+  quando cai pro redator local Qwen3 (sem chave configurada, ou Gemini falhou nessa
+  hora). Implementado com um callback novo `enhanceScript(..., onWriterUsed: (Boolean)
+  -> Unit)` em vez de campo novo em `RadioScript`/`RadioScriptSource` - só
+  `prewarmCoreBuffer()` (`LocalTuneViewModel.kt`) precisa distinguir Gemini de local,
+  nenhum outro consumidor faz isso por design (ver comentário em
+  `RemoteGeminiRadioScriptWriter.writeContextual` sobre reusar
+  `RadioScriptSource.LocalLlm` pros dois). `usedGemini` guarda o resultado do callback e
+  vira a condição extra (`&& !usedGemini`) no `if` que entra no laço de espera do
+  cooldown.

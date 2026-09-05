@@ -62,10 +62,11 @@ Usuário toca numa Rádio
 playRadioSession()                          [LocalTuneViewModel]
   ├─ radioSessionFrom() → fila anti-repetição
   ├─ startRadioNewsMode(radioName)
-  │    ├─ zera contadores/flags do boletim
+  │    ├─ zera contadores/flags do boletim, esvazia bulletinBuffer
   │    ├─ setupTextToSpeech()               (fallback; ver TTS.md)
   │    └─ carrega boletins em background:
-  │         RadioBulletinRepository.loadScripts()
+  │         RadioBulletinRepository.loadScripts() → refillBulletinBuffer()
+  │         (enche o buffer pra BULLETIN_BUFFER_TARGET=3 itens prontos, ver ADR-019)
   ├─ controller.setMediaItems + prepare      (autoPlay=false se vai tocar vinheta)
   └─ playRadioVinhetas(radioName)            (só quando startIndex == 0, entrada nova)
         ├─ playVinhetaResource(R.raw.radio_intro)
@@ -75,13 +76,15 @@ playRadioSession()                          [LocalTuneViewModel]
         ▼  (sessão rodando)
 onMediaItemTransition(reason = AUTO)        [Player.Listener]
   ├─ completedRadioSongs += 1
-  └─ a cada settings.songsBetweenBulletins (padrão 3):
-       speakNextNewsBreak()
-         ├─ pega próximo script da lista (índice circular)
-         ├─ resumeAfterNews = player.isPlaying; player.pause()
-         ├─ síntese local (sherpa, timeout 12 s) OU TTS do sistema
-         ├─ MediaPlayer toca o WAV (cacheDir/radio_voice_<timestamp>.wav)
-         └─ finishNewsBreak() → retoma playback se resumeAfterNews
+  ├─ a cada settings.songsBetweenBulletins (padrão 3):
+  │    speakNextNewsBreak()
+  │      ├─ bulletinBuffer.removeFirstOrNull() → refillBulletinBuffer() (repõe já)
+  │      ├─ item do buffer pronto: usa script+WAV já preparados
+  │      │  (buffer vazio: monta boletim ao vivo, sem redator local, timeout 12 s)
+  │      ├─ resumeAfterNews = player.isPlaying; player.pause()
+  │      ├─ playPassagem() → MediaPlayer toca o WAV do boletim (cacheDir/radio_voice_<ts>.wav)
+  │      │  → playPassagem() de novo → finishNewsBreak() → retoma playback
+  └─ refillBulletinBuffer()                  (nudge idempotente, no-op se já cheio)
 ```
 
 Gatilho importante: boletins só contam em transição **AUTO** (música acabou sozinha).
@@ -116,27 +119,58 @@ Interface `RadioScriptWriter` com duas implementações:
 | Escritor | Quando é usado | Comportamento |
 |---|---|---|
 | `OptionalLocalLlmRadioScriptWriter` | modo Dialogue + pacote LLM instalado (`filesDir/radio_writer/model.ready`) | Usa Qwen3 1.7B GGUF via `llama.cpp` para reescrever o próximo boletim em JSON curto; qualquer falha, demora ou JSON inválido cai no fallback. |
-| `FallbackRadioScriptWriter` | sempre disponível | Bate-bola entre Frankie (otimista) e Nicky (pessimista), com abertura citando a última música, resumo da matéria pelo Nicky, provocação/contra provocação e chamada de volta para a rádio — ver ADR-014 — ou headline curta (2 falas, só Frankie). |
+| `FallbackRadioScriptWriter` | sempre disponível | Bate-bola entre Fran (otimista) e Nico (pessimista), com abertura citando a última música, resumo da matéria pelo Nico, provocação/contra provocação, reflexão existencialista/absurdista do Nico e chamada da próxima música com curiosidade — ver ADR-014 — ou headline curta (2 falas, só Fran). |
 
-Modos do usuário (`RadioBulletinMode`): `Off`, `Headlines` (só manchete), `Dialogue`
-(diálogo completo, tenta redator local primeiro).
+Modo é sempre `Dialogue` (diálogo completo, tenta redator local primeiro) — a seleção de
+modo (`Off`/`Headlines`/`Dialogue`) foi removida da UI (tela "Boletins da radio"); o enum
+`RadioBulletinMode` continua existindo em `RadioBulletin.kt` mas `Off`/`Headlines` não são
+mais alcançáveis por preferência do usuário.
 
 O pacote do redator local é importado pela tela de boletins. Ele fica fora do APK por
 tamanho: o pacote recomendado é `dist/Pailer-Radio-Writer-Qwen3-1.7B-Q4KM-v1.zip`
 (~1,03 GB), com `manifest.json` + `Qwen3-1.7B-Q4_K_M.gguf`.
 
-### Bate-bola Frankie/Nicky (ADR-014)
+### Bate-bola Fran/Nico (ADR-014)
 
 `FallbackRadioScriptWriter.buildDialogueLines()` classifica o tema da notícia (título +
 resumo, por palavra-chave — política, economia, ciência/tecnologia, saúde, cultura pop,
 esporte, clima, curiosidade, mundo/conflito ou geral) e monta as falas com bancos de
 texto próprios por tema para cada personagem, em vez de reações genéricas soltas.
-O Nicky agora resume ou explica a matéria antes de criticar, usando o resumo real do RSS
+O Nico agora resume ou explica a matéria antes de criticar, usando o resumo real do RSS
 quando existe. A opinião dos dois parte de uma leitura de mundo mais forte: capitalismo
 tardio, jogo imperialista, corporativismo, lobby, indústria cultural, plataformas e
 mercado financeiro aparecem como bagagem cultural, não como bordão repetido em toda fala.
 Extrai também um "gancho" (primeiro percentual, valor em R$ ou número grande do texto)
-para referenciar algo concreto da matéria.
+para referenciar algo concreto da matéria. O bate-bola em si (`buildDialogueLines`) termina
+na contra-provocação do Nico — a "chamada de volta pra rádio" não faz mais parte dessa
+função, ver fechamento filosófico abaixo.
+
+### Fechamento filosófico + chamada de música (`withPhilosophicalCloser`)
+
+Depois que o roteiro-base (fallback ou redator local) é gerado, `LocalTuneViewModel` cola
+1 ou 2 falas novas via `RadioScript.withPhilosophicalCloser()` (`RadioBulletin.kt`),
+aplicada **depois** da geração — igual `withLastPlayedIntro` — porque só se sabe qual é a
+próxima faixa da fila em tempo de reprodução, nunca em `loadScripts()`:
+
+1. **Nico** traz uma reflexão existencialista/absurdista. Desde 02/09/2026 (ver ADR-002,
+   atualização), quando o roteiro veio do **redator local** o comentário já vem pronto
+   como a 5ª fala pedida em `buildPrompt()` — gerado em cima da matéria específica, não
+   sorteado — e `withPhilosophicalCloser` só reaproveita essa fala. Só sorteia do banco
+   fixo (`NICO_REFLECTIONS_LIGHT`/`NICO_REFLECTIONS_DEEP`, por peso conforme
+   `RadioScript.duration`) quando o roteiro veio do fallback determinístico ou o LLM não
+   entregou a 5ª fala dessa vez — nesse caso continua Camus/Sartre/Nietzsche/Beckett (só
+   citação literal segura) ou Kafka/Cioran (por tema, não por citação).
+2. **Fran** reage e chama a próxima música, citando o artista (resolvido espiando a
+   fila real do `Player`, `getMediaItemAt`) e uma curiosidade **sempre genérica de
+   gênero/época** (nunca específica do artista — decisão deliberada: o redator local é
+   pequeno demais pra arriscar inventar dado sobre banda pouco conhecida da biblioteca,
+   mesma regra de "não invente fatos" que já vale pras notícias). Cadeia gênero → época →
+   genérico em `musicTrivia()`. Sem faixa seguinte conhecida, degrada pra frase genérica
+   sem citar artista.
+
+Aplicado nos dois pontos de chamada de `withLastPlayedIntro` (pré-síntese e fallback ao
+vivo) — essencial pra o áudio pré-sintetizado e o fallback de texto ficarem consistentes.
+Só roda no modo `Dialogue` (não no `Headlines`).
 
 Na hora de tocar ou preparar o boletim, `LocalTuneViewModel` injeta a última faixa ouvida
 na primeira fala: "Você acaba de ouvir X, de Y, e vamos às notícias." Isso acontece só no
@@ -144,10 +178,14 @@ contexto de reprodução, porque os roteiros-base são carregados quando a rádi
 música anterior só é conhecida no intervalo.
 
 Para não travar a entrada da rádio, `loadScripts()` continua carregando roteiros-base via
-fallback determinístico. O redator local entra em `prepareUpcomingBulletin()`, só para o
-próximo boletim. A versão gerada fica cacheada como texto e, se a voz local estiver ligada,
-também como áudio. Assim o app evita gerar oito notícias de uma vez e mantém silêncio
-mínimo entre as músicas.
+fallback determinístico. O redator local entra em `refillBulletinBuffer()` (ADR-019),
+preparando **até 3 boletins com antecedência** em segundo plano (um de cada vez, nunca
+mais de um motor de voz carregado ao mesmo tempo) em vez de só o próximo. Cada versão
+gerada fica cacheada como texto e, se a voz local estiver ligada, também como áudio, num
+buffer (`bulletinBuffer`) reposto assim que um item é consumido. Assim o app evita gerar
+oito notícias de uma vez, mas também não fica refém de "só 1 música de antecedência" -
+qualquer soluço pontual de síntese tem folga de até 3 boletins pra se resolver antes de
+faltar áudio pronto.
 
 Regra de segurança em produção: depois que a música pausa, o app não chama mais o redator
 local nem tenta sintetizar voz local pesada se o WAV não estava pronto. Se o roteiro/áudio
@@ -163,11 +201,11 @@ Diferença chave da versão antiga: o número de falas é decidido **pela duraç
 cortado depois por `fitFor()` — antes um script fixo de 3 falas podia perder a última
 inteira se estourasse o limite de palavras, quebrando a participação igual dos dois:
 
-| Duração | Falas | Estrutura |
+| Duração | Falas (base + fechamento) | Estrutura |
 |---|---|---|
-| Short | 5 | última música + manchete do Frankie → Nicky resume/explica com leitura crítica → Frankie provoca sem ingenuidade → Nicky contra provoca → volta para a rádio |
-| Normal | 5 | mesma estrutura, com mais margem de palavras para resumo e comentário |
-| Long | 6 | + uma fala extra do Nicky contextualizando consequência/gancho antes da provocação |
+| Short | 4 + 2 | última música + manchete da Fran → Nico resume/explica com leitura crítica → Fran provoca sem ingenuidade → Nico contra provoca → reflexão do Nico → Fran chama a próxima música com curiosidade |
+| Normal | 4 + 2 | mesma estrutura, com mais margem de palavras para resumo e comentário |
+| Long | 5 + 2 | + uma fala extra do Nico contextualizando consequência/gancho antes da provocação |
 
 `fitFor()` continua como rede de segurança (apara palavras se algum banco de texto sair
 grande), mas não deve mais precisar cortar linha inteira em uso normal.
@@ -181,9 +219,11 @@ Duração → limite de palavras aplicado por `fitFor()`:
 | Long | 45 | 235 |
 
 Cada fala vira uma linha `RadioScriptLine(speaker, text)` — o speaker define qual voz
-do pacote sintetiza aquela linha (ver [TTS.md](TTS.md)). Os enums `RadioSpeaker.Female`/
-`Male` são só nomes de slot herdados do pacote de voz — hoje os dois carregam vozes
-masculinas (Frankie no slot Female, Nicky no slot Male).
+do pacote sintetiza aquela linha (ver [TTS.md](TTS.md)). `RadioSpeaker.Female` = Fran
+(voz Supertonic F2), `RadioSpeaker.Male` = Nico (voz Supertonic M1) — ver ADR-018. O
+`fitFor()` acima só se aplica às falas base; as 2 falas do fechamento filosófico
+(`withPhilosophicalCloser`) têm seu próprio limite de palavras e não contam nesse
+orçamento.
 
 ## Arquivos temporários e limpeza
 

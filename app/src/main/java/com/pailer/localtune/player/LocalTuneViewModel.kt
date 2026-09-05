@@ -48,11 +48,17 @@ import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageRepository
 import com.pailer.localtune.data.RadioWriterPackageRepository
 import com.pailer.localtune.data.withLastPlayedIntro
+import com.pailer.localtune.data.withPhilosophicalCloser
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -149,17 +155,50 @@ data class RadioBulletinUiState(
     val localWriterName: String = "Redator local",
     val localWriterDetail: String = "Pacote de LLM ainda nao instalado",
     val localWriterMessage: String? = null,
+    // true quando ha uma chave de API do Gemini salva localmente (GeminiWriterSettings) -
+    // pedido do usuario (03/09/2026): escrever o boletim via Gemini (nuvem, rapido) em vez do
+    // redator local (Qwen3 4B no aparelho, ver ADR-020), so a sintese de voz continua local.
+    val geminiConfigured: Boolean = false,
+)
+
+// Estado do buffer de boletins prontos (bulletinBuffer/refillBulletinBuffer, ver ADR-019),
+// exposto pra UI acompanhar o preparo em segundo plano em tempo real - pedido do usuario
+// (03/09/2026): quer ver quantos boletins ja estao prontos, quantos estao sendo escritos agora,
+// alem de poder pausar/resetar o preparo.
+data class RadioBulletinBufferUiState(
+    val readyCount: Int = 0,
+    val targetCount: Int = 3,
+    val isPreparing: Boolean = false,
+    val isPaused: Boolean = false,
+    val statusMessage: String? = null,
+    // Percentual real: na escrita (redator local Qwen3) vem do callback nativo por token
+    // (LlamaProgressListener, tokens gerados/teto); na sintese de voz vem do
+    // RadioVoiceSynthesisService (index/total de fala). Nunca estimado (pedido do usuario
+    // 03/09/2026 foi "acompanhamento em porcentagem", nao "estimativa").
+    val progressPercent: Int? = null,
+    // Pedido do usuario (03/09/2026): botao de reproduzir o primeiro boletim pronto do buffer,
+    // sem precisar entrar numa radio pra testar - ver playReadyBufferedBulletin().
+    val isPlayingPreview: Boolean = false,
+    // Nivel 1 (coreBuffer/prewarmCoreBuffer) tem pelo menos um item com audio do miolo pronto -
+    // usado como fallback do botao de reproduzir quando o Nivel 2 (bulletinBuffer, que exige
+    // radio tocando) ainda esta vazio (achado 03/09/2026: sem isso o botao nunca acendia so de
+    // abrir o app, contrariando a promessa original de "sem precisar entrar numa radio").
+    val hasCorePreview: Boolean = false,
+    // true so quando existe audio de verdade pra tocar (nao so texto pronto) - readyCount conta
+    // qualquer item com SCRIPT pronto, inclusive roteiro padrao de fallback (que nunca tem
+    // audio, ver prewarmCoreBuffer). Sem esse campo separado o botao ficava habilitado mas mudo
+    // ao tocar num item sem audio (achado 03/09/2026, usuario relatou "reproduzir previa nao
+    // esta funcionando").
+    val hasPlayableAudio: Boolean = false,
 )
 
 data class RadioVoiceUiState(
     val isInstalled: Boolean = false,
     val isImporting: Boolean = false,
     val isTesting: Boolean = false,
-    val isTestingBulletin: Boolean = false,
     val isTestingAndroidVoice: Boolean = false,
     val isEnabled: Boolean = false,
     val packageName: String = "Voz local",
-    val engine: String = "",
     val femaleSpeaker: String = "",
     val maleSpeaker: String = "",
     val detail: String = "Nenhum pacote de voz instalado",
@@ -173,6 +212,32 @@ private data class LocalVoiceSynthesisResult(
     val file: File?,
     val detail: String,
     val elapsedMs: Long,
+)
+
+// Um item do buffer de boletins (ver bulletinBuffer/refillBulletinBuffer). `file` fica nulo
+// quando a voz local estava desativada ou a sintese falhou/estourou o timeout - nesse caso
+// speakNextNewsBreak cai pro TTS do Android usando script.spokenText.
+private data class PreparedBulletin(
+    val script: RadioScript,
+    val file: File?,
+)
+
+// Um "nucleo" pre-aquecido (ver coreBuffer/prewarmCoreBuffer, pedido do usuario 03/09/2026:
+// buffer deve encher mesmo sem radio nenhuma tocando, sem prender o trabalho pesado a uma
+// radio especifica). `script` tem 6 falas mas SEM faixa/radio reais (hasTrackContext=false,
+// ver RadioBulletin.kt) - so a analise da noticia (falas 2-5) e reaproveitavel entre radios.
+// `coreFile` e o WAV "seco" (falas 2-5, sem musica de fundo) que refillBulletinBuffer() usa em
+// spliceEdges() pra colar as pontas (fala 1/6) com contexto real, sem re-sintetizar tudo.
+// `introFile` e SO pra previa manual (playReadyBufferedBulletin) - a fala 1 sozinha, sintetizada
+// com o texto generico que o LLM ja escreve quando nao ha faixa real (ver buildPrompt: "faixa
+// desconhecida - nao cite nome nenhum, so emenda direto pra noticia"). NUNCA usado por
+// spliceEdges/refillBulletinBuffer (Nivel 2 sempre gera SUA PROPRIA fala 1 com faixa real e
+// audio novo) - achado 03/09/2026: sem isso a previa comecava direto na fala do Nico, sem
+// nenhum contexto de qual noticia estava sendo discutida ("fica sem pe nem cabeca").
+private data class PreparedNewsCore(
+    val script: RadioScript,
+    val coreFile: File?,
+    val introFile: File? = null,
 )
 
 class LocalTuneViewModel(application: Application) : AndroidViewModel(application) {
@@ -201,8 +266,22 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var resumeAfterNews = false
     private var currentRadioTrack: RadioLastPlayedTrack? = null
     private var pendingVinheta = false
+    // Alterna entre as duas passagens curtas (musica > passagem > boletim > passagem > musica) -
+    // ver playPassagem(). Incrementa a cada uso, nao reseta entre boletins.
+    private var nextPassagemIndex = 0
+    // Guarda de reentrancia de finishNewsBreak(): agora ela dispara a passagem final e so
+    // zera speakingNews no fim disso (pra manter o watchdog cobrindo a passagem), entao o
+    // guard antigo (`if (!speakingNews) return`) sozinho nao bastava mais - uma segunda
+    // chamada durante a passagem tocaria a passagem duas vezes.
+    private var newsBreakEnding = false
     private var announcementPlayer: MediaPlayer? = null
     private var lastTestAudioFile: File? = null
+    // Player dedicado pro "Reproduzir" do card de buffer (playReadyBufferedBulletin) - separado
+    // de announcementPlayer/lastTestAudioFile de proposito: aquele mecanismo APAGA o arquivo
+    // anterior a cada novo teste, e o arquivo de um boletim do buffer ainda pertence ao
+    // bulletinBuffer (vai tocar de verdade dali a pouco) - reusar o mesmo player/apagamento
+    // arriscaria apagar o audio de um boletim que a radio real ainda vai consumir.
+    private var previewPlayer: MediaPlayer? = null
     private var announcementToken = 0
     private var announcementWatchdogJob: Job? = null
     private var libraryScanRunning = false
@@ -214,9 +293,31 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var lastUpcomingQueueKey = ""
     private var cachedUpcomingTracks: List<String> = emptyList()
     private var bulletinPrepJob: Job? = null
-    private var preparedBulletinIndex = -1
-    private var preparedBulletinScript: RadioScript? = null
-    private var preparedBulletinFile: File? = null
+    // Buffer de boletins prontos (roteiro ja decorado + WAV ja sintetizado, se a voz local
+    // estiver ativa) - ver refillBulletinBuffer()/ADR-019. Mantido em BULLETIN_BUFFER_TARGET
+    // itens; consumido em FIFO por speakNextNewsBreak(), reabastecido logo em seguida.
+    private val bulletinBuffer = ArrayDeque<PreparedBulletin>()
+    // Buffer do "nucleo" (Nivel 1, ver PreparedNewsCore/prewarmCoreBuffer) - roda independente
+    // de radioNewsEnabled, sobrevive a troca de radio (so bulletinBuffer, especifico da radio
+    // ativa, e limpo em startRadioNewsMode). refillBulletinBuffer() consome daqui primeiro.
+    private val coreBuffer = ArrayDeque<PreparedNewsCore>()
+    private var corePrepJob: Job? = null
+    // Nivel 1 (prewarmCoreBuffer) e Nivel 2 (refillBulletinBuffer) agora rodam em coroutines
+    // INDEPENDENTES e podem se sobrepor (radio tocando enquanto o nucleo de outra materia ainda
+    // esta sendo preparado) - sem isso, dois generate()/synthesize() concorrentes no mesmo
+    // processo arriscam o mesmo tipo de crash que ja preocupou este projeto (redator local sem
+    // isolamento de processo, ver ADR-002; "nunca dois engines de voz carregados ao mesmo
+    // tempo", ver ADR-003). Os dois mutexes serializam cada motor nativo entre os dois niveis
+    // sem bloquear um motor por causa do outro.
+    private val llmGenerationMutex = Mutex()
+    private val voiceSynthesisMutex = Mutex()
+    // Pausa manual do preparo em segundo plano (pauseBulletinPreparation/resumeBulletinPreparation,
+    // pedido do usuario 03/09/2026) - refillBulletinBuffer()/prewarmCoreBuffer() viram no-op
+    // enquanto isso for true, em TODOS os pontos de chamada (troca de faixa, fim de boletim,
+    // reload de feed), sem precisar guardar isso em cada um. So sai do estado pausado se o
+    // usuario retomar explicitamente - nao e limpo sozinho ao trocar de radio nem ao
+    // desligar/ligar o modo boletim de novo.
+    private var bulletinPrepPaused = false
 
     var libraryState = androidx.compose.runtime.mutableStateOf(LibraryUiState())
         private set
@@ -241,6 +342,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     var radioBulletinState = androidx.compose.runtime.mutableStateOf(loadRadioBulletinUiState())
         private set
 
+    var radioBulletinBufferState = androidx.compose.runtime.mutableStateOf(
+        RadioBulletinBufferUiState(targetCount = BULLETIN_BUFFER_TARGET),
+    )
+        private set
+
     var radioVoiceState = androidx.compose.runtime.mutableStateOf(loadRadioVoiceUiState())
         private set
 
@@ -258,12 +364,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 val interval = radioBulletinState.value.settings.songsBetweenBulletins.coerceAtLeast(1)
                 if (completedRadioSongs % interval == 0) {
                     speakNextNewsBreak(completedTrack)
-                } else if (interval > 1 && completedRadioSongs % interval == interval - 1) {
-                    // Ultima musica antes do proximo boletim acabou de comecar: adianta a sintese
-                    // da voz local em segundo plano (tem a duracao da faixa inteira disponivel),
-                    // entao o boletim toca sem pausa de espera quando o intervalo fechar.
-                    prepareUpcomingBulletin(currentRadioTrack)
                 }
+                // Preparo em segundo plano nao depende mais de "1 musica antes" - o buffer
+                // (bulletinBuffer/refillBulletinBuffer) e mantido cheio continuamente, entao so
+                // precisa de um empurrao aqui se algo tiver esvaziado ele nesse meio tempo
+                // (ex.: reload de feed que faltava).
+                refillBulletinBuffer()
             }
         }
     }
@@ -275,6 +381,25 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 controller?.let { updatePlayerState(it) }
                 delay(if ((controller?.mediaItemCount ?: 0) > 0) 1_500 else 3_000)
             }
+        }
+        // Pre-aquecimento do nucleo do boletim comeca na abertura do app, SEM esperar o usuario
+        // tocar uma radio (pedido do usuario 03/09/2026: "todos os dias, ele tem que fazer esse
+        // buffer mesmo sem eu tocar na radio"). Ver prewarmCoreBuffer/PreparedNewsCore.
+        // Restaura primeiro o que ja tinha sido escrito numa sessao anterior (loadCoreBufferManifest,
+        // ver comentario la - pedido do usuario 03/09/2026: boletins prontos nao podiam sumir so
+        // por reiniciar o app) antes de decidir se precisa preparar mais.
+        // NAO rodar em Dispatchers.Default: syncBulletinBufferState() le/escreve Compose State
+        // (radioBulletinBufferState) criado no proprio construtor deste ViewModel - fazer essa
+        // primeira leitura de uma thread diferente da que criou o State, antes de qualquer
+        // snapshot global ter sido aplicado, derruba o app com IllegalStateException ("Reading a
+        // state that was created after the snapshot was taken") em TODA abertura - crash visto em
+        // campo 03/09/2026 assim que essa persistencia foi ligada. O manifest e pequeno (poucos
+        // KB), ler direto aqui no thread padrao do viewModelScope (Main.immediate) nao trava nada
+        // perceptivel na abertura.
+        viewModelScope.launch {
+            loadCoreBufferManifest()
+            syncBulletinBufferState()
+            prewarmCoreBuffer()
         }
     }
 
@@ -338,10 +463,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun cancelPendingDelete() {
         pendingDeleteSongs = emptyList()
-    }
-
-    fun setRadioBulletinMode(mode: RadioBulletinMode) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(mode = mode))
     }
 
     fun setRadioBulletinPreferLocalWriter(preferLocalWriter: Boolean) {
@@ -408,6 +529,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         radioVoiceState.value = loadRadioVoiceUiState().copy(
             message = if (enabled) "Voz local experimental ativada." else "Voz local desligada. Usando Android.",
         )
+        // Pedido do usuario (02/09/2026): virar a chavinha no meio de uma radio ja tocando nao
+        // mudava nada nos boletins que ja estavam prontos no buffer (preparados com o valor
+        // ANTIGO de isEnabled - refillBulletinBuffer() so reconsulta a chavinha quando prepara
+        // um item novo). Descarta o que tinha e prepara de novo do zero com o valor atual, pra
+        // nao ter que esperar os boletins antigos (BULLETIN_BUFFER_TARGET) acabarem antes da voz
+        // nova (ou a volta pro Android) valer de verdade.
+        clearBulletinBuffer()
+        refillBulletinBuffer()
     }
 
     fun testRadioVoicePackage() {
@@ -429,7 +558,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 lines = listOf(
                     RadioScriptLine(
                         speaker = RadioSpeaker.Female,
-                        text = "Aqui é o Frankie testando a voz local do Pailer FM.",
+                        text = "Aqui é a Fran testando a voz local do Pailer FM.",
                     ),
                 ),
             )
@@ -448,53 +577,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     isTesting = false,
                     message = result?.detail
                         ?: "Teste sem resposta em ${LOCAL_VOICE_TEST_TIMEOUT_MS / 1000}s. Mantive a voz do Android.",
-                )
-            }
-        }
-    }
-
-    fun testRadioBulletin() {
-        if (!radioVoiceState.value.isInstalled) {
-            radioVoiceState.value = radioVoiceState.value.copy(message = "Importe um pacote antes de testar.")
-            return
-        }
-        radioVoiceState.value = radioVoiceState.value.copy(
-            isTestingBulletin = true,
-            message = "Buscando notícia real e preparando boletim com 2 locutores...",
-        )
-        viewModelScope.launch {
-            val radioName = activeRadioName.ifBlank { "Pailer FM" }
-            val settings = radioBulletinState.value.settings.copy(mode = RadioBulletinMode.Dialogue)
-            val script = runCatching {
-                bulletinRepository.loadLiveTestScript(settings, radioName)
-            }.onFailure {
-                Log.w(TAG_RADIO_VOICE, "teste de boletim: falhou ao buscar noticia real", it)
-            }.getOrNull()?.withLastPlayedIntro(currentRadioTrack)
-
-            if (script == null) {
-                radioVoiceState.value = loadRadioVoiceUiState().copy(
-                    isTestingBulletin = false,
-                    message = "Não consegui buscar uma notícia agora. Verifique a internet e tente de novo.",
-                )
-                return@launch
-            }
-            Log.d(
-                TAG_RADIO_VOICE,
-                "teste de boletim: noticia='${script.story.title}' fonte=${script.story.source} roteiro=${script.source}",
-            )
-            val result = requestLocalVoiceSynthesis(script, LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS)
-            if (result?.file != null) {
-                radioVoiceState.value = loadRadioVoiceUiState().copy(
-                    isTestingBulletin = false,
-                    message = "Boletim real OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s: ${script.story.title}",
-                    canReplayTest = true,
-                )
-                playTestAudio(result.file)
-            } else {
-                radioVoiceState.value = loadRadioVoiceUiState().copy(
-                    isTestingBulletin = false,
-                    message = result?.detail
-                        ?: "Boletim sem resposta em ${LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS / 1000}s.",
                 )
             }
         }
@@ -617,17 +699,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun loadRadioBulletinUiState(): RadioBulletinUiState {
-        val mode = runCatching {
-            RadioBulletinMode.valueOf(
-                radioPrefs.getString(KEY_RADIO_BULLETIN_MODE, RadioBulletinMode.Dialogue.name)
-                    ?: RadioBulletinMode.Dialogue.name,
-            )
-        }.getOrDefault(RadioBulletinMode.Dialogue)
-        // Duracao do boletim nao e mais preferencia do usuario - cada materia escolhe sozinha
-        // (ver RadioBulletinRepository.pickDuration) de acordo com o quanto de conteudo real
-        // tem pra render.
+        // Modo nao e mais escolha do usuario - sempre "conversa dos locutores" (Dialogue), a
+        // UI de selecao foi removida. Ignora qualquer valor antigo salvo em
+        // KEY_RADIO_BULLETIN_MODE (ex.: Off/Headlines de uma instalacao anterior).
+        // Duracao do boletim tambem nao e mais preferencia do usuario - cada materia escolhe
+        // sozinha (ver RadioBulletinRepository.pickDuration) de acordo com o quanto de
+        // conteudo real tem pra render.
         val settings = RadioBulletinSettings(
-            mode = mode,
+            mode = RadioBulletinMode.Dialogue,
             songsBetweenBulletins = RADIO_BULLETIN_DEFAULT_INTERVAL,
             preferLocalWriter = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, true),
         )
@@ -637,7 +716,24 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             localWriterInstalled = status.isInstalled,
             localWriterName = status.modelName,
             localWriterDetail = status.detail,
+            geminiConfigured = bulletinRepository.geminiSettings().apiKey() != null,
         )
+    }
+
+    // Salva/remove a chave de API do Gemini (GeminiWriterSettings, fica so no SharedPreferences
+    // do aparelho) e atualiza a UI - pedido do usuario (03/09/2026): campo direto nas
+    // Configuracoes, a chave nunca passa por fora do proprio celular.
+    fun saveGeminiApiKey(key: String) {
+        if (key.isBlank()) return
+        bulletinRepository.geminiSettings().setApiKey(key)
+        radioBulletinState.value = radioBulletinState.value.copy(geminiConfigured = true)
+        showToast("Chave do Gemini salva.")
+    }
+
+    fun clearGeminiApiKey() {
+        bulletinRepository.geminiSettings().clearApiKey()
+        radioBulletinState.value = radioBulletinState.value.copy(geminiConfigured = false)
+        showToast("Chave do Gemini removida.")
     }
 
     private fun loadRadioVoiceUiState(): RadioVoiceUiState =
@@ -650,7 +746,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             isTesting = false,
             isEnabled = isInstalled && radioPrefs.getBoolean(KEY_RADIO_VOICE_ENABLED, false),
             packageName = packageName,
-            engine = engine,
             femaleSpeaker = femaleSpeaker,
             maleSpeaker = maleSpeaker,
             detail = detail,
@@ -667,8 +762,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 error = null,
             )
         }
+        // Log.d/Log.e adicionados 02/09/2026: antes disso, uma falha em loadSongs() (ou uma
+        // consulta que devolvia a mesma contagem por metadado do MediaStore ainda pendente -
+        // duration/is_music NULL logo apos um scan em massa via `content call scan_volume`, que
+        // NAO extrai metadado como um scan por arquivo) ficava completamente silenciosa -
+        // onFailure so seta error, nunca loga a excecao.
         runCatching { repository.loadSongs(includeDeviceGenres = includeDeviceGenres) }
             .onSuccess { songs ->
+                Log.d("PailerLibrarySync", "scanLibrary sucesso: ${songs.size} faixas (antes: ${state.songs.size})")
                 repository.saveCachedSongs(songs)
                 applyLibrarySongs(
                     songs = songs,
@@ -678,6 +779,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             .onFailure { error ->
+                Log.e("PailerLibrarySync", "scanLibrary falhou", error)
                 libraryState.value = libraryState.value.copy(
                     isLoading = false,
                     hasLoaded = true,
@@ -1387,6 +1489,42 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
     }
 
+    // Remove um artista/album adicionado depois (botao "-" na tela da radio) - so afeta fontes
+    // extras, nunca a fonte original que criou a radio (ver MusicLibraryRepository.removeSourceFromCustomRadio).
+    fun removeArtistFromRadio(radio: LocalRadio, artist: LocalArtist): LocalRadio? {
+        val customId = radio.customId ?: return null
+        repository.removeSourceFromCustomRadio(customId, repository.sourceIdForArtist(artist))
+        rebuildLibraryContent()
+        showToast("${artist.name} removido de \"${radio.name}\".")
+        return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
+    }
+
+    fun removeAlbumFromRadio(radio: LocalRadio, album: LocalAlbum): LocalRadio? {
+        val customId = radio.customId ?: return null
+        repository.removeSourceFromCustomRadio(customId, repository.sourceIdForAlbum(album))
+        rebuildLibraryContent()
+        showToast("${album.title} removido de \"${radio.name}\".")
+        return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
+    }
+
+    // Lista as fontes extras (id prefixado "album:<id>"/"artist:<chave>", ver
+    // MusicLibraryRepository.sourceIdForAlbum/sourceIdForArtist) de uma radio personalizada, pra
+    // tela resolver nome/capa cruzando contra as listas artists/albums ja carregadas.
+    fun radioExtraSourceIds(radio: LocalRadio): List<String> {
+        val customId = radio.customId ?: return emptyList()
+        return repository.customRadioDefinitions().firstOrNull { it.id == customId }?.extraSourceIds.orEmpty()
+    }
+
+    // Renomeia radio personalizada (botao de lapis) - nao se aplica a radio criada de categoria
+    // (ver MusicLibraryRepository.renameCustomRadio, que recusa sourceType "genre" devolvendo null).
+    fun renameRadio(radio: LocalRadio, newName: String): LocalRadio? {
+        val customId = radio.customId ?: return null
+        repository.renameCustomRadio(customId, newName) ?: return null
+        rebuildLibraryContent()
+        showToast("Radio renomeada.")
+        return repository.radiosFrom(libraryState.value.songs).firstOrNull { it.customId == customId }
+    }
+
     // Radios de perfil/genero (Grunge, Anos 2000, Jazz etc.) nao tem definicao persistida pra
     // apagar - sao recalculadas da biblioteca toda vez. "Apagar" aqui so tira da lista (ver
     // MusicLibraryRepository.hideRadio); a vinheta por genero continua chaveada pelo nome
@@ -1542,13 +1680,17 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun startRadioNewsMode(radioName: String) {
         setupTextToSpeech(getApplication())
-        val settings = radioBulletinState.value.settings
-        radioNewsEnabled = settings.mode != RadioBulletinMode.Off
+        radioNewsEnabled = true
         completedRadioSongs = 0
-        newsBulletins = emptyList()
-        nextBulletinIndex = 0
-        clearPreparedBulletin()
+        // NAO limpa newsBulletins/coreBuffer (Nivel 1, ver PreparedNewsCore) nem reseta
+        // nextBulletinIndex - o pre-aquecimento (prewarmCoreBuffer, roda desde a abertura do
+        // app) e radio-agnostico de proposito (pedido do usuario 03/09/2026: "posso entrar em
+        // qualquer radio e ainda assim o boletim funcionar"), entao o trabalho pesado ja feito
+        // (RSS + redator local) sobrevive a troca de radio. So bulletinBuffer (Nivel 2, com
+        // audio especifico dessa rádio - nome dela entra na fala 6) e limpo abaixo.
+        clearBulletinBuffer()
         speakingNews = false
+        newsBreakEnding = false
         currentNewsHeadline = ""
         resumeAfterNews = false
         currentRadioTrack = controller?.currentMediaItem?.toRadioLastPlayedTrack()
@@ -1557,25 +1699,42 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         playbackSource = "Rádio $radioName"
 
         viewModelScope.launch {
-            newsBulletins = runCatching {
-                bulletinRepository.loadScripts(settings, radioName)
-            }.getOrDefault(emptyList())
+            ensureNewsBulletinsLoaded()
+            // Carga inicial terminou (ou ja tinha sido feita pelo pre-aquecimento) - comeca a
+            // encher o buffer de boletins prontos (3 por padrao, ver ADR-019) em segundo plano,
+            // sem esperar a primeira musica acabar. refillBulletinBuffer() reaproveita o que o
+            // coreBuffer ja tiver pronto.
+            refillBulletinBuffer()
         }
     }
 
+    // Carrega newsBulletins (historias RSS convertidas em roteiro base) se ainda nao tiver -
+    // usado tanto pelo pre-aquecimento (prewarmCoreBuffer, sem radio nenhuma) quanto por
+    // startRadioNewsMode (reaproveita se o pre-aquecimento ja carregou). radioName so entra no
+    // contexto por compatibilidade de assinatura - loadScripts()/buildDialogueLines() no modo
+    // Dialogue (unico usado hoje) nunca colocam nome de radio na fala em si.
+    private suspend fun ensureNewsBulletinsLoaded(radioName: String = "") {
+        if (newsBulletins.isNotEmpty()) return
+        val settings = radioBulletinState.value.settings
+        newsBulletins = runCatching {
+            bulletinRepository.loadScripts(settings, radioName)
+        }.getOrDefault(emptyList())
+    }
+
     private fun reloadNewsBulletinsIfNeeded() {
-        if (bulletinReloadInFlight || !radioNewsEnabled) return
-        val radioName = activeRadioName
-        if (radioName.isBlank()) return
+        if (bulletinReloadInFlight) return
         bulletinReloadInFlight = true
         val settings = radioBulletinState.value.settings
+        val radioName = activeRadioName
         viewModelScope.launch {
             val reloaded = runCatching {
                 bulletinRepository.loadScripts(settings, radioName)
             }.getOrDefault(emptyList())
-            if (reloaded.isNotEmpty() && activeRadioName == radioName) {
+            if (reloaded.isNotEmpty()) {
                 newsBulletins = reloaded
                 Log.d(TAG_RADIO_VOICE, "boletim: recarga recuperou ${reloaded.size} historias")
+                prewarmCoreBuffer()
+                if (radioNewsEnabled) refillBulletinBuffer()
             }
             bulletinReloadInFlight = false
         }
@@ -1584,9 +1743,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun stopRadioNewsMode() {
         radioNewsEnabled = false
         completedRadioSongs = 0
-        nextBulletinIndex = 0
-        clearPreparedBulletin()
+        // coreBuffer/corePrepJob (Nivel 1) NAO param aqui - continuam pre-aquecendo mesmo sem
+        // radio tocando (pedido do usuario 03/09/2026), so bulletinBuffer (Nivel 2) e encerrado.
+        clearBulletinBuffer()
         speakingNews = false
+        newsBreakEnding = false
         currentNewsHeadline = ""
         resumeAfterNews = false
         currentRadioTrack = null
@@ -1622,7 +1783,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun playVinhetaResource(resId: Int, onFinished: () -> Unit) {
+    private fun playVinhetaResource(resId: Int, volume: Float = 1.0f, onFinished: () -> Unit) {
         announcementPlayer?.release()
         announcementPlayer = null
         val player = runCatching {
@@ -1633,6 +1794,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             onFinished()
             return
         }
+        player.setVolume(volume, volume)
         player.setOnCompletionListener {
             it.release()
             if (announcementPlayer === it) announcementPlayer = null
@@ -1651,99 +1813,543 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
-    private fun prepareUpcomingBulletin(lastPlayedTrack: RadioLastPlayedTrack? = currentRadioTrack) {
-        if (newsBulletins.isEmpty()) {
+    // Mantem bulletinBuffer com BULLETIN_BUFFER_TARGET itens prontos (roteiro decorado + WAV
+    // sintetizado, se a voz local estiver ativa) - ver ADR-019. Um item de cada vez, nunca dois
+    // engines de voz carregados ao mesmo tempo (mesma cautela de TTS.md/ADR-003). Chamada nao
+    // bloqueia: se ja tem um preparo rodando (bulletinPrepJob ativo) ou o buffer ja esta cheio,
+    // e um no-op - seguro chamar de qualquer lugar (transicao de faixa, fim de boletim, reload
+    // de feed).
+    private fun refillBulletinBuffer() {
+        if (!radioNewsEnabled) return
+        if (bulletinPrepPaused) return
+        if (bulletinPrepJob?.isActive == true) return
+        if (bulletinBuffer.size >= BULLETIN_BUFFER_TARGET) return
+        if (coreBuffer.isEmpty() && newsBulletins.isEmpty()) {
             reloadNewsBulletinsIfNeeded()
             return
         }
-        if (bulletinPrepJob?.isActive == true) return
-        val index = nextBulletinIndex % newsBulletins.size
-        val baseScript = newsBulletins[index]
-        val settings = radioBulletinState.value.settings
         val radioName = activeRadioName
         bulletinPrepJob = viewModelScope.launch {
-            Log.d(
-                TAG_RADIO_VOICE,
-                "boletim: preparando index=$index redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
-            )
-            val script = bulletinRepository
-                .enhanceScript(baseScript, settings, radioName)
-                .withLastPlayedIntro(lastPlayedTrack)
-            preparedBulletinScript = script
-            preparedBulletinIndex = index
-            Log.d(TAG_RADIO_VOICE, "boletim: roteiro preparado index=$index fonte=${script.source}")
-            if (!radioVoiceState.value.isEnabled) {
-                return@launch
+            try {
+                while (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && radioNewsEnabled &&
+                    activeRadioName == radioName && !bulletinPrepPaused
+                ) {
+                    if (coreBuffer.isEmpty() && newsBulletins.isEmpty()) {
+                        reloadNewsBulletinsIfNeeded()
+                        break
+                    }
+                    val bufferPositionBeforeThisItem = bulletinBuffer.size
+                    syncBulletinBufferState(
+                        isPreparing = true,
+                        statusMessage = "Preparando boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...",
+                    )
+                    // Catch-all defensivo: nada aqui deveria lancar sem ja logar (enhanceScript
+                    // encapsula o redator local em runCatching, requestLocalVoiceSynthesis
+                    // encapsula a chamada ao servico de voz), mas se algo inesperado escapar
+                    // mesmo assim, melhor logar com stacktrace completo e parar essa rodada de
+                    // preparo do que deixar a excecao subir e derrubar o job silenciosamente -
+                    // pedido do usuario (03/09/2026): "pra caso algo der erro a gente saiba o
+                    // que". CancellationException segue pro finally normalmente (nao e erro).
+                    try {
+                        val settings = radioBulletinState.value.settings
+                        val interval = settings.songsBetweenBulletins.coerceAtLeast(1)
+
+                        // Previsao de qual musica "acaba de tocar" (intro) e qual "vem a seguir"
+                        // (fechamento filosofico) quando ESSE item do buffer realmente for ao ar -
+                        // calculada andando na fila fixa da sessao pelo numero de musicas que ainda
+                        // faltam ate a posicao dele (1 intervalo por item de buffer a frente). So fica
+                        // imprecisa se o usuario pular musica manualmente entre o preparo e a hora de
+                        // tocar - degrada pra frase generica sem citar artista (ver
+                        // buildFranCloser), nunca quebra o boletim (ver ADR-019).
+                        val player = controller
+                        val songsUntilFire = run {
+                            val remainder = completedRadioSongs % interval
+                            val toNextBoundary = if (remainder == 0) interval else interval - remainder
+                            toNextBoundary + bufferPositionBeforeThisItem * interval
+                        }
+                        val lastPlayedTrack = player?.let { p ->
+                            val idx = p.currentMediaItemIndex + songsUntilFire - 1
+                            if (idx in 0 until p.mediaItemCount) p.getMediaItemAt(idx).toRadioLastPlayedTrack() else null
+                        }
+                        val upcomingTrack = player?.let { p ->
+                            val idx = p.currentMediaItemIndex + songsUntilFire
+                            if (idx in 0 until p.mediaItemCount) p.getMediaItemAt(idx).toUpcomingTrack() else null
+                        }
+
+                        // Nucleo pre-aquecido (Nivel 1, prewarmCoreBuffer) primeiro - so cai pra
+                        // gerar do zero (rede de seguranca) se o pre-aquecimento nao alcancou a
+                        // tempo. Ver PreparedNewsCore/spliceEdges.
+                        val core = coreBuffer.removeFirstOrNull()
+                        val script: RadioScript
+                        val file: File?
+                        if (core != null) {
+                            Log.d(TAG_RADIO_VOICE, "boletim: usando nucleo pre-aquecido (restam ${coreBuffer.size} no nucleo)")
+                            script = core.script.withLastPlayedIntro(lastPlayedTrack).withPhilosophicalCloser(radioName, upcomingTrack)
+                            file = if (radioVoiceState.value.isEnabled) {
+                                if (core.coreFile != null && core.script.lines.size == 6) {
+                                    syncBulletinBufferState(statusMessage = "Encaixando abertura/fechamento do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
+                                    val spliced = voiceSynthesisMutex.withLock {
+                                        requestSpliceSynthesis(
+                                            core.coreFile, script.lines.first(), script.lines.last(), BULLETIN_PREP_TIMEOUT_MS,
+                                            onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                            onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                        )
+                                    }
+                                    spliced ?: run {
+                                        Log.w(TAG_RADIO_VOICE, "boletim: encaixe falhou; sintetizando boletim inteiro como rede de seguranca")
+                                        voiceSynthesisMutex.withLock {
+                                            synthesizeLocalVoiceSafely(
+                                                script, BULLETIN_PREP_TIMEOUT_MS,
+                                                onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                                onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
+                                    voiceSynthesisMutex.withLock {
+                                        synthesizeLocalVoiceSafely(
+                                            script, BULLETIN_PREP_TIMEOUT_MS,
+                                            onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                            onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                        )
+                                    }
+                                }
+                            } else {
+                                null
+                            }
+                            // core.coreFile ja foi lido (splice/synthesize acima) e o item ja saiu
+                            // do coreBuffer - regrava o manifest agora, que tambem varre e apaga
+                            // esse .wav do nucleo (nao referenciado por nenhum item restante).
+                            saveCoreBufferManifest()
+                            // Repoe o nucleo consumido, em paralelo (nao espera terminar).
+                            prewarmCoreBuffer()
+                        } else {
+                            val index = nextBulletinIndex % newsBulletins.size
+                            val baseScript = newsBulletins[index]
+                            nextBulletinIndex += 1
+                            Log.d(
+                                TAG_RADIO_VOICE,
+                                "boletim: preparando do zero (nucleo vazio) index=$index posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
+                            )
+                            val enhanced = llmGenerationMutex.withLock {
+                                bulletinRepository.enhanceScript(
+                                    baseScript, settings, radioName, lastPlayedTrack, upcomingTrack,
+                                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                    onProgressPercent = { percent ->
+                                        syncBulletinBufferState(statusMessage = radioBulletinBufferState.value.statusMessage, progressPercent = percent)
+                                    },
+                                )
+                            }
+                            script = enhanced.withLastPlayedIntro(lastPlayedTrack).withPhilosophicalCloser(radioName, upcomingTrack)
+                            file = if (radioVoiceState.value.isEnabled) {
+                                syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
+                                voiceSynthesisMutex.withLock {
+                                    synthesizeLocalVoiceSafely(
+                                        script, BULLETIN_PREP_TIMEOUT_MS,
+                                        onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                        onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                    )
+                                }
+                            } else {
+                                null
+                            }
+                        }
+                        if (!radioNewsEnabled || activeRadioName != radioName) {
+                            file?.delete()
+                            break
+                        }
+                        if (file == null) {
+                            Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio; buffer guarda so o roteiro")
+                        }
+                        bulletinBuffer.addLast(PreparedBulletin(script, file))
+                        Log.d(TAG_RADIO_VOICE, "boletim: buffer agora com ${bulletinBuffer.size}/$BULLETIN_BUFFER_TARGET (audio=${file != null})")
+                        syncBulletinBufferState(isPreparing = false, statusMessage = null)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Log.e(TAG_RADIO_VOICE, "boletim: erro inesperado preparando item $bufferPositionBeforeThisItem do buffer", e)
+                        syncBulletinBufferState(
+                            isPreparing = false,
+                            statusMessage = "Erro ao preparar boletim: ${e.message ?: e::class.simpleName} (ver logcat, tag $TAG_RADIO_VOICE).",
+                        )
+                        break
+                    }
+                }
+            } finally {
+                // Roda tambem em cancelamento (pauseBulletinPreparation/resetBulletinBuffer) -
+                // garante que a UI nunca fique presa mostrando "escrevendo" depois que o job
+                // parou. Cancelamento de coroutine e cooperativo: se o preparo estiver travado
+                // numa chamada nativa bloqueante (JNI do redator local/voz), o cancel() so
+                // encerra o job assim que essa chamada devolver o controle - risco ja conhecido
+                // de falta de isolamento de processo do redator local (ver ADR-002).
+                syncBulletinBufferState(isPreparing = false, statusMessage = null)
             }
-            val file = synthesizeLocalVoiceSafely(script, BULLETIN_PREP_TIMEOUT_MS)
-            if (file != null) {
-                preparedBulletinFile = file
-                Log.d(TAG_RADIO_VOICE, "boletim: audio preparado index=$index bytes=${file.length()}")
-            } else {
-                Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio index=$index; TTS Android sera fallback")
+        }
+        syncBulletinBufferState(isPreparing = true)
+    }
+
+    private fun clearBulletinBuffer() {
+        bulletinPrepJob?.cancel()
+        bulletinPrepJob = null
+        bulletinBuffer.forEach { it.file?.delete() }
+        bulletinBuffer.clear()
+        syncBulletinBufferState(isPreparing = false, statusMessage = null)
+    }
+
+    // Nivel 1: enche coreBuffer com "nucleos" (falas 2-5, radio/faixa-agnosticas, ver
+    // PreparedNewsCore) mesmo sem radio nenhuma tocando - pedido do usuario (03/09/2026): "todos
+    // os dias, ele tem que fazer esse buffer mesmo sem eu tocar na radio". Chamada nao bloqueia,
+    // e um no-op se ja tem um preparo rodando ou o buffer ja esta cheio - seguro chamar de
+    // qualquer lugar (init do app, recarga de feed, consumo de um nucleo por
+    // refillBulletinBuffer).
+    private fun prewarmCoreBuffer() {
+        if (bulletinPrepPaused) return
+        if (corePrepJob?.isActive == true) return
+        if (coreBuffer.size >= BULLETIN_BUFFER_TARGET) return
+        corePrepJob = viewModelScope.launch {
+            try {
+                if (newsBulletins.isEmpty()) ensureNewsBulletinsLoaded()
+                while (coreBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused) {
+                    if (newsBulletins.isEmpty()) {
+                        // RSS falhou ou ainda nao carregou - nada pra preparar agora; desiste
+                        // sem erro (reloadNewsBulletinsIfNeeded/prewarmCoreBuffer tentam de novo
+                        // no proximo gatilho).
+                        break
+                    }
+                    try {
+                        val settings = radioBulletinState.value.settings
+                        val index = nextBulletinIndex % newsBulletins.size
+                        val baseScript = newsBulletins[index]
+                        nextBulletinIndex += 1
+                        syncCoreBufferStatus("Preparando núcleo do boletim (sem rádio ativa)...")
+                        Log.d(TAG_RADIO_VOICE, "nucleo: preparando index=$index redator=${settings.preferLocalWriter}")
+                        var usedGemini = false
+                        val enhanced = llmGenerationMutex.withLock {
+                            bulletinRepository.enhanceScript(
+                                baseScript, settings, radioName = "", lastPlayedTrack = null, upcomingTrack = null,
+                                onProgress = { message -> syncCoreBufferStatus(message) },
+                                onProgressPercent = { percent -> syncCoreBufferStatus(radioBulletinBufferState.value.statusMessage, percent) },
+                                onWriterUsed = { usedGemini = it },
+                            )
+                        }
+                        // So cacheia audio do "miolo" quando o roteiro saiu com as 6 falas
+                        // esperadas (redator local completo) - com menos falas (fallback
+                        // deterministico ou LLM que nao emplacou) nao ha separacao clara entre
+                        // "pontas" e "nucleo" pra encaixar depois, refillBulletinBuffer sintetiza
+                        // esse item inteiro na hora, igual sempre foi.
+                        val coreFile = if (enhanced.lines.size == 6 && radioVoiceState.value.isEnabled) {
+                            syncCoreBufferStatus("Sintetizando núcleo do boletim...")
+                            voiceSynthesisMutex.withLock {
+                                requestCoreSynthesis(
+                                    enhanced.lines.subList(1, 5), BULLETIN_PREP_TIMEOUT_MS,
+                                    onProgress = { message -> syncCoreBufferStatus(message) },
+                                    onProgressPercent = { percent -> syncCoreBufferStatus(radioBulletinBufferState.value.statusMessage, percent) },
+                                )
+                            }
+                        } else {
+                            null
+                        }
+                        // So pra previa manual (introFile, ver PreparedNewsCore) - fala 1 sozinha,
+                        // ja generica porque foi gerada sem faixa real (lastPlayedTrack=null acima).
+                        // Reaproveita o mesmo requestCoreSynthesis com 1 linha so, sem precisar de
+                        // nenhum caminho novo no servico de voz.
+                        val introFile = if (coreFile != null) {
+                            syncCoreBufferStatus("Sintetizando abertura da prévia...")
+                            voiceSynthesisMutex.withLock {
+                                requestCoreSynthesis(
+                                    listOf(enhanced.lines.first()), BULLETIN_PREP_TIMEOUT_MS,
+                                    onProgress = { message -> syncCoreBufferStatus(message) },
+                                    onProgressPercent = { percent -> syncCoreBufferStatus(radioBulletinBufferState.value.statusMessage, percent) },
+                                )
+                            }
+                        } else {
+                            null
+                        }
+                        coreBuffer.addLast(PreparedNewsCore(enhanced, coreFile, introFile))
+                        saveCoreBufferManifest()
+                        Log.d(TAG_RADIO_VOICE, "nucleo: buffer agora com ${coreBuffer.size}/$BULLETIN_BUFFER_TARGET (core=${coreFile != null}, falas=${enhanced.lines.size})")
+                        syncCoreBufferStatus(null)
+                        // Cooldown termico entre boletins consecutivos (pedido do usuario 03/09/2026,
+                        // junto de subir threads pro maximo do aparelho/8): sessoes de geracao seguida
+                        // mostraram o prefill do redator degradando de 7.3 pra 5.6 tok/s ao longo do
+                        // dia (throttling termico, ja visto tambem na sintese de voz - 2t=410s/
+                        // 4t=496s). Da um respiro pro SoC esfriar antes de emendar a proxima geracao
+                        // pesada. So espera se ainda falta preparar mais item (senao fica parado 3min
+                        // a toa depois do ultimo, sem nada que va se beneficiar do respiro).
+                        // Pulado quando o Gemini escreveu essa (usedGemini) - pedido do usuario
+                        // (04/09/2026): a escrita saiu da nuvem, so sobra a sintese de voz local
+                        // sozinha (bem mais leve que LLM local + sintese juntos, a causa original
+                        // do cooldown). Continua normal se caiu pro redator local Qwen3 (sem chave
+                        // configurada, ou Gemini falhou nessa hora) - ver ADR-021.
+                        if (coreBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !usedGemini) {
+                            val cooldownStart = System.currentTimeMillis()
+                            while (System.currentTimeMillis() - cooldownStart < COOLDOWN_BETWEEN_BULLETINS_MS && !bulletinPrepPaused) {
+                                val remainingS = ((COOLDOWN_BETWEEN_BULLETINS_MS - (System.currentTimeMillis() - cooldownStart)) / 1000)
+                                    .coerceAtLeast(0)
+                                syncCoreBufferStatus("Aguardando o aparelho esfriar antes do próximo boletim... ${remainingS}s")
+                                delay(COOLDOWN_STATUS_TICK_MS)
+                            }
+                            syncCoreBufferStatus(null)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Log.e(TAG_RADIO_VOICE, "nucleo: erro inesperado preparando core", e)
+                        syncCoreBufferStatus("Erro ao preparar núcleo: ${e.message ?: e::class.simpleName} (ver logcat, tag $TAG_RADIO_VOICE).")
+                        break
+                    }
+                }
+            } finally {
+                syncCoreBufferStatus(null)
             }
         }
     }
 
-    private fun clearPreparedBulletin() {
+    // So atualiza o texto/pulso de status quando o Nivel 2 (bulletinBuffer/refillBulletinBuffer)
+    // nao estiver com uma mensagem propria em andamento - evita o preparo de fundo do nucleo
+    // sobrescrever o progresso "de verdade" (pronto pra tocar) que o usuario esta acompanhando.
+    // isPreparing=true enquanto tiver mensagem (pedido do usuario 03/09/2026: a bolinha nao
+    // piscava durante o pre-aquecimento porque so o Nivel 2 ligava essa flag antes) - a bolinha
+    // pisca na mesma posicao de sempre (proximo slot vazio do bulletinBuffer) mesmo sendo
+    // trabalho do Nivel 1, so pra dar sinal de vida visual; nao muda o que fica tocavel.
+    // Guarda contra bulletinPrepJob (job do Nivel 2), NAO contra radioBulletinBufferState.isPreparing
+    // - essa flag e a MESMA que esta funcao liga no proprio primeiro sucesso, entao guardar contra
+    // ela travava a si mesma: a 1a mensagem passava, ligava isPreparing=true, e da em diante TODA
+    // atualizacao seguinte do Nivel 1 (inclusive o percentual por token e o syncCoreBufferStatus(null)
+    // final) era descartada ate o Nivel 2 desligar a flag por fora - achado 03/09/2026 implementando
+    // o percentual real do redator local, que dependia de chamadas repetidas chegarem na UI.
+    private fun syncCoreBufferStatus(message: String?, percent: Int? = null) {
+        if (bulletinPrepJob?.isActive == true) return
+        syncBulletinBufferState(isPreparing = message != null, statusMessage = message, progressPercent = percent)
+    }
+
+    private fun clearCoreBuffer() {
+        corePrepJob?.cancel()
+        corePrepJob = null
+        coreBuffer.forEach { it.coreFile?.delete() }
+        coreBuffer.clear()
+        saveCoreBufferManifest()
+    }
+
+    // Pasta privada do app em filesDir (NAO cacheDir) - sobrevive a "limpar cache" e a
+    // reinicio/morte do processo, so some se o usuario fizer "Limpar dados" do app. Sem
+    // permissao nenhuma envolvida (filesDir e sempre privado ao proprio app). Mesmo nome que
+    // LocalRadioVoiceEngine usa pra escrever os .wav do nucleo (CORE_BUFFER_DIR_NAME).
+    private val coreBufferDir: File
+        get() = getApplication<Application>().filesDir
+            .resolve(LocalRadioVoiceEngine.CORE_BUFFER_DIR_NAME).apply { mkdirs() }
+
+    // Grava o estado atual do coreBuffer (Nivel 1) em disco - pedido do usuario (03/09/2026):
+    // boletins ja escritos nao podiam sumir so porque o app reiniciou ou o Android limpou o
+    // cache. So o Nivel 1 e persistido (nao o Nivel 2/bulletinBuffer): esse e especifico da radio
+    // ativa e sempre limpo em startRadioNewsMode, entao nao sobreviveria a proxima sessao mesmo
+    // se fosse salvo. Tambem varre a pasta e apaga .wav que sobrou de item ja consumido/removido
+    // do coreBuffer (evita acumular lixo) - chamar sempre que coreBuffer mudar de conteudo.
+    private fun saveCoreBufferManifest() {
+        runCatching {
+            val array = JSONArray()
+            coreBuffer.forEach { item ->
+                array.put(
+                    JSONObject().apply {
+                        put("title", item.script.story.title)
+                        put("source", item.script.story.source)
+                        put("summary", item.script.story.summary)
+                        put("scriptSource", item.script.source.name)
+                        put("duration", item.script.duration.name)
+                        put("hasTrackContext", item.script.hasTrackContext)
+                        put(
+                            "lines",
+                            JSONArray().apply {
+                                item.script.lines.forEach { line ->
+                                    put(
+                                        JSONObject().apply {
+                                            put("speaker", line.speaker.name)
+                                            put("text", line.text)
+                                        },
+                                    )
+                                }
+                            },
+                        )
+                        put("coreFile", item.coreFile?.name)
+                        put("introFile", item.introFile?.name)
+                    },
+                )
+            }
+            coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE).writeText(array.toString())
+            val referenced = (coreBuffer.mapNotNull { it.coreFile?.name } + coreBuffer.mapNotNull { it.introFile?.name }).toSet()
+            coreBufferDir.listFiles { file -> file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced }
+                ?.forEach { it.delete() }
+        }.onFailure { Log.w(TAG_RADIO_VOICE, "nucleo: falha ao salvar manifest do buffer em disco", it) }
+    }
+
+    // Le o manifest salvo (se existir) e repopula coreBuffer - chamado uma vez na abertura do
+    // app, antes do primeiro prewarmCoreBuffer(). Descarta silenciosamente qualquer entrada cujo
+    // .wav nao exista mais em disco (sobrevive a "Limpar dados" parcial/corrupcao) em vez de
+    // travar a restauracao inteira.
+    private fun loadCoreBufferManifest() {
+        runCatching {
+            val manifestFile = coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE)
+            if (!manifestFile.exists()) return
+            val array = JSONArray(manifestFile.readText())
+            val restored = (0 until array.length()).mapNotNull { index ->
+                runCatching {
+                    val json = array.getJSONObject(index)
+                    val story = com.pailer.localtune.data.NewsStory(
+                        title = json.getString("title"),
+                        source = json.getString("source"),
+                        summary = json.optString("summary"),
+                    )
+                    val linesJson = json.getJSONArray("lines")
+                    val lines = (0 until linesJson.length()).map { lineIndex ->
+                        val lineJson = linesJson.getJSONObject(lineIndex)
+                        RadioScriptLine(
+                            speaker = RadioSpeaker.valueOf(lineJson.getString("speaker")),
+                            text = lineJson.getString("text"),
+                        )
+                    }
+                    val script = RadioScript(
+                        story = story,
+                        lines = lines,
+                        source = RadioScriptSource.valueOf(json.getString("scriptSource")),
+                        duration = com.pailer.localtune.data.RadioBulletinDuration.valueOf(json.getString("duration")),
+                        hasTrackContext = json.optBoolean("hasTrackContext", false),
+                    )
+                    val coreFile = json.optString("coreFile").takeIf { it.isNotBlank() }
+                        ?.let { coreBufferDir.resolve(it) }
+                        ?.takeIf { it.exists() }
+                    val introFile = json.optString("introFile").takeIf { it.isNotBlank() }
+                        ?.let { coreBufferDir.resolve(it) }
+                        ?.takeIf { it.exists() }
+                    PreparedNewsCore(script, coreFile, introFile)
+                }.getOrNull()
+            }
+            coreBuffer.clear()
+            coreBuffer.addAll(restored)
+            Log.d(TAG_RADIO_VOICE, "nucleo: restaurados ${restored.size}/${array.length()} boletins do disco")
+        }.onFailure { Log.w(TAG_RADIO_VOICE, "nucleo: falha ao restaurar buffer do disco", it) }
+    }
+
+    private fun syncBulletinBufferState(
+        isPreparing: Boolean = radioBulletinBufferState.value.isPreparing,
+        statusMessage: String? = radioBulletinBufferState.value.statusMessage,
+        // Some sozinho quando a mensagem some junto (nova etapa/fim) - assim quem so passa
+        // statusMessage=null pra "limpar" nao deixa um percentual velho grudado na tela.
+        progressPercent: Int? = if (statusMessage == null) null else radioBulletinBufferState.value.progressPercent,
+    ) {
+        radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
+            // Sem radio tocando o Nivel 2 (bulletinBuffer) nunca enche - cai pro Nivel 1
+            // (coreBuffer) pras bolinhas refletirem o preparo automatico de verdade, em vez de
+            // ficar preso em 0/3 (achado 03/09/2026 junto do botao de reproduzir por posicao).
+            readyCount = if (bulletinBuffer.isNotEmpty()) bulletinBuffer.size else coreBuffer.size,
+            isPreparing = isPreparing,
+            isPaused = bulletinPrepPaused,
+            statusMessage = statusMessage,
+            progressPercent = progressPercent,
+            // true quando o readyCount acima veio do Nivel 1 (nucleo, sem radio tocando) em vez
+            // do Nivel 2 - usado so pra rotular o botao/bolinhas como "previa" (ver
+            // RadioBulletinBufferStatusCard); cada bolinha checa seu proprio audio na hora de
+            // tocar (playReadyBufferedBulletin(index)), nao precisa de lista pre-calculada aqui.
+            hasCorePreview = bulletinBuffer.isEmpty() && coreBuffer.isNotEmpty(),
+            hasPlayableAudio = bulletinBuffer.any { it.file != null } || coreBuffer.any { it.coreFile != null },
+        )
+    }
+
+    // Pausa o preparo em segundo plano (pedido do usuario 03/09/2026): cancela o job em
+    // andamento (ver ressalva de cancelamento cooperativo no finally de refillBulletinBuffer) e
+    // bloqueia refillBulletinBuffer() de comecar outro ate resumeBulletinPreparation() ser
+    // chamado - o buffer ja pronto continua disponivel, so para de crescer/repor.
+    fun pauseBulletinPreparation() {
+        if (bulletinPrepPaused) return
+        bulletinPrepPaused = true
         bulletinPrepJob?.cancel()
         bulletinPrepJob = null
-        preparedBulletinFile?.delete()
-        preparedBulletinScript = null
-        preparedBulletinFile = null
-        preparedBulletinIndex = -1
+        // Nivel 1 (nucleo) pausa junto - um botao so pro usuario, cobrindo os dois niveis do
+        // pipeline (ver PreparedNewsCore).
+        corePrepJob?.cancel()
+        corePrepJob = null
+        syncBulletinBufferState(isPreparing = false, statusMessage = null)
+    }
+
+    fun resumeBulletinPreparation() {
+        if (!bulletinPrepPaused) return
+        bulletinPrepPaused = false
+        syncBulletinBufferState()
+        prewarmCoreBuffer()
+        if (radioNewsEnabled) refillBulletinBuffer()
+    }
+
+    // Apaga tudo que ja estava pronto nos dois niveis (nucleo + boletins prontos pra tocar) e
+    // comeca de novo do zero (pedido do usuario 03/09/2026) - se estiver pausado, so limpa e
+    // fica vazio ate o usuario retomar.
+    fun resetBulletinBuffer() {
+        clearBulletinBuffer()
+        clearCoreBuffer()
+        if (!bulletinPrepPaused) {
+            prewarmCoreBuffer()
+            if (radioNewsEnabled) refillBulletinBuffer()
+        }
     }
 
     private fun speakNextNewsBreak(lastPlayedTrack: RadioLastPlayedTrack? = currentRadioTrack) {
         if (!ttsReady || speakingNews) return
-        if (newsBulletins.isEmpty()) {
-            // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed fora do
-            // ar - ver NewsBulletinRepository.loadStories, falha e ignorada silenciosamente por
-            // feed) e a lista ficava vazia pro resto da sessao, sem log e sem nova tentativa -
-            // o boletim simplesmente nunca mais tocava. Loga pra dar pra diagnosticar e tenta
-            // recarregar em segundo plano; essa chamada so desiste dessa vez.
-            Log.w(TAG_RADIO_VOICE, "boletim: newsBulletins vazio no intervalo - tentando recarregar")
-            reloadNewsBulletinsIfNeeded()
-            return
-        }
         val player = controller ?: return
-        val bulletinIndex = nextBulletinIndex % newsBulletins.size
-        val baseBulletin = newsBulletins[bulletinIndex]
-        nextBulletinIndex += 1
-        val readyFile = preparedBulletinFile.takeIf { preparedBulletinIndex == bulletinIndex && it?.exists() == true }
-        val readyScript = preparedBulletinScript.takeIf { preparedBulletinIndex == bulletinIndex }
-        if (preparedBulletinFile != null && readyFile == null) preparedBulletinFile?.delete()
-        bulletinPrepJob?.cancel()
-        bulletinPrepJob = null
-        preparedBulletinScript = null
-        preparedBulletinFile = null
-        preparedBulletinIndex = -1
+        val prepared = bulletinBuffer.removeFirstOrNull()
+        // Consumiu um item (ou tentou e o buffer estava vazio) - manda reabastecer ja, em
+        // paralelo com a fala que vai comecar agora (ver ADR-019: buffer sempre com
+        // BULLETIN_BUFFER_TARGET itens prontos, reposto assim que um sai).
+        refillBulletinBuffer()
+
+        val bulletin: RadioScript
+        val readyFile: File?
+        if (prepared != null) {
+            bulletin = prepared.script
+            readyFile = prepared.file?.takeIf { it.exists() }
+            Log.d(TAG_RADIO_VOICE, "boletim: consumindo do buffer (audio=${readyFile != null}, restam ${bulletinBuffer.size})")
+        } else {
+            if (newsBulletins.isEmpty()) {
+                // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed
+                // fora do ar - ver NewsBulletinRepository.loadStories, falha e ignorada
+                // silenciosamente por feed) e a lista ficava vazia pro resto da sessao, sem log e
+                // sem nova tentativa - o boletim simplesmente nunca mais tocava. Loga pra dar pra
+                // diagnosticar; reloadNewsBulletinsIfNeeded ja tenta de novo em segundo plano.
+                Log.w(TAG_RADIO_VOICE, "boletim: buffer e newsBulletins vazios - tentando recarregar")
+                reloadNewsBulletinsIfNeeded()
+                return
+            }
+            // Buffer vazio (sessao acabou de comecar, feed ainda carregando, ou consumo mais
+            // rapido do que o preparo consegue acompanhar) - monta um boletim ao vivo com o
+            // contexto real de agora (sem enhanceScript/redator local, que e lento demais pra
+            // essa emergencia; so o fallback determinístico + decoracao).
+            Log.w(TAG_RADIO_VOICE, "boletim: buffer vazio; montando boletim ao vivo")
+            val index = nextBulletinIndex % newsBulletins.size
+            val baseBulletin = newsBulletins[index]
+            nextBulletinIndex += 1
+            val upcomingTrack = player.currentMediaItem?.toUpcomingTrack()
+            bulletin = baseBulletin
+                .withLastPlayedIntro(lastPlayedTrack)
+                .withPhilosophicalCloser(activeRadioName, upcomingTrack)
+            readyFile = null
+        }
+
         speakingNews = true
-        currentNewsHeadline = baseBulletin.displayText
+        currentNewsHeadline = bulletin.displayText
         controller?.let { updatePlayerState(it) }
         resumeAfterNews = player.isPlaying
         if (resumeAfterNews) player.pause()
 
-        if (readyFile != null) {
-            currentNewsHeadline = baseBulletin.displayText
-            Log.d(TAG_RADIO_VOICE, "boletim: tocando audio preparado index=$bulletinIndex")
-            playAnnouncementFile(readyFile) { finishNewsBreak() }
-            armAnnouncementWatchdog()
-            return
-        }
-
-        viewModelScope.launch {
-            val bulletin = if (readyScript != null) {
-                Log.d(TAG_RADIO_VOICE, "boletim: usando roteiro preparado index=$bulletinIndex")
-                readyScript
-            } else {
-                Log.w(
-                    TAG_RADIO_VOICE,
-                    "boletim: roteiro preparado nao estava pronto index=$bulletinIndex; usando base imediato",
-                )
-                baseBulletin.withLastPlayedIntro(lastPlayedTrack)
+        // Ponte curta antes do boletim (musica > passagem > boletim) - alterna entre as duas
+        // faixas, ver playPassagem(). Cobre os dois caminhos abaixo (audio pronto e fallback
+        // TTS Android) porque entra antes da bifurcacao.
+        playPassagem {
+            if (!speakingNews) return@playPassagem
+            if (readyFile != null) {
+                Log.d(TAG_RADIO_VOICE, "boletim: tocando audio do buffer")
+                playAnnouncementFile(readyFile) { finishNewsBreak() }
+                armAnnouncementWatchdog()
+                return@playPassagem
             }
-            if (!speakingNews || !radioNewsEnabled) return@launch
+
             Log.d(TAG_RADIO_VOICE, "boletim: sem audio pronto; usando TTS Android imediato")
             val tts = textToSpeech
             val accepted = if (tts != null && ttsReady) {
@@ -1761,6 +2367,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 armAnnouncementWatchdog()
             }
         }
+    }
+
+    // Passagem curta entre musica e boletim (e vice-versa) - roda em sequencia pelas faixas
+    // de PASSAGEM_RESOURCES (res/raw, ver vinhetas/README.md) pra nao repetir sempre a mesma.
+    // Reaproveita playVinhetaResource() (mesmo MediaPlayer.create de recurso, sem gap pra
+    // tocar em seguida). Volume reduzido -8dB (pedido do usuario, tocava alto demais).
+    private fun playPassagem(onFinished: () -> Unit) {
+        val resId = PASSAGEM_RESOURCES[nextPassagemIndex % PASSAGEM_RESOURCES.size]
+        nextPassagemIndex++
+        playVinhetaResource(resId, volume = PASSAGEM_VOLUME, onFinished)
     }
 
     private fun armAnnouncementWatchdog() {
@@ -1792,23 +2408,31 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun finishNewsBreak() {
-        if (!speakingNews) return
-        speakingNews = false
+        if (!speakingNews || newsBreakEnding) return
+        newsBreakEnding = true
         currentNewsHeadline = ""
-        if (resumeAfterNews) {
-            resumeAfterNews = false
-            viewModelScope.launch {
-                controller?.play()
+        // Ponte curta depois do boletim (boletim > passagem > musica) antes de retomar.
+        // speakingNews so vira false depois da passagem tocar - enquanto isso o watchdog
+        // (armAnnouncementWatchdog, disparado por playVinhetaResource) continua cobrindo essa
+        // janela, senao uma passagem travada nunca seria forcada a liberar a musica de volta.
+        playPassagem {
+            newsBreakEnding = false
+            speakingNews = false
+            if (resumeAfterNews) {
+                resumeAfterNews = false
+                viewModelScope.launch {
+                    controller?.play()
+                }
             }
+            controller?.let { updatePlayerState(it) }
         }
-        controller?.let { updatePlayerState(it) }
     }
 
     // So pros botoes de teste em Configuracoes: ao contrario do playAnnouncementFile do boletim
     // ao vivo (que sempre apaga o WAV depois de tocar - ver RADIO_PIPELINE.md), este mantem o
     // arquivo no disco pra permitir repetir o mesmo teste sem sintetizar de novo (pedido do
     // usuario - sintese local pode levar bastante tempo, ver BULLETIN_PREP_TIMEOUT_MS).
-    private fun playTestAudio(file: java.io.File) {
+    private fun playTestAudio(file: java.io.File, onFinished: () -> Unit = {}) {
         if (lastTestAudioFile != null && lastTestAudioFile != file) {
             lastTestAudioFile?.delete()
         }
@@ -1821,15 +2445,28 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 setOnCompletionListener {
                     it.release()
                     if (announcementPlayer === it) announcementPlayer = null
+                    onFinished()
                 }
                 setOnErrorListener { player, _, _ ->
                     player.release()
                     if (announcementPlayer === player) announcementPlayer = null
+                    onFinished()
                     true
                 }
                 prepare()
                 start()
                 announcementPlayer = this
+            }
+        }.onFailure { onFinished() }
+    }
+
+    // Toca a passagem antes e depois, igual o boletim ao vivo (speakNextNewsBreak/
+    // finishNewsBreak) - pedido do usuario pra poder ouvir o teste exatamente como sai na
+    // radio de verdade, nao so a voz pelada.
+    private fun playTestAudioWithPassagem(file: java.io.File, onFinished: () -> Unit = {}) {
+        playPassagem {
+            playTestAudio(file) {
+                playPassagem { onFinished() }
             }
         }
     }
@@ -1843,7 +2480,101 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             )
             return
         }
-        playTestAudio(file)
+        playTestAudioWithPassagem(file)
+    }
+
+    // Toca o boletim pronto na posicao `index` do buffer (bulletinBuffer, Nivel 2) direto na tela
+    // de Configuracoes, sem precisar entrar numa radio - pedido do usuario (03/09/2026): quer
+    // ouvir o resultado do redator local assim que fica pronto. So espia (elementAtOrNull), nunca
+    // remove do buffer - testar nao pode consumir o boletim que a radio de verdade ainda vai usar.
+    // Sem radio nenhuma tocando o Nivel 2 nunca enche (refillBulletinBuffer exige radioNewsEnabled
+    // - achado 03/09/2026), entao cai pro Nivel 1 (coreBuffer) como previa: so o miolo (falas 2-5),
+    // sem abertura/fechamento reais porque nao ha faixa de contexto ainda. `index` deixa tocar
+    // qualquer um dos ate BULLETIN_BUFFER_TARGET itens prontos, nao so o primeiro (pedido do
+    // usuario 03/09/2026: "os outros que ficam pronto, nao sei como reproduzir eles") - ver
+    // RadioBulletinBufferStatusCard, cada bolinha preenchida vira clicavel pra sua posicao.
+    fun playReadyBufferedBulletin(index: Int = 0) {
+        if (radioBulletinBufferState.value.isPlayingPreview) return
+        val bulletinItem = bulletinBuffer.elementAtOrNull(index)
+        val coreItem = coreBuffer.filter { it.coreFile != null }.getOrNull(index)
+        val isCorePreview: Boolean
+        val mainFile: File?
+        val storyTitle: String?
+        val introFile: File?
+        if (bulletinItem?.file != null) {
+            isCorePreview = false
+            mainFile = bulletinItem.file
+            storyTitle = bulletinItem.script.story.title
+            introFile = null
+        } else if (coreItem != null) {
+            isCorePreview = true
+            mainFile = coreItem.coreFile
+            storyTitle = coreItem.script.story.title
+            introFile = coreItem.introFile
+        } else {
+            // Achado 03/09/2026: sem isso, tocar numa posicao sem audio (ex.: item que caiu pro
+            // roteiro padrao apos falha do redator - fallback nunca tem coreFile, ver
+            // prewarmCoreBuffer) nao fazia NADA visivel - o botao parecia habilitado (readyCount
+            // conta item "com texto pronto", nao "com audio pronto") mas ficava mudo ao tocar.
+            radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
+                statusMessage = "Esse boletim não tem áudio pronto (o redator local falhou nessa matéria, ou a voz local está desligada).",
+                progressPercent = null,
+            )
+            return
+        }
+        if (mainFile == null || !mainFile.exists()) {
+            radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
+                statusMessage = "Esse boletim não tem áudio pronto (voz local desligada agora).",
+                progressPercent = null,
+            )
+            return
+        }
+        radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
+            isPlayingPreview = true,
+            statusMessage = if (isCorePreview) {
+                "Tocando prévia — matéria: \"${storyTitle ?: "?"}\" (sem fechamento, que depende de rádio real tocando)..."
+            } else {
+                radioBulletinBufferState.value.statusMessage
+            },
+        )
+        previewPlayer?.release()
+        previewPlayer = null
+        val leadIn = introFile?.takeIf { it.exists() }
+        // Fala 1 (introFile) primeiro se existir - ela ja e generica (gerada sem faixa real),
+        // sem ela a previa comecava direto na resposta do Nico, sem contexto nenhum de qual
+        // noticia estava sendo discutida (achado 03/09/2026, feedback do usuario: "fica sem pe
+        // nem cabeca pra entender do que se trata").
+        if (leadIn != null) {
+            playPreviewFile(leadIn) { playPreviewFile(mainFile) { finishPreview() } }
+        } else {
+            playPreviewFile(mainFile) { finishPreview() }
+        }
+    }
+
+    private fun finishPreview() {
+        radioBulletinBufferState.value = radioBulletinBufferState.value.copy(isPlayingPreview = false)
+    }
+
+    private fun playPreviewFile(file: File, onFinished: () -> Unit) {
+        runCatching {
+            MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                setOnCompletionListener {
+                    it.release()
+                    if (previewPlayer === it) previewPlayer = null
+                    onFinished()
+                }
+                setOnErrorListener { player, _, _ ->
+                    player.release()
+                    if (previewPlayer === player) previewPlayer = null
+                    onFinished()
+                    true
+                }
+                prepare()
+                start()
+                previewPlayer = this
+            }
+        }.onFailure { onFinished() }
     }
 
     private fun playAnnouncementFile(file: java.io.File, onFinished: () -> Unit) {
@@ -1881,11 +2612,60 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private suspend fun synthesizeLocalVoiceSafely(
         script: RadioScript,
         timeoutMs: Long = LOCAL_VOICE_TIMEOUT_MS,
-    ): File? = requestLocalVoiceSynthesis(script, timeoutMs)?.file
+        onProgress: (String) -> Unit = {},
+        onProgressPercent: (Int) -> Unit = {},
+    ): File? = requestLocalVoiceSynthesis(script, timeoutMs, onProgress, onProgressPercent)?.file
 
     private suspend fun requestLocalVoiceSynthesis(
         script: RadioScript,
         timeoutMs: Long,
+        onProgress: (String) -> Unit = {},
+        onProgressPercent: (Int) -> Unit = {},
+    ): LocalVoiceSynthesisResult? =
+        requestVoiceSynthesis(timeoutMs, "full lines=${script.lines.size}", onProgress, onProgressPercent) { context, receiver ->
+            RadioVoiceSynthesisService.intent(context, script, receiver)
+        }
+
+    // Nucleo pre-aquecido (ver PreparedNewsCore/prewarmCoreBuffer) - so as falas do meio, sem
+    // musica de fundo (mixBackgroundMusic depende do tamanho final, so calculado no encaixe).
+    private suspend fun requestCoreSynthesis(
+        lines: List<RadioScriptLine>,
+        timeoutMs: Long,
+        onProgress: (String) -> Unit = {},
+        onProgressPercent: (Int) -> Unit = {},
+    ): File? =
+        requestVoiceSynthesis(timeoutMs, "core lines=${lines.size}", onProgress, onProgressPercent) { context, receiver ->
+            RadioVoiceSynthesisService.coreIntent(context, lines, receiver)
+        }?.file
+
+    // Encaixe das pontas (fala 1/6 com contexto real) num nucleo ja pronto - ver
+    // LocalRadioVoiceEngine.spliceEdges. Chamado por refillBulletinBuffer() quando o boletim
+    // entrando no bulletinBuffer veio de um PreparedNewsCore com coreFile != null.
+    private suspend fun requestSpliceSynthesis(
+        coreFile: File,
+        introLine: RadioScriptLine,
+        closerLine: RadioScriptLine,
+        timeoutMs: Long,
+        onProgress: (String) -> Unit = {},
+        onProgressPercent: (Int) -> Unit = {},
+    ): File? =
+        requestVoiceSynthesis(timeoutMs, "splice core=${coreFile.name}", onProgress, onProgressPercent) { context, receiver ->
+            RadioVoiceSynthesisService.spliceIntent(context, coreFile, introLine, closerLine, receiver)
+        }?.file
+
+    // Base compartilhada por synthesizeLocalVoiceSafely/requestCoreSynthesis/
+    // requestSpliceSynthesis - so muda o Intent que dispara o RadioVoiceSynthesisService, o
+    // protocolo de resposta (ResultReceiver, progresso, timeout) e o mesmo pros 3 modos.
+    // onProgressPercent e separado de onProgress (nao muda a assinatura usada pelos testes de
+    // Configuracoes) - so quem quiser o numero (refillBulletinBuffer/prewarmCoreBuffer, pedido
+    // do usuario 03/09/2026) passa os dois; index/total por fala ja vem do
+    // RadioVoiceSynthesisService (RESULT_PROGRESS), so nao ha stage sem numero real aqui.
+    private suspend fun requestVoiceSynthesis(
+        timeoutMs: Long,
+        logLabel: String,
+        onProgress: (String) -> Unit,
+        onProgressPercent: (Int) -> Unit = {},
+        buildIntent: (Context, ResultReceiver) -> Intent,
     ): LocalVoiceSynthesisResult? =
         withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { continuation ->
@@ -1894,6 +2674,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
                     override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
                         if (!continuation.isActive) return
+                        if (resultCode == RadioVoiceSynthesisService.RESULT_PROGRESS) {
+                            val index = resultData?.getInt(RadioVoiceSynthesisService.EXTRA_PROGRESS_INDEX) ?: 0
+                            val total = resultData?.getInt(RadioVoiceSynthesisService.EXTRA_PROGRESS_TOTAL) ?: 0
+                            Log.d(TAG_RADIO_VOICE, "voice progress $index/$total")
+                            onProgress("Sintetizando vozes: fala $index de $total...")
+                            if (total > 0) onProgressPercent(index * 100 / total)
+                            return
+                        }
                         val elapsedMs = resultData
                             ?.getLong(RadioVoiceSynthesisService.EXTRA_ELAPSED_MS, 0L)
                             ?.takeIf { it > 0L }
@@ -1925,12 +2713,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         continuation.resume(result)
                     }
                 }
-                Log.d(TAG_RADIO_VOICE, "request voice lines=${script.lines.size} timeout=${timeoutMs}ms")
+                Log.d(TAG_RADIO_VOICE, "request voice $logLabel timeout=${timeoutMs}ms")
                 continuation.invokeOnCancellation {
                     Log.w(TAG_RADIO_VOICE, "voice request cancelled after ${System.currentTimeMillis() - startedAt}ms")
                 }
                 runCatching {
-                    context.startService(RadioVoiceSynthesisService.intent(context, script, receiver))
+                    context.startService(buildIntent(context, receiver))
                 }.onFailure {
                     Log.e(TAG_RADIO_VOICE, "failed to start local voice service", it)
                     if (continuation.isActive) {
@@ -2020,6 +2808,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    // Igual toRadioLastPlayedTrack, mas tambem busca genero/ano na biblioteca ja carregada pelo
+    // id da faixa - usado so pra "proxima musica" do fechamento filosofico
+    // (withPhilosophicalCloser/musicTrivia em RadioBulletin.kt), que precisa desses dois campos
+    // pra escolher a curiosidade (a introducao "voce acaba de ouvir" nao precisa disso).
+    private fun MediaItem.toUpcomingTrack(): RadioLastPlayedTrack? {
+        val base = toRadioLastPlayedTrack() ?: return null
+        val song = libraryState.value.songs.firstOrNull { it.id.toString() == mediaId }
+        return base.copy(genre = song?.genre.orEmpty(), year = song?.year ?: 0)
+    }
+
     private fun recordCurrentSong(player: Player) {
         val mediaId = player.currentMediaItem?.mediaId ?: return
         if (mediaId == lastRecordedMediaId) return
@@ -2077,6 +2875,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.removeListener(playerListener)
         controllerFuture?.let(MediaController::releaseFuture)
         announcementPlayer?.release()
+        previewPlayer?.release()
         lastTestAudioFile?.delete()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
@@ -2094,6 +2893,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
         const val KEY_RADIO_BULLETIN_LOCAL_WRITER = "radio_bulletin_local_writer"
         const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
+        const val CORE_BUFFER_MANIFEST_FILE = "manifest.json"
+        // Pausa entre boletins consecutivos do preparo automatico (Nivel 1) pra deixar o SoC
+        // esfriar - ver comentario em prewarmCoreBuffer. Status atualiza a cada
+        // COOLDOWN_STATUS_TICK_MS pra usuario acompanhar a contagem regressiva.
+        const val COOLDOWN_BETWEEN_BULLETINS_MS = 180_000L
+        const val COOLDOWN_STATUS_TICK_MS = 15_000L
         const val MAX_HISTORY_ITEMS = 80
         const val POSITION_SAVE_INTERVAL_MS = 3000L
         const val RADIO_BULLETIN_DEFAULT_INTERVAL = 3
@@ -2102,21 +2907,35 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val LOCAL_VOICE_TIMEOUT_MS = 12_000L
         // Pre-geracao roda em segundo plano durante a musica anterior ao boletim (minutos
         // disponiveis), entao pode esperar bem mais que o timeout usado na hora H do boletim.
-        // Medido em campo com Piper (vits-dual): dialogo de 3 falas (fem->masc->fem) leva
-        // ~60-65s porque cada troca de locutor recarrega um engine sherpa inteiro do disco
-        // (~16-18s cada); 45s cortava o processo poucos segundos antes de terminar.
-        // Medido em campo com Kokoro (26/08/2026, Duracao Curta ~300 caracteres): ~152s
-        // (~9-10s de load por locutor + ~2 chars/s de geracao) — modelo maior, sem cache
-        // entre requests (ver TTS.md). 120s cortava o boletim quase no fim; 160s da folga
-        // pequena so pra Curta — Normal/Longa com Kokoro provavelmente ainda estouram.
-        // Atualizacao (28/08/2026, ADR-014): "speed" do manifest caiu de 0.92 pra 0.85
-        // (locutores mais lentos, pedido do usuario) — audio ~9% mais longo pro mesmo
-        // texto, custo de geracao sobe na mesma proporcao. Timeout subiu pra 175s pra
-        // manter a mesma folga de antes.
-        const val BULLETIN_PREP_TIMEOUT_MS = 175_000L
+        // Historico Piper/Kokoro (obsoleto, motor trocado pra Supertonic): ~60-65s e ~152s
+        // respectivamente - valores abaixo nao se aplicam mais.
+        // Atualizacao (03/09/2026): com Supertonic o timeout de 175s estava CORTANDO a sintese
+        // em segundo plano antes de terminar (log de campo mostrou 410s com numThreads=2 /
+        // 496s com numThreads=4, RTF≈5,6 no aparelho) -
+        // o boletim ao vivo caia sistematicamente pro fallback TTS do Android mesmo com buffer
+        // (BULLETIN_BUFFER_TARGET) tendo musicas de sobra pra preparar, porque quem matava o job
+        // era esse timeout, nao falta de tempo real. Subido pro mesmo teto do teste (600s), depois
+        // pra 660s (11min, pedido do usuario 03/09/2026) pra dar mais folga ao redator local
+        // terminar sem estourar e cair no fallback deterministico (que usa frase fixa - ver
+        // FallbackRadioScriptWriter) - folga aqui nao custa nada, roda em segundo plano.
+        const val BULLETIN_PREP_TIMEOUT_MS = 660_000L
+
+        // Quantos boletins prontos (roteiro + audio, se a voz local estiver ligada) o app
+        // mantem em reserva o tempo todo - ver refillBulletinBuffer()/ADR-019. Preparo roda um
+        // de cada vez em segundo plano bem antes de precisar, entao BULLETIN_PREP_TIMEOUT_MS
+        // acima deixou de ser um aperto real (so importa se o consumo for mais rapido que o
+        // preparo consegue repor, ex.: songsBetweenBulletins = 1).
+        // Subido de 3 pra 5 (pedido do usuario 04/09/2026, junto da diversificacao de feeds em
+        // NewsBulletinRepository) - mais folga de boletins prontos pra cobrir a variedade nova
+        // de temas sem esbarrar em timeout de preparo. Ver ADR-021.
+        const val BULLETIN_BUFFER_TARGET = 5
+
+        // -8dB em amplitude linear (10^(-8/20)) - passagem_1/2 tocavam alto demais no volume
+        // original do arquivo (pedido do usuario, 02/09/2026).
+        const val PASSAGEM_VOLUME = 0.398f
+        val PASSAGEM_RESOURCES = listOf(R.raw.passagem_1, R.raw.passagem_2, R.raw.passagem_3)
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
-        const val LOCAL_VOICE_BULLETIN_TEST_TIMEOUT_MS = 90_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"

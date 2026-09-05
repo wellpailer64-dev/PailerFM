@@ -22,13 +22,14 @@ Feito em Kotlin, Jetpack Compose e Media3/ExoPlayer.
   fila que evita repetir a sessao anterior.
 - Abertura com vinheta gravada (intro comum + complemento por genero, sem narracao
   falada) antes da primeira musica de cada entrada na radio.
-- Boletins de noticia entre as musicas (RSS de g1/Super/Olhar Digital/BBC Brasil), em
-  modo manchete ou bate-bola entre Frankie (otimista) e Nicky (pessimista), duas vozes
-  masculinas com humor acido, opinando de verdade sobre a materia lida - com duracao
-  configuravel.
-- Vozes locais offline via sherpa-onnx (VITS/Piper/Kokoro/Supertonic) rodando em processo
-  separado (`:radio_voice`); pacote .zip de vozes instalavel pela UI. Fallback para o
-  TTS do sistema quando nao ha pacote ativo.
+- Boletins de noticia entre as musicas (RSS de g1/Super/Olhar Digital/BBC Brasil), sempre
+  em bate-bola entre Fran (otimista) e Nico (pessimista), com humor acido, opinando de
+  verdade sobre a materia lida - duracao decidida pela propria materia. O bate-bola fecha
+  com uma reflexao existencialista/absurdista do Nico e a Fran chamando a proxima musica
+  com o nome do artista e uma curiosidade de genero/epoca.
+- Voz local offline via sherpa-onnx (Supertonic 3) rodando em processo separado
+  (`:radio_voice`); pacote .zip de vozes instalavel pela UI. Fallback para o TTS do
+  sistema quando nao ha pacote ativo.
 
 ### Ferramentas de biblioteca
 - Revisao de metadados: albuns sem genero/artista reconhecido, sugestoes e aprovacao.
