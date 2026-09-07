@@ -26,6 +26,14 @@ data class RadioWriterPackageConfig(
 ) {
     val modelFile: File
         get() = rootDir.resolve(model)
+
+    // Cache do KV-state do prefixo fixo do prompt (system instructions + few-shot, ver
+    // OptionalLocalLlmRadioScriptWriter.buildPromptPrefix/LocalLlamaTextGenerator, 06/09/2026).
+    // Fica dentro do rootDir do proprio pacote - reimportar/remover o redator (que apaga
+    // rootDir inteiro, ver RadioWriterPackageRepository) invalida o cache junto, o que e
+    // exatamente o comportamento certo (cache e so valido pro modelo+prompt daquele pacote).
+    val prefixCacheFile: File
+        get() = rootDir.resolve("prefix_cache.bin")
 }
 
 class RadioWriterPackageRepository(private val context: Context) {
@@ -93,6 +101,21 @@ class RadioWriterPackageRepository(private val context: Context) {
         tempDir.copyRecursively(currentDir, overwrite = true)
         currentDir.resolve(READY_FILE).writeText("ok")
         tempDir.deleteRecursively()
+
+        // Copia de referencia do .zip original na pasta oficial (se configurada) - so pra
+        // organizacao/portabilidade do usuario, o app continua rodando da copia interna acima
+        // (ver comentario em AppFolderRepository sobre por que o modelo nativo nao pode morar
+        // numa pasta SAF). Melhor esforco: falha aqui nunca invalida a importacao que ja
+        // funcionou.
+        runCatching {
+            AppFolderRepository(context).copyUriToSubfolder(
+                uri,
+                AppFolderRepository.SUBFOLDER_WRITER,
+                "redator_local.zip",
+                "application/zip",
+            )
+        }
+
         parsedConfig.toStatus("Pacote importado com sucesso")
     }
 
@@ -192,14 +215,33 @@ object LocalLlamaTextGenerator {
         }.getOrDefault(false)
     }
 
+    // promptPrefix (06/09/2026): a parte do prompt IDENTICA em toda chamada (system instructions
+    // + exemplo few-shot, ver OptionalLocalLlmRadioScriptWriter.buildPromptPrefix). Medido em
+    // campo: prefill sozinho custava ~232s por boletim (~1150-1190 tokens, quase todos desse
+    // prefixo fixo) - ensurePrefixCacheNative decodifica esse pedaco uma unica vez e salva o
+    // KV-state em disco (RadioWriterPackageConfig.prefixCacheFile); generateCachedNative reaproveita
+    // esse estado em toda chamada seguinte, so decodificando de verdade o que muda (a materia).
+    // ensurePrefixCacheNative e "melhor esforco": se falhar (disco cheio, cache corrompido etc.)
+    // generateCachedNative sozinha cai pro prefill completo, igual sempre foi - nunca quebra a
+    // geracao por causa do cache.
     fun generate(
         config: RadioWriterPackageConfig,
         prompt: String,
+        promptPrefix: String,
         onProgress: LlamaProgressListener? = null,
     ): String {
         if (!nativeReady) error("Motor local do redator não carregou.")
-        val output = generateNative(
+        runCatching {
+            ensurePrefixCacheNative(
+                modelPath = config.modelFile.absolutePath,
+                cachePath = config.prefixCacheFile.absolutePath,
+                prefixPrompt = promptPrefix,
+                threads = config.threads,
+            )
+        }
+        val output = generateCachedNative(
             modelPath = config.modelFile.absolutePath,
+            cachePath = config.prefixCacheFile.absolutePath,
             prompt = prompt,
             maxTokens = config.maxTokens,
             temperature = config.temperature,
@@ -211,8 +253,30 @@ object LocalLlamaTextGenerator {
         return output
     }
 
+    // Caminho antigo, sem cache de prefixo - mantido como esta (nao chamado hoje) como rede de
+    // seguranca: caminho ja testado em producao antes do cache de prefixo existir, disponivel
+    // pra rollback manual (trocar a chamada em generate() acima) se o caminho com cache
+    // apresentar algum problema em campo.
     private external fun generateNative(
         modelPath: String,
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float,
+        threads: Int,
+        timeoutMs: Int,
+        progressListener: LlamaProgressListener?,
+    ): String
+
+    private external fun ensurePrefixCacheNative(
+        modelPath: String,
+        cachePath: String,
+        prefixPrompt: String,
+        threads: Int,
+    ): Boolean
+
+    private external fun generateCachedNative(
+        modelPath: String,
+        cachePath: String,
         prompt: String,
         maxTokens: Int,
         temperature: Float,

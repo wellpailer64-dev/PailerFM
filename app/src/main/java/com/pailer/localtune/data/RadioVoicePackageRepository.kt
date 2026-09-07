@@ -122,6 +122,18 @@ class RadioVoicePackageRepository(private val context: Context) {
         tempDir.copyRecursively(currentDir, overwrite = true)
         currentDir.resolve(READY_FILE).writeText("ok")
         tempDir.deleteRecursively()
+
+        // Copia de referencia do .zip original na pasta oficial (se configurada) - ver mesmo
+        // comentario em RadioWriterPackageRepository.importPackage.
+        runCatching {
+            AppFolderRepository(context).copyUriToSubfolder(
+                uri,
+                AppFolderRepository.SUBFOLDER_VOICE,
+                "pacote_de_vozes.zip",
+                "application/zip",
+            )
+        }
+
         parsedConfig.toStatus().copy(isInstalled = true, detail = "Pacote importado com sucesso")
     }
 

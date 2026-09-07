@@ -872,6 +872,77 @@ class MusicLibraryRepository(private val context: Context) {
         return true
     }
 
+    // --- Foto de artista (busca na internet + salva so no app, sem mexer nas faixas) ---
+    //
+    // Diferente da capa de album (que grava nos ARQUIVOS de audio via writeArtworkToAudioFile),
+    // a foto de artista nao tem onde morar no MediaStore - LocalArtist e um agrupamento
+    // calculado, nao uma entidade com metadado proprio. Por isso ela vira um override guardado
+    // so no app (arquivo em filesDir + path em metadataPrefs), consultado ANTES de cair pra capa
+    // do primeiro album do artista (ver artist.songs.firstOrNull{}.artworkUri na UI). A iTunes
+    // Search API (usada pra capa de album) nao tem foto de artista de verdade - so capa de
+    // disco/faixa - entao aqui a fonte e a Deezer, publica e sem chave, que devolve foto real do
+    // artista (picture_xl) na busca por nome.
+    suspend fun searchArtistPhotoCandidates(artistName: String): List<ArtworkCandidate> = withContext(Dispatchers.IO) {
+        val cleanName = primaryArtistName(artistName).trim()
+        if (cleanName.isBlank()) return@withContext emptyList()
+        val term = URLEncoder.encode(cleanName, "UTF-8")
+        val url = "https://api.deezer.com/search/artist?q=$term&limit=$ARTWORK_CANDIDATE_LIMIT"
+        val results = runCatching {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 10_000
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "PailerPlayer/0.1")
+            }
+            val body = connection.inputStream.use { it.readBytes().decodeToString() }
+            connection.disconnect()
+            JSONObject(body).optJSONArray("data") ?: JSONArray()
+        }.getOrDefault(JSONArray())
+
+        val seen = LinkedHashMap<String, ArtworkCandidate>()
+        for (i in 0 until results.length()) {
+            val item = results.optJSONObject(i) ?: continue
+            val full = item.optString("picture_xl").takeIf { it.isNotBlank() }
+                ?: item.optString("picture_big").takeIf { it.isNotBlank() }
+                ?: continue
+            val preview = item.optString("picture_medium").takeIf { it.isNotBlank() } ?: full
+            if (seen.containsKey(full)) continue
+            val name = item.optString("name").ifBlank { cleanName }
+            seen[full] = ArtworkCandidate(previewUrl = preview, fullUrl = full, label = name)
+        }
+        seen.values.toList()
+    }
+
+    private val artistPhotoDir: File
+        get() = File(context.filesDir, "artist_photos").apply { mkdirs() }
+
+    fun artistPhotoOverrideUri(artistKey: String): Uri? {
+        val path = metadataPrefs.getString(artistPhotoOverrideKey(artistKey), null) ?: return null
+        val file = File(path)
+        return file.takeIf { it.exists() }?.let { Uri.fromFile(it) }
+    }
+
+    suspend fun applyArtistPhoto(artistKey: String, imageBytes: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val file = File(artistPhotoDir, "${artistPhotoFileName(artistKey)}.jpg")
+            file.writeBytes(imageBytes)
+            metadataPrefs.edit().putString(artistPhotoOverrideKey(artistKey), file.absolutePath).apply()
+            true
+        }.getOrDefault(false)
+    }
+
+    fun removeArtistPhotoOverride(artistKey: String) {
+        val path = metadataPrefs.getString(artistPhotoOverrideKey(artistKey), null)
+        if (path != null) runCatching { File(path).delete() }
+        metadataPrefs.edit().remove(artistPhotoOverrideKey(artistKey)).apply()
+    }
+
+    private fun artistPhotoFileName(artistKey: String): String =
+        asciiFold(artistKey).replace(Regex("[^a-z0-9]+"), "_").trim('_').ifBlank { "artist" }
+
+    private fun artistPhotoOverrideKey(artistKey: String): String =
+        "artist_photo:$artistKey"
+
     private fun sniffImageMimeType(bytes: ByteArray): String = when {
         bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() -> "image/png"
         else -> "image/jpeg"

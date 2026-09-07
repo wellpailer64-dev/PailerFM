@@ -2,6 +2,9 @@ package com.pailer.localtune.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -11,7 +14,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDecay
 import androidx.compose.animation.core.animateFloat
@@ -20,8 +25,12 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.ScrollScope
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -29,9 +38,12 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
@@ -53,6 +65,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -78,10 +91,12 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
@@ -102,6 +117,7 @@ import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -130,17 +146,21 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -149,7 +169,15 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.core.view.ViewCompat
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -160,6 +188,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -167,6 +196,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.Player
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
+import com.pailer.localtune.data.ArtistNewsCard
 import com.pailer.localtune.data.DuplicateArtistGroup
 import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
@@ -179,6 +209,10 @@ import com.pailer.localtune.data.joinGenreTags
 import com.pailer.localtune.data.splitGenreTags
 import com.pailer.localtune.player.LocalTuneViewModel
 import com.pailer.localtune.player.AlbumArtworkUiState
+import com.pailer.localtune.player.ArtistPhotoUiState
+import com.pailer.localtune.player.ArtistNewsUiState
+import com.pailer.localtune.player.AppFolderUiState
+import com.pailer.localtune.player.BackupUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
 import com.pailer.localtune.player.RadioBulletinBufferUiState
@@ -197,8 +231,10 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalTime
@@ -220,6 +256,7 @@ private enum class SettingsPage {
     Artists,
     RadioBulletins,
     AlbumArtwork,
+    Backup,
 }
 
 // Fling mais suave/macio pra rolagem do app inteiro (pedido do usuario 04/09/2026) - o default
@@ -431,6 +468,21 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     ) { uri ->
         uri?.let(viewModel::importRadioWriterPackage)
     }
+    val backupCreateLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        uri?.let(viewModel::chooseBackupDestination)
+    }
+    val backupRestoreLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let(viewModel::restoreBackup)
+    }
+    val appFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let(viewModel::chooseAppFolder)
+    }
     val library = viewModel.libraryState.value
     val content = viewModel.libraryContentState.value
     val player = viewModel.playerState.value
@@ -440,6 +492,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         // A Uri de albumart nao muda quando a capa embutida no arquivo muda - sem isso o app
         // continuaria mostrando o bitmap antigo (ou o placeholder) ate reiniciar.
         if (albumArtwork.appliedVersion > 0) artworkMemoryCache.evictAll()
+    }
+    val artistPhoto = viewModel.artistPhotoState.value
+    LaunchedEffect(artistPhoto.appliedVersion) {
+        // Mesmo motivo do albumArtwork acima: o arquivo local de foto do artista pode trocar de
+        // conteudo sem trocar de nome/Uri.
+        if (artistPhoto.appliedVersion > 0) artworkMemoryCache.evictAll()
     }
     val radioBulletins = viewModel.radioBulletinState.value
     val radioBulletinBuffer = viewModel.radioBulletinBufferState.value
@@ -455,6 +513,16 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val suggestedAlbums = content.suggestedAlbums
     val favoriteAlbums = content.favoriteAlbums
     val continueSong = content.continueSong
+    val artistNews = viewModel.artistNewsState.value
+    val favoriteArtists = remember(artists, library.favoriteArtistKeys) {
+        artists.filter { it.key in library.favoriteArtistKeys }
+    }
+    val newsContext = LocalContext.current
+    val onOpenNewsLink: (String) -> Unit = { link ->
+        runCatching {
+            newsContext.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)))
+        }
+    }
     val openedArtistAlbums = remember(selectedArtist) {
         selectedArtist?.let { viewModel.albums(it.songs) } ?: emptyList()
     }
@@ -574,7 +642,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     openedAlbum != null -> AlbumDetailScreen(
                         album = openedAlbum,
                         isFavorite = viewModel.isAlbumFavorite(openedAlbum),
-                        onBack = { selectedAlbum = null },
                         onToggleFavorite = { viewModel.toggleAlbumFavorite(openedAlbum) },
                         onPlayAlbum = { viewModel.playSongs(openedAlbum.songs, source = "Álbum ${openedAlbum.title}") },
                         onShuffleAlbum = { viewModel.playSongs(openedAlbum.songs, shuffle = true, source = "Mix do álbum ${openedAlbum.title}") },
@@ -599,7 +666,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         artist = openedArtist,
                         albums = openedArtistAlbums,
                         isFavorite = viewModel.isArtistFavorite(openedArtist),
-                        onBack = { selectedArtist = null },
                         onToggleFavorite = { viewModel.toggleArtistFavorite(openedArtist) },
                         onOpenAlbum = { selectedAlbum = it },
                         onPlayArtist = { viewModel.playSongs(openedArtist.songs, source = "Artista ${openedArtist.name}") },
@@ -610,6 +676,13 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             requestRecentMetadataEditWrite()
                         },
                         onCreateRadio = { viewModel.createRadioFromArtist(openedArtist) },
+                        photoOverrideUri = viewModel.artistPhotoUri(openedArtist),
+                        photoState = artistPhoto,
+                        onOpenPhotoSearch = { viewModel.openArtistPhotoSearch(openedArtist) },
+                        onClosePhotoSearch = viewModel::closeArtistPhotoSearch,
+                        onSelectPhotoCandidate = viewModel::selectArtistPhotoCandidate,
+                        onApplyPhoto = { viewModel.applyArtistPhoto(openedArtist) },
+                        onRemovePhoto = { viewModel.removeArtistPhoto(openedArtist) },
                         listState = artistDetailListState,
                     )
                     openedRadio != null -> {
@@ -689,32 +762,41 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onPlayGenre = { viewModel.playSongs(openedGenre.songs, source = "Categoria ${openedGenre.name}") },
                         onShuffleGenre = { viewModel.playSongs(openedGenre.songs, shuffle = true, source = "Mix da categoria ${openedGenre.name}") },
                         onCreateRadio = { viewModel.createRadioFromGenre(openedGenre) },
+                        photoUriFor = viewModel::artistPhotoUri,
                         listState = genreDetailListState,
                     )
-                    selectedTab == LibraryTab.Home -> HomeScreen(
-                        songs = songs,
-                        continueSong = continueSong,
-                        continuePositionMs = viewModel.continuePositionMs(),
-                        recentlyAddedAlbums = recentlyAddedAlbums,
-                        listenAgain = listenAgain,
-                        suggestedAlbums = suggestedAlbums,
-                        favoriteAlbums = favoriteAlbums,
-                        radios = radios,
-                        player = player,
-                        onContinue = { viewModel.continuePlayback(songs) },
-                        onOpenAlbum = { selectedAlbum = it },
-                        onOpenRadio = {
-                            radioSession = emptyList()
-                            selectedRadio = it
-                        },
-                        onOpenPlayer = openActiveRadio,
-                        onPlay = { list, index, shuffle -> viewModel.playSongs(list, index, shuffle, source = if (shuffle) "Misturar tudo" else "Biblioteca") },
-                    )
+                    selectedTab == LibraryTab.Home -> HomeNewsDrawer(
+                        favoriteArtists = favoriteArtists,
+                        newsState = artistNews,
+                        onRequestLoad = { viewModel.loadArtistNewsIfNeeded(favoriteArtists) },
+                        onOpenLink = onOpenNewsLink,
+                    ) {
+                        HomeScreen(
+                            songs = songs,
+                            continueSong = continueSong,
+                            continuePositionMs = viewModel.continuePositionMs(),
+                            recentlyAddedAlbums = recentlyAddedAlbums,
+                            listenAgain = listenAgain,
+                            suggestedAlbums = suggestedAlbums,
+                            favoriteAlbums = favoriteAlbums,
+                            radios = radios,
+                            player = player,
+                            onContinue = { viewModel.continuePlayback(songs) },
+                            onOpenAlbum = { selectedAlbum = it },
+                            onOpenRadio = {
+                                radioSession = emptyList()
+                                selectedRadio = it
+                            },
+                            onOpenPlayer = openActiveRadio,
+                            onPlay = { list, index, shuffle -> viewModel.playSongs(list, index, shuffle, source = if (shuffle) "Misturar tudo" else "Biblioteca") },
+                        )
+                    }
                     selectedTab == LibraryTab.Artists -> ArtistsScreen(
                         artists = artists,
                         onOpenArtist = { selectedArtist = it },
                         onDeleteArtist = { pendingDeleteArtist = it },
                         favoriteArtistKeys = library.favoriteArtistKeys,
+                        photoUriFor = viewModel::artistPhotoUri,
                         scrollState = artistsScrollState,
                     )
                     selectedTab == LibraryTab.Albums -> AlbumsScreen(
@@ -789,10 +871,13 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onSelectArtworkCandidate = viewModel::selectArtworkCandidate,
             onApplyArtwork = requestApplyArtwork,
             onSetRadioBulletinPreferLocalWriter = viewModel::setRadioBulletinPreferLocalWriter,
+            onSetRadioBulletinCloudWriterEnabled = viewModel::setRadioBulletinCloudWriterEnabled,
             onImportRadioWriterPackage = { writerPackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioWriterPackage = viewModel::clearRadioWriterPackage,
             onSaveGeminiApiKey = viewModel::saveGeminiApiKey,
             onClearGeminiApiKey = viewModel::clearGeminiApiKey,
+            onSaveOpenRouterApiKey = viewModel::saveOpenRouterApiKey,
+            onClearOpenRouterApiKey = viewModel::clearOpenRouterApiKey,
             onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
@@ -802,9 +887,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onPauseBulletinPreparation = viewModel::pauseBulletinPreparation,
             onResumeBulletinPreparation = viewModel::resumeBulletinPreparation,
             onResetBulletinBuffer = viewModel::resetBulletinBuffer,
+            onFixFallbackBulletins = viewModel::fixFallbackBulletins,
             onPlayReadyBulletin = viewModel::playReadyBufferedBulletin,
             hasHiddenRadios = viewModel.hasHiddenRadios(),
             onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
+            backup = viewModel.backupState.value,
+            onChooseBackupDestination = { backupCreateLauncher.launch("pailer_fm_backup.json") },
+            onBackupNow = viewModel::performBackupNow,
+            onClearBackupDestination = viewModel::clearBackupDestination,
+            onRestoreBackup = { backupRestoreLauncher.launch(arrayOf("application/json", "*/*")) },
+            appFolder = viewModel.appFolderState.value,
+            onChooseAppFolder = { appFolderLauncher.launch(null) },
+            onClearAppFolder = viewModel::clearAppFolder,
         )
 
         pendingDeleteSong?.let { song ->
@@ -988,10 +1082,13 @@ private fun SettingsDrawer(
     onSelectArtworkCandidate: (ArtworkCandidate) -> Unit,
     onApplyArtwork: (LocalAlbum) -> Unit,
     onSetRadioBulletinPreferLocalWriter: (Boolean) -> Unit,
+    onSetRadioBulletinCloudWriterEnabled: (Boolean) -> Unit,
     onImportRadioWriterPackage: () -> Unit,
     onClearRadioWriterPackage: () -> Unit,
     onSaveGeminiApiKey: (String) -> Unit,
     onClearGeminiApiKey: () -> Unit,
+    onSaveOpenRouterApiKey: (String) -> Unit,
+    onClearOpenRouterApiKey: () -> Unit,
     onImportRadioVoicePackage: () -> Unit,
     onClearRadioVoicePackage: () -> Unit,
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
@@ -1001,9 +1098,18 @@ private fun SettingsDrawer(
     onPauseBulletinPreparation: () -> Unit,
     onResumeBulletinPreparation: () -> Unit,
     onResetBulletinBuffer: () -> Unit,
+    onFixFallbackBulletins: () -> Unit,
     onPlayReadyBulletin: (Int) -> Unit,
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
+    backup: BackupUiState = BackupUiState(),
+    onChooseBackupDestination: () -> Unit = {},
+    onBackupNow: () -> Unit = {},
+    onClearBackupDestination: () -> Unit = {},
+    onRestoreBackup: () -> Unit = {},
+    appFolder: AppFolderUiState = AppFolderUiState(),
+    onChooseAppFolder: () -> Unit = {},
+    onClearAppFolder: () -> Unit = {},
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -1061,6 +1167,7 @@ private fun SettingsDrawer(
                                 onPageChange(SettingsPage.AlbumArtwork)
                                 onScanAlbumArtwork()
                             },
+                            onOpenBackup = { onPageChange(SettingsPage.Backup) },
                             hasHiddenRadios = hasHiddenRadios,
                             onRestoreHiddenRadios = onRestoreHiddenRadios,
                         )
@@ -1094,10 +1201,13 @@ private fun SettingsDrawer(
                             radioVoice = radioVoice,
                             onBack = { onPageChange(SettingsPage.Main) },
                             onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
+                            onSetCloudWriterEnabled = onSetRadioBulletinCloudWriterEnabled,
                             onImportWriterPackage = onImportRadioWriterPackage,
                             onClearWriterPackage = onClearRadioWriterPackage,
                             onSaveGeminiApiKey = onSaveGeminiApiKey,
                             onClearGeminiApiKey = onClearGeminiApiKey,
+                            onSaveOpenRouterApiKey = onSaveOpenRouterApiKey,
+                            onClearOpenRouterApiKey = onClearOpenRouterApiKey,
                             onImportVoicePackage = onImportRadioVoicePackage,
                             onClearVoicePackage = onClearRadioVoicePackage,
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
@@ -1107,6 +1217,7 @@ private fun SettingsDrawer(
                             onPauseBulletinPreparation = onPauseBulletinPreparation,
                             onResumeBulletinPreparation = onResumeBulletinPreparation,
                             onResetBulletinBuffer = onResetBulletinBuffer,
+                            onFixFallbackBulletins = onFixFallbackBulletins,
                             onPlayReadyBulletin = onPlayReadyBulletin,
                         )
                         SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
@@ -1117,6 +1228,17 @@ private fun SettingsDrawer(
                             onCloseSearch = onCloseArtworkSearch,
                             onSelectCandidate = onSelectArtworkCandidate,
                             onApply = onApplyArtwork,
+                        )
+                        SettingsPage.Backup -> BackupSettingsPanel(
+                            state = backup,
+                            onBack = { onPageChange(SettingsPage.Main) },
+                            onChooseDestination = onChooseBackupDestination,
+                            onBackupNow = onBackupNow,
+                            onClearDestination = onClearBackupDestination,
+                            onRestore = onRestoreBackup,
+                            appFolder = appFolder,
+                            onChooseAppFolder = onChooseAppFolder,
+                            onClearAppFolder = onClearAppFolder,
                         )
                     }
                 }
@@ -1137,6 +1259,7 @@ private fun SettingsMainPanel(
     onOpenArtists: () -> Unit,
     onOpenRadioBulletins: () -> Unit,
     onOpenAlbumArtwork: () -> Unit,
+    onOpenBackup: () -> Unit = {},
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
 ) {
@@ -1144,6 +1267,7 @@ private fun SettingsMainPanel(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
+            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
             .padding(horizontal = 18.dp, vertical = 22.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1216,6 +1340,13 @@ private fun SettingsMainPanel(
             icon = Icons.Filled.Image,
             onClick = onOpenAlbumArtwork,
         )
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        SettingsActionRow(
+            title = "Backup",
+            subtitle = "Guardar favoritos e fotos de artista num arquivo seu",
+            icon = Icons.Filled.CloudUpload,
+            onClick = onOpenBackup,
+        )
         if (hasHiddenRadios) {
             HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
             SettingsActionRow(
@@ -1235,10 +1366,13 @@ private fun RadioBulletinSettingsPanel(
     radioVoice: RadioVoiceUiState,
     onBack: () -> Unit,
     onSetPreferLocalWriter: (Boolean) -> Unit,
+    onSetCloudWriterEnabled: (Boolean) -> Unit,
     onImportWriterPackage: () -> Unit,
     onClearWriterPackage: () -> Unit,
     onSaveGeminiApiKey: (String) -> Unit,
     onClearGeminiApiKey: () -> Unit,
+    onSaveOpenRouterApiKey: (String) -> Unit,
+    onClearOpenRouterApiKey: () -> Unit,
     onImportVoicePackage: () -> Unit,
     onClearVoicePackage: () -> Unit,
     onSetVoiceEnabled: (Boolean) -> Unit,
@@ -1248,6 +1382,7 @@ private fun RadioBulletinSettingsPanel(
     onPauseBulletinPreparation: () -> Unit,
     onResumeBulletinPreparation: () -> Unit,
     onResetBulletinBuffer: () -> Unit,
+    onFixFallbackBulletins: () -> Unit,
     onPlayReadyBulletin: (Int) -> Unit,
 ) {
     val settings = radioBulletins.settings
@@ -1289,6 +1424,7 @@ private fun RadioBulletinSettingsPanel(
             onPause = onPauseBulletinPreparation,
             onResume = onResumeBulletinPreparation,
             onReset = onResetBulletinBuffer,
+            onFixFallback = onFixFallbackBulletins,
             onPlay = onPlayReadyBulletin,
         )
         Spacer(Modifier.height(20.dp))
@@ -1347,39 +1483,126 @@ private fun RadioBulletinSettingsPanel(
         Spacer(Modifier.height(20.dp))
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         Spacer(Modifier.height(16.dp))
-        Text("Redator via Gemini (nuvem)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        Text(
-            text = if (radioBulletins.geminiConfigured) {
-                "Chave salva: o Gemini escreve o boletim primeiro (mais rapido), e o redator local so entra se ele falhar."
-            } else {
-                "Opcional: cole sua chave de API gratuita do Gemini pra escrever o boletim na nuvem em vez do redator local. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
-            },
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Spacer(Modifier.height(10.dp))
-        if (radioBulletins.geminiConfigured) {
-            TextButton(onClick = onClearGeminiApiKey) {
-                Text("Remover chave do Gemini", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        } else {
-            var geminiKeyInput by remember { mutableStateOf("") }
-            MetadataTextField(
-                value = geminiKeyInput,
-                onValueChange = { geminiKeyInput = it },
-                label = "Chave de API do Gemini",
-                placeholder = "AIza...",
-            )
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = {
-                    onSaveGeminiApiKey(geminiKeyInput)
-                    geminiKeyInput = ""
-                },
-                enabled = geminiKeyInput.isNotBlank(),
+        // Chave geral Gemini+OpenRouter (06/09/2026, pedido do usuario): desligada, o app ignora
+        // as chaves salvas e so o redator local escreve - liga/desliga sem precisar apagar chave
+        // nenhuma. Ver RadioBulletinSettings.cloudWriterEnabled/RadioBulletinRepository.
+        // enhanceScript.
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = PailerSurface.copy(alpha = 0.9f),
+            shape = RoundedCornerShape(8.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
             ) {
-                Text("Salvar chave")
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Redação em nuvem",
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = if (radioBulletins.settings.cloudWriterEnabled) {
+                            "Ligado: Gemini/OpenRouter escrevem primeiro (mais rapido), redator local so entra se os dois falharem."
+                        } else {
+                            "Desligado: so o redator local escreve, mesmo com chave salva. As chaves continuam guardadas."
+                        },
+                        modifier = Modifier.padding(top = 3.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = radioBulletins.settings.cloudWriterEnabled,
+                    onCheckedChange = onSetCloudWriterEnabled,
+                )
+            }
+        }
+
+        if (radioBulletins.settings.cloudWriterEnabled) {
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            Spacer(Modifier.height(16.dp))
+            Text("Redator via Gemini (nuvem)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = if (radioBulletins.geminiConfigured) {
+                    "Chave salva: o Gemini escreve o boletim primeiro (mais rapido), e o redator local so entra se ele falhar."
+                } else {
+                    "Opcional: cole sua chave de API gratuita do Gemini pra escrever o boletim na nuvem em vez do redator local. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
+                },
+                modifier = Modifier.padding(top = 8.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(10.dp))
+            if (radioBulletins.geminiConfigured) {
+                TextButton(onClick = onClearGeminiApiKey) {
+                    Text("Remover chave do Gemini", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                var geminiKeyInput by remember { mutableStateOf("") }
+                MetadataTextField(
+                    value = geminiKeyInput,
+                    onValueChange = { geminiKeyInput = it },
+                    label = "Chave de API do Gemini",
+                    placeholder = "AIza...",
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        onSaveGeminiApiKey(geminiKeyInput)
+                        geminiKeyInput = ""
+                    },
+                    enabled = geminiKeyInput.isNotBlank(),
+                ) {
+                    Text("Salvar chave")
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            Spacer(Modifier.height(16.dp))
+            // Segunda opcao de nuvem, INDEPENDENTE do Gemini (provedor/infra diferente) - pedido do
+            // usuario (05/09/2026), motivado por um pico de demanda real do Gemini (503 em sequencia)
+            // que so o redator local (lento) sobrava pra cobrir. So entra se o Gemini falhar (ver
+            // RadioBulletinRepository.enhanceScript) - mesma ordem de prioridade "nuvem antes de
+            // local" de sempre, com uma 2a chance de nuvem antes de desistir de vez.
+            Text("Redator via OpenRouter (nuvem, 2ª opção)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = if (radioBulletins.openRouterConfigured) {
+                    "Chave salva: se o Gemini falhar, o OpenRouter tenta escrever antes de cair pro redator local."
+                } else {
+                    "Opcional: cole sua chave de API gratuita do OpenRouter (openrouter.ai) como reserva do Gemini. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
+                },
+                modifier = Modifier.padding(top = 8.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(10.dp))
+            if (radioBulletins.openRouterConfigured) {
+                TextButton(onClick = onClearOpenRouterApiKey) {
+                    Text("Remover chave do OpenRouter", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                var openRouterKeyInput by remember { mutableStateOf("") }
+                MetadataTextField(
+                    value = openRouterKeyInput,
+                    onValueChange = { openRouterKeyInput = it },
+                    label = "Chave de API do OpenRouter",
+                    placeholder = "sk-or-v1-...",
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        onSaveOpenRouterApiKey(openRouterKeyInput)
+                        openRouterKeyInput = ""
+                    },
+                    enabled = openRouterKeyInput.isNotBlank(),
+                ) {
+                    Text("Salvar chave")
+                }
             }
         }
 
@@ -1519,8 +1742,14 @@ private fun RadioBulletinBufferStatusCard(
     onPause: () -> Unit,
     onResume: () -> Unit,
     onReset: () -> Unit,
+    onFixFallback: () -> Unit,
     onPlay: (Int) -> Unit,
 ) {
+    // Amarelo por convencao (nem erro/vermelho, nem normal/primary) pra bolinha de fallback -
+    // roteiro generico/repetitivo (RadioScriptSource.Fallback, ver LocalTuneViewModel.
+    // syncBulletinBufferState) em vez do bate-bola de verdade escrito por LLM. Pedido do usuario
+    // (05/09/2026): "deixamos a bolinha na cor amarela" pra identificar de relance.
+    val fallbackColor = Color(0xFFFFC107)
     // Pulso lento (1400ms, mais devagar que o "radioLivePulse"/"playerLivePulse" de 820ms usados
     // em "ao vivo" pela UI) na bolinha que esta sendo escrita agora - pedido do usuario
     // (03/09/2026): quer ver visualmente qual boletim esta em andamento, piscando devagar.
@@ -1553,12 +1782,13 @@ private fun RadioBulletinBufferStatusCard(
                     )
                     Text(
                         text = "${bulletinBuffer.readyCount}/${bulletinBuffer.targetCount} prontos" +
+                            (if (bulletinBuffer.hasFallback) " · ${bulletinBuffer.fallbackSlots.size} em fallback" else "") +
                             if (bulletinBuffer.isPaused) " · pausado" else "",
                         modifier = Modifier.padding(top = 3.dp),
-                        color = if (bulletinBuffer.isPaused) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                        color = when {
+                            bulletinBuffer.isPaused -> MaterialTheme.colorScheme.error
+                            bulletinBuffer.hasFallback -> fallbackColor
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -1584,6 +1814,7 @@ private fun RadioBulletinBufferStatusCard(
                     val filled = slot < bulletinBuffer.readyCount
                     val preparing = !filled && slot == bulletinBuffer.readyCount && bulletinBuffer.isPreparing
                     val clickable = filled && !bulletinBuffer.isPlayingPreview
+                    val isFallback = filled && slot in bulletinBuffer.fallbackSlots
                     Box(
                         modifier = Modifier
                             .size(14.dp)
@@ -1592,6 +1823,7 @@ private fun RadioBulletinBufferStatusCard(
                             .then(if (clickable) Modifier.clickable { onPlay(slot) } else Modifier)
                             .background(
                                 when {
+                                    isFallback -> fallbackColor
                                     filled -> MaterialTheme.colorScheme.primary
                                     preparing -> MaterialTheme.colorScheme.primary
                                     else -> Color.White.copy(alpha = 0.14f)
@@ -1618,29 +1850,61 @@ private fun RadioBulletinBufferStatusCard(
                 )
             }
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Botoes compactos (padding/icone/texto reduzidos) dentro de um Row com scroll
+            // horizontal - com os 3 (Pausar/Retomar, Resetar, Corrigir fallback) no tamanho
+            // padrao do Material3 a soma nao cabia na largura da tela e o texto do 3o botao
+            // quebrava letra por linha (achado 05/09/2026, ao vivo no aparelho). O scroll e so
+            // rede de seguranca pra telas ainda mais estreitas/fonte grande - com o tamanho
+            // reduzido os 3 cabem normalmente sem precisar rolar.
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                val compactPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
                 if (bulletinBuffer.isPaused) {
-                    Button(onClick = onResume) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Retomar")
+                    Button(onClick = onResume, contentPadding = compactPadding) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Retomar", style = MaterialTheme.typography.labelMedium)
                     }
                 } else {
-                    Button(onClick = onPause) {
-                        Icon(Icons.Filled.Pause, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Pausar")
+                    Button(onClick = onPause, contentPadding = compactPadding) {
+                        Icon(Icons.Filled.Pause, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Pausar", style = MaterialTheme.typography.labelMedium)
                     }
                 }
-                TextButton(onClick = onReset) {
+                TextButton(onClick = onReset, contentPadding = compactPadding) {
                     Icon(
                         Icons.Filled.Refresh,
                         contentDescription = null,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(16.dp),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.width(6.dp))
-                    Text("Resetar", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "Resetar",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+                // So acende quando ha pelo menos 1 bolinha amarela (ver fallbackColor acima) -
+                // remove so os itens em fallback dos buffers e deixa o preparo normal repor essas
+                // vagas priorizando o Gemini de novo (ver LocalTuneViewModel.fixFallbackBulletins).
+                // A mesma correcao roda sozinha em segundo plano assim que um fallback novo entra
+                // no buffer (scheduleFallbackAutoFix) - este botao e so o atalho manual, pra nao
+                // esperar o ciclo automatico.
+                if (bulletinBuffer.hasFallback) {
+                    TextButton(onClick = onFixFallback, contentPadding = compactPadding) {
+                        Icon(
+                            Icons.Filled.Build,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = fallbackColor,
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("Corrigir", color = fallbackColor, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
             // Reproduz o primeiro boletim ja pronto direto aqui, sem precisar entrar numa radio
@@ -1939,6 +2203,205 @@ private fun AlbumArtworkSettingsPanel(
         }
     }
 }
+
+// Backup manual/automatico de favoritos, overrides de album/artista e fotos de artista (ver
+// BackupRepository/BackupScheduler) - pedido do usuario 07/09/2026 depois de perder esses dados
+// num "adb uninstall" usado pra debug. Duas formas de escolher o destino: a pasta oficial do
+// Pailer FM (ver AppFolderRepository - preferida, tambem organiza Logs/Redator Local/Pacote de
+// Vozes) ou um arquivo avulso escolhido na mao (caminho antigo, mantido pra quem configurou
+// antes da pasta oficial existir). Com pasta oficial configurada, o backup sempre usa ela -
+// os controles de "arquivo avulso" ficam ocultos pra nao confundir com dois destinos possiveis.
+@Composable
+private fun BackupSettingsPanel(
+    state: BackupUiState,
+    onBack: () -> Unit,
+    onChooseDestination: () -> Unit,
+    onBackupNow: () -> Unit,
+    onClearDestination: () -> Unit,
+    onRestore: () -> Unit,
+    appFolder: AppFolderUiState,
+    onChooseAppFolder: () -> Unit,
+    onClearAppFolder: () -> Unit,
+) {
+    var pendingRestoreConfirm by remember { mutableStateOf(false) }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Backup",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        Text("Pasta oficial do Pailer FM", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Text(
+            "Uma pasta que voce escolhe uma vez - o app organiza dentro dela as subpastas Backup, Logs, Redator Local e Pacote de Vozes. Os modelos continuam rodando de dentro do app (exigencia tecnica), mas ficam com uma copia de referencia la.",
+            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        if (appFolder.folderName != null) {
+            Text(
+                "Pasta atual: ${appFolder.folderName}",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onChooseAppFolder, modifier = Modifier.fillMaxWidth()) {
+                Text("Trocar pasta")
+            }
+            Spacer(Modifier.height(10.dp))
+            TextButton(onClick = onClearAppFolder, modifier = Modifier.fillMaxWidth()) {
+                Text("Remover pasta oficial")
+            }
+        } else {
+            Button(onClick = onChooseAppFolder, modifier = Modifier.fillMaxWidth()) {
+                Text("Escolher pasta oficial")
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(20.dp))
+
+        Text("Backup", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Text(
+            if (state.usingOfficialFolder) {
+                "Guarda favoritos, fotos de artista e correcoes de album/artista dentro da pasta oficial acima."
+            } else {
+                "Guarda favoritos, fotos de artista e correcoes de album/artista num arquivo que voce escolhe (ex.: no seu Google Drive)."
+            },
+            modifier = Modifier.padding(top = 4.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(16.dp))
+
+        if (state.hasDestination) {
+            Text(
+                "Backup automatico ativo",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            state.destinationDescription?.let { description ->
+                Text(
+                    "Local: $description",
+                    modifier = Modifier.padding(top = 2.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Text(
+                if (state.lastBackupAtMillis > 0L) {
+                    "Ultimo backup: ${formatBackupTimestamp(state.lastBackupAtMillis)}"
+                } else {
+                    "Ainda nao rodou nenhum backup nesse destino."
+                },
+                modifier = Modifier.padding(top = 4.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onBackupNow,
+                enabled = !state.isWorking,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (state.isWorking) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(if (state.isWorking) "Salvando..." else "Fazer backup agora")
+            }
+            // Controles de arquivo avulso ficam ocultos com pasta oficial ativa - so um destino
+            // por vez pra nao confundir (a pasta sempre tem prioridade, ver BackupRepository).
+            if (!state.usingOfficialFolder) {
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(onClick = onChooseDestination, modifier = Modifier.fillMaxWidth()) {
+                    Text("Trocar arquivo de backup")
+                }
+                Spacer(Modifier.height(10.dp))
+                TextButton(onClick = onClearDestination, modifier = Modifier.fillMaxWidth()) {
+                    Text("Desligar backup automatico")
+                }
+            }
+        } else {
+            Button(
+                onClick = onChooseDestination,
+                enabled = !state.isWorking,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Escolher arquivo de backup")
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(16.dp))
+        Text("Restaurar", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Text(
+            "Escolhe um arquivo de backup salvo antes e substitui os dados atuais do app por ele.",
+            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        OutlinedButton(
+            onClick = { pendingRestoreConfirm = true },
+            enabled = !state.isWorking,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Restaurar de um arquivo")
+        }
+
+        state.message?.let { message ->
+            Spacer(Modifier.height(16.dp))
+            Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+
+    if (pendingRestoreConfirm) {
+        AlertDialog(
+            onDismissRequest = { pendingRestoreConfirm = false },
+            icon = { Icon(Icons.Filled.CloudUpload, contentDescription = null) },
+            title = { Text("Restaurar backup") },
+            text = { Text("Isso vai substituir os favoritos, fotos de artista e correcoes atuais pelos do arquivo escolhido. Essa acao nao pode ser desfeita.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRestoreConfirm = false
+                    onRestore()
+                }) {
+                    Text("Restaurar")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRestoreConfirm = false }) {
+                    Text("Cancelar")
+                }
+            },
+        )
+    }
+}
+
+private fun formatBackupTimestamp(millis: Long): String =
+    java.text.SimpleDateFormat("dd/MM/yyyy 'as' HH:mm", java.util.Locale("pt", "BR")).format(java.util.Date(millis))
 
 @Composable
 private fun ArtworkSearchOverlay(
@@ -2577,6 +3040,12 @@ private fun HomeScreen(
     onPlay: (List<LocalSong>, Int, Boolean) -> Unit,
 ) {
     val homeRecentAlbums = remember(recentlyAddedAlbums) { recentlyAddedAlbums.take(8) }
+    // 2a fileira mostra os PROXIMOS recentes (nao os mesmos 8 de cima) - pedido do usuario
+    // 07/09/2026: as duas fileiras repetiam exatamente os mesmos albuns, so espelhado. Cai de
+    // volta pros mesmos 8 apenas se a biblioteca nao tiver mais que isso de albuns recentes.
+    val homeRecentAlbumsRow2 = remember(recentlyAddedAlbums) {
+        recentlyAddedAlbums.drop(8).take(8).ifEmpty { recentlyAddedAlbums.take(8) }
+    }
     val homeListenAgain = remember(listenAgain) { listenAgain.take(8) }
     val homeSuggestedAlbums = remember(suggestedAlbums) { suggestedAlbums.take(6) }
     val homeFavoriteAlbums = remember(favoriteAlbums) { favoriteAlbums.take(6) }
@@ -2610,31 +3079,9 @@ private fun HomeScreen(
         }
         item {
             SectionTitle("Albuns adicionados recentemente", modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp))
-            val recentAlbumsListState = rememberLazyListState()
-            // Carrossel automatico bem lento, avancando uma capa por vez - pausa longa entre
-            // cada passo em vez de animacao de deslize lenta (LazyListState.animateScrollToItem
-            // nao expoe duracao customizavel), da o mesmo efeito de "passeando" pelas capas.
-            LaunchedEffect(homeRecentAlbums) {
-                if (homeRecentAlbums.size > 1) {
-                    while (true) {
-                        delay(4500)
-                        if (!recentAlbumsListState.isScrollInProgress) {
-                            val next = (recentAlbumsListState.firstVisibleItemIndex + 1) % homeRecentAlbums.size
-                            recentAlbumsListState.animateScrollToItem(next)
-                        }
-                    }
-                }
-            }
-            LazyRow(
-                state = recentAlbumsListState,
-                flingBehavior = rememberSoftFlingBehavior(),
-                contentPadding = PaddingValues(horizontal = 18.dp),
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                items(homeRecentAlbums, key = { it.key }) { album ->
-                    AlbumCoverCard(album = album, onClick = { onOpenAlbum(album) })
-                }
-            }
+            ContinuousAlbumRow(albums = homeRecentAlbums, reverse = true, onOpenAlbum = onOpenAlbum)
+            Spacer(Modifier.height(14.dp))
+            ContinuousAlbumRow(albums = homeRecentAlbumsRow2, reverse = false, onOpenAlbum = onOpenAlbum)
         }
         item {
             SectionTitle("Ouvir de novo", modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp))
@@ -2699,10 +3146,301 @@ private fun HomeScreen(
                 )
             }
         }
-        item { SectionTitle("Novas no aparelho", modifier = Modifier.padding(horizontal = 18.dp)) }
-        items(songs.take(8), key = { it.id }) { song ->
-            Box(Modifier.padding(horizontal = 10.dp)) {
-                SongRow(song = song, onClick = { onPlay(songs, songs.indexOf(song), false) })
+    }
+}
+
+// Fileira de capas que desliza sozinha, sem parar, bem devagar (pedido do usuario 07/09/2026 -
+// substitui o carrossel antigo que avancava aos saltos com animateScrollToItem a cada poucos
+// segundos, um efeito "travado"). LazyRow com espaco de indice "infinito" (Int.MAX_VALUE) dando a
+// volta nas mesmas capas via modulo - mesma tecnica da esteira de capas da tela de radio
+// (RadioCoverTicker). Chegou a ser reescrita sem LazyRow (Row manual + graphicsLayer) pra tentar
+// resolver o bug de clique abaixo, mas essa versao teve problemas serios de renderizacao (capas
+// sumindo, layout quebrado) - voltou pro LazyRow, que sempre renderizou certinho; o bug de
+// clique foi resolvido de outro jeito (ver comentario no LaunchedEffect abaixo).
+//
+// BUG DE CLIQUE (07/09/2026): tocar num album da fileira nao abria nada. Causa: o auto-scroll
+// rodava dentro de UM UNICO listState.scroll(MutatePriority.Default) segurado para sempre (loop
+// infinito por dentro do bloco). Qualquer toque na fileira faz o proprio Compose "parar o fling"
+// interceptando o gesto ANTES do clickable do item receber o evento - com o mutex sempre ocupado
+// pelo auto-scroll, TODO toque colidia com isso, entao o clique nunca disparava. Confirmado
+// desligando o auto-scroll: sem ele, o clique funciona perfeitamente.
+// Correcao: em vez de UM scroll() segurado por todos os frames, cada frame faz sua PROPRIA
+// chamada curta e independente (listState.scrollBy) que adquire e solta o mutex na hora - o
+// mutex fica livre durante toda a espera entre frames (a maior parte do tempo real), entao um
+// toque quase nunca coincide com o instante exato de uma chamada em andamento. Rolagem manual
+// continua funcionando (arrastar usa MutatePriority.UserInput, que ainda ganha prioridade se por
+// acaso colidir com uma chamada do auto-scroll).
+@Composable
+private fun ContinuousAlbumRow(
+    albums: List<LocalAlbum>,
+    reverse: Boolean,
+    onOpenAlbum: (LocalAlbum) -> Unit,
+) {
+    if (albums.isEmpty()) return
+    val density = LocalDensity.current
+    val startIndex = remember(albums.size) {
+        val half = Int.MAX_VALUE / 2
+        half - half % albums.size
+    }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = startIndex)
+    LaunchedEffect(listState, reverse) {
+        val sign = if (reverse) -1f else 1f
+        // Bem mais devagar que a esteira de capas da radio (28dp/s) - aqui e so um fundo vivo,
+        // sutil, atras de uma tela que o usuario passa a maior parte do tempo olhando parado.
+        val pxPerSecond = sign * with(density) { 6.dp.toPx() }
+        var lastFrameNanos = 0L
+        while (isActive) {
+            val frameNanos = withFrameNanos { it }
+            if (lastFrameNanos != 0L) {
+                val deltaSeconds = (frameNanos - lastFrameNanos) / 1_000_000_000f
+                // Chamada curta: pega e solta o mutex na hora, nao mantem segurado ate o
+                // proximo frame (isso e o que resolve o bug de clique - ver comentario acima).
+                // Se colidir com um arrasto do usuario (prioridade maior), so essa chamada e
+                // cancelada - ignora e tenta de novo no proximo frame.
+                runCatching { listState.scrollBy(pxPerSecond * deltaSeconds) }
+            }
+            lastFrameNanos = frameNanos
+        }
+    }
+    LazyRow(
+        state = listState,
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(horizontal = 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        items(count = Int.MAX_VALUE) { index ->
+            val album = albums[index % albums.size]
+            AlbumCoverCard(album = album, onClick = { onOpenAlbum(album) })
+        }
+    }
+}
+
+// Painel de noticias/curiosidades dos artistas favoritados, revelado arrastando a Home pra
+// direita (pedido do usuario 06/09/2026 - so na Home, ver LocalTuneApp.kt onde e usado). A zona
+// de deteccao do gesto fica so numa faixa fina na borda esquerda pra nao brigar com os carrosseis
+// horizontais da propria Home (Albuns recentes, Ouvir de novo etc.) - uma vez aberto, o proprio
+// painel e o scrim tambem aceitam arrastar/tocar pra fechar.
+@Composable
+private fun HomeNewsDrawer(
+    favoriteArtists: List<LocalArtist>,
+    newsState: ArtistNewsUiState,
+    onRequestLoad: () -> Unit,
+    onOpenLink: (String) -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    // Cobre quase a tela toda, deixando so um filete da Home visivel na ponta (pedido do usuario)
+    // - 32dp de sobra em vez da largura cheia, pra ainda dar pra perceber que tem conteudo atras.
+    val panelWidthDp = (configuration.screenWidthDp.dp - 32.dp).coerceAtLeast(240.dp)
+    val panelWidthPx = with(density) { panelWidthDp.toPx() }
+    val offsetX = remember { Animatable(-panelWidthPx) }
+    val scope = rememberCoroutineScope()
+    val isOpen = offsetX.value > -panelWidthPx / 2
+    val progress = ((offsetX.value + panelWidthPx) / panelWidthPx).coerceIn(0f, 1f)
+
+    LaunchedEffect(isOpen) {
+        if (isOpen) onRequestLoad()
+    }
+    BackHandler(enabled = progress > 0f) {
+        scope.launch { offsetX.animateTo(-panelWidthPx) }
+    }
+
+    // O gesto de voltar do sistema (navegacao por gestos, Android 10+) tambem escuta a borda
+    // esquerda da tela - sem excluir essa faixa, o Android intercepta o arrasto como "voltar" e
+    // sai do app antes do nosso proprio detector de arrasto receber o toque.
+    val view = LocalView.current
+    var edgeZoneBounds by remember { mutableStateOf<android.graphics.Rect?>(null) }
+    DisposableEffect(view, edgeZoneBounds) {
+        edgeZoneBounds?.let { rect -> ViewCompat.setSystemGestureExclusionRects(view, listOf(rect)) }
+        onDispose { ViewCompat.setSystemGestureExclusionRects(view, emptyList()) }
+    }
+
+    val dragModifier = Modifier.pointerInput(panelWidthPx) {
+        detectHorizontalDragGestures(
+            onDragEnd = {
+                scope.launch {
+                    offsetX.animateTo(if (offsetX.value > -panelWidthPx / 2) 0f else -panelWidthPx)
+                }
+            },
+            onHorizontalDrag = { change, dragAmount ->
+                change.consume()
+                scope.launch { offsetX.snapTo((offsetX.value + dragAmount).coerceIn(-panelWidthPx, 0f)) }
+            },
+        )
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        content()
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .fillMaxHeight()
+                .width(28.dp)
+                .onGloballyPositioned { coordinates ->
+                    val bounds = coordinates.boundsInWindow()
+                    edgeZoneBounds = android.graphics.Rect(
+                        bounds.left.roundToInt(),
+                        bounds.top.roundToInt(),
+                        bounds.right.roundToInt(),
+                        bounds.bottom.roundToInt(),
+                    )
+                }
+                .then(dragModifier),
+        )
+        if (progress > 0f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f * progress))
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                    ) { scope.launch { offsetX.animateTo(-panelWidthPx) } }
+                    .then(dragModifier),
+            )
+        }
+        Column(
+            modifier = Modifier
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .width(panelWidthDp)
+                .fillMaxHeight()
+                .background(PailerCharcoal)
+                .then(dragModifier)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(vertical = 18.dp),
+        ) {
+            Text(
+                "Novidades dos seus favoritos",
+                modifier = Modifier.padding(horizontal = 18.dp),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Black,
+            )
+            Spacer(Modifier.height(4.dp))
+            when {
+                favoriteArtists.isEmpty() -> Text(
+                    "Curta um artista pra ver noticias e curiosidades dele aqui.",
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                newsState.isLoading -> Box(
+                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+                }
+                newsState.hasLoaded && newsState.cards.isEmpty() -> Text(
+                    "Nao encontrei noticias recentes dos seus favoritos agora.",
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                else -> LazyColumn(
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(newsState.cards, key = { it.link }) { card ->
+                        val artist = favoriteArtists.firstOrNull { it.key == card.artistName.lowercase().trim() }
+                        val coverSong = artist?.songs?.firstOrNull { it.artworkUri != null }
+                        ArtistNewsCardView(
+                            card = card,
+                            artworkUri = coverSong?.artworkUri,
+                            embeddedSourceUri = coverSong?.contentUri,
+                            onClick = { onOpenLink(card.link) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArtistNewsCardView(
+    card: ArtistNewsCard,
+    artworkUri: Uri?,
+    embeddedSourceUri: Uri?,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(PailerGunmetal.copy(alpha = 0.5f))
+            .clickable(onClick = onClick)
+            .padding(bottom = 14.dp),
+    ) {
+        if (card.imageUrl.isNotBlank()) {
+            NetworkThumbnail(
+                url = card.imageUrl,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f),
+            )
+        } else {
+            ArtworkBox(
+                uri = artworkUri,
+                embeddedSourceUri = embeddedSourceUri,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f),
+                iconModifier = Modifier.size(44.dp),
+            )
+        }
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                ) {
+                    ArtworkBox(
+                        uri = artworkUri,
+                        embeddedSourceUri = embeddedSourceUri,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(CircleShape),
+                        iconModifier = Modifier.size(12.dp),
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    card.artistName,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                card.headline,
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                card.source,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val dateLabel = formatNewsDate(card.publishedAtMillis)
+            if (dateLabel.isNotBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    dateLabel,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                )
             }
         }
     }
@@ -2714,6 +3452,7 @@ private fun ArtistsScreen(
     onOpenArtist: (LocalArtist) -> Unit,
     onDeleteArtist: (LocalArtist) -> Unit = {},
     favoriteArtistKeys: Set<String> = emptySet(),
+    photoUriFor: (LocalArtist) -> Uri? = { null },
     scrollState: ScrollState = rememberScrollState(),
 ) {
     // Bento: favoritos ocupam bloco 2x2 de verdade, os demais fluem 1x1 ao redor - por isso
@@ -2733,6 +3472,7 @@ private fun ArtistsScreen(
                 artist = artist,
                 onClick = { onOpenArtist(artist) },
                 onLongClick = { onDeleteArtist(artist) },
+                photoUri = photoUriFor(artist),
             )
         }
     }
@@ -2855,6 +3595,7 @@ private fun GenreDetailScreen(
     onPlayGenre: () -> Unit,
     onShuffleGenre: () -> Unit,
     onCreateRadio: () -> Unit = {},
+    photoUriFor: (LocalArtist) -> Uri? = { null },
     listState: LazyGridState = rememberLazyGridState(),
 ) {
     var showCreateRadioConfirm by rememberSaveable(genre.name) { mutableStateOf(false) }
@@ -2933,6 +3674,7 @@ private fun GenreDetailScreen(
             ArtistGridCard(
                 artist = artist,
                 onClick = { onOpenArtist(artist) },
+                photoUri = photoUriFor(artist),
             )
         }
     }
@@ -2961,7 +3703,6 @@ private fun ArtistDetailScreen(
     artist: LocalArtist,
     albums: List<LocalAlbum>,
     isFavorite: Boolean,
-    onBack: () -> Unit,
     onToggleFavorite: () -> Unit,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onPlayArtist: () -> Unit,
@@ -2969,12 +3710,24 @@ private fun ArtistDetailScreen(
     availableGenres: List<String>,
     onSaveMetadata: (String, List<AlbumMetadataEdit>) -> Unit,
     onCreateRadio: () -> Unit = {},
+    photoOverrideUri: Uri? = null,
+    photoState: ArtistPhotoUiState = ArtistPhotoUiState(),
+    onOpenPhotoSearch: () -> Unit = {},
+    onClosePhotoSearch: () -> Unit = {},
+    onSelectPhotoCandidate: (ArtworkCandidate) -> Unit = {},
+    onApplyPhoto: () -> Unit = {},
+    onRemovePhoto: () -> Unit = {},
     listState: LazyGridState = rememberLazyGridState(),
 ) {
+    // Foto escolhida pelo usuario (busca na web) tem prioridade sobre a capa do primeiro album -
+    // ver LocalTuneViewModel.artistPhotoUri/LocalArtist nao ter foto propria no data model.
     val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
+    val displayUri = photoOverrideUri ?: artworkSong?.artworkUri
+    val displayEmbeddedSource = if (photoOverrideUri != null) null else artworkSong?.contentUri
     var showEditor by rememberSaveable(artist.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(artist.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
+        AlbumArtBackdrop(uri = displayUri, embeddedSourceUri = displayEmbeddedSource)
         LazyVerticalGrid(
             columns = GridCells.Fixed(3),
             state = listState,
@@ -2984,44 +3737,35 @@ private fun ArtistDetailScreen(
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             item(span = { GridItemSpan(maxLineSpan) }) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(
-                            Icons.Filled.ArrowBack,
-                            contentDescription = "Voltar",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = { showEditor = true }) {
-                        Icon(
-                            Icons.Filled.Edit,
-                            contentDescription = "Editar metadados",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                    IconButton(onClick = onToggleFavorite) {
-                        Icon(
-                            imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                            contentDescription = "Curtir artista",
-                            tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                }
-            }
-            item(span = { GridItemSpan(maxLineSpan) }) {
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    ArtworkBox(
-                        uri = artworkSong?.artworkUri,
-                        embeddedSourceUri = artworkSong?.contentUri,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .aspectRatio(1f),
-                        iconModifier = Modifier.size(84.dp),
-                    )
+                    Box(contentAlignment = Alignment.BottomEnd) {
+                        ArtworkBox(
+                            uri = displayUri,
+                            embeddedSourceUri = displayEmbeddedSource,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(1f),
+                            iconModifier = Modifier.size(84.dp),
+                        )
+                        IconButton(
+                            onClick = onOpenPhotoSearch,
+                            modifier = Modifier
+                                .padding(10.dp)
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(PailerGunmetal.copy(alpha = 0.75f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "Buscar foto do artista na web",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(16.dp))
                     Text(
                         artist.name,
@@ -3083,6 +3827,34 @@ private fun ArtistDetailScreen(
                                 tint = MaterialTheme.colorScheme.onBackground,
                             )
                         }
+                        Spacer(Modifier.width(20.dp))
+                        IconButton(
+                            onClick = { showEditor = true },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(PailerGunmetal.copy(alpha = 0.5f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "Editar metadados",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
+                        Spacer(Modifier.width(20.dp))
+                        IconButton(
+                            onClick = onToggleFavorite,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(PailerGunmetal.copy(alpha = 0.5f)),
+                        ) {
+                            Icon(
+                                imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                contentDescription = "Curtir artista",
+                                tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
                     }
                 }
             }
@@ -3123,6 +3895,157 @@ private fun ArtistDetailScreen(
                     }
                 },
             )
+        }
+        if (photoState.activeArtistKey == artist.key) {
+            ArtistPhotoSearchOverlay(
+                artist = artist,
+                state = photoState,
+                hasOverride = photoOverrideUri != null,
+                onCancel = onClosePhotoSearch,
+                onSelectCandidate = onSelectPhotoCandidate,
+                onApply = onApplyPhoto,
+                onRemove = { onRemovePhoto(); onClosePhotoSearch() },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArtistPhotoSearchOverlay(
+    artist: LocalArtist,
+    state: ArtistPhotoUiState,
+    hasOverride: Boolean,
+    onCancel: () -> Unit,
+    onSelectCandidate: (ArtworkCandidate) -> Unit,
+    onApply: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.58f)),
+    ) {
+        Surface(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(18.dp)
+                .fillMaxWidth(),
+            color = PailerSurfaceHigh,
+            shape = RoundedCornerShape(8.dp),
+            tonalElevation = 10.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Foto de ${artist.name}",
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onBackground,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = onCancel) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancelar", tint = MaterialTheme.colorScheme.onBackground)
+                    }
+                }
+                when {
+                    state.isSearching -> Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 24.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                    state.candidates.isEmpty() -> Text(
+                        state.message ?: "Nenhuma foto encontrada pra essa busca.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    else -> LazyRow(
+                        flingBehavior = rememberSoftFlingBehavior(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        items(state.candidates, key = { it.previewUrl }) { candidate ->
+                            val selected = candidate == state.selectedCandidate
+                            Column(
+                                modifier = Modifier
+                                    .width(84.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onSelectCandidate(candidate) },
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .then(
+                                            if (selected) {
+                                                Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f))
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
+                                        .padding(if (selected) 3.dp else 0.dp),
+                                ) {
+                                    NetworkThumbnail(url = candidate.previewUrl, modifier = Modifier.fillMaxSize())
+                                }
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    candidate.label,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (state.isDownloadingSelection) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Baixando foto escolhida...",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    TextButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                        Text("Cancelar")
+                    }
+                    Button(
+                        onClick = onApply,
+                        enabled = state.selectedCandidate != null && !state.isDownloadingSelection && !state.isApplying,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        if (state.isApplying) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(if (state.isApplying) "Salvando..." else "Aplicar")
+                    }
+                }
+                if (hasOverride) {
+                    TextButton(onClick = onRemove, modifier = Modifier.fillMaxWidth()) {
+                        Text("Voltar a usar capa de album")
+                    }
+                }
+            }
         }
     }
 }
@@ -3476,11 +4399,48 @@ private fun AlbumsScreen(
     }
 }
 
+// Compartilha o arquivo de audio de verdade (Uri do MediaStore) via ACTION_SEND - o app que
+// recebe (WhatsApp, Bluetooth, Drive, etc.) ganha a faixa tocavel direto, sem passar por zip.
+private fun shareSong(context: Context, uri: Uri?, title: String) {
+    if (uri == null) return
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "audio/*"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, title)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Compartilhar musica"))
+}
+
+// Compartilha varias faixas de uma vez (ex.: album inteiro) via ACTION_SEND_MULTIPLE - preferido
+// a zipar os arquivos: chega no destinatario como faixas tocaveis direto (a maioria dos apps que
+// recebem midia aceita varios anexos de audio), sem o custo de gerar/copiar um zip temporario nem
+// depender do destinatario saber descompactar.
+private fun shareSongs(context: Context, songs: List<LocalSong>, subject: String) {
+    if (songs.isEmpty()) return
+    if (songs.size == 1) {
+        shareSong(context, songs.first().contentUri, songs.first().title)
+        return
+    }
+    val uris = songs.map { it.contentUri }
+    val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+        type = "audio/*"
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+        putExtra(Intent.EXTRA_SUBJECT, subject)
+        // ClipData com todas as Uris - e o que faz o FLAG_GRANT_READ_URI_PERMISSION valer pra
+        // cada arquivo (o app que recebe so consegue ler o que estiver listado aqui).
+        clipData = ClipData(subject, arrayOf("audio/*"), ClipData.Item(uris.first())).apply {
+            uris.drop(1).forEach { addItem(ClipData.Item(it)) }
+        }
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Compartilhar album"))
+}
+
 @Composable
 private fun AlbumDetailScreen(
     album: LocalAlbum,
     isFavorite: Boolean,
-    onBack: () -> Unit,
     onToggleFavorite: () -> Unit,
     onPlayAlbum: () -> Unit,
     onShuffleAlbum: () -> Unit,
@@ -3498,41 +4458,19 @@ private fun AlbumDetailScreen(
     currentlyPlayingSongId: Long? = null,
     listState: LazyListState = rememberLazyListState(),
 ) {
+    val context = LocalContext.current
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
+        if (!album.isVariousArtists) {
+            AlbumArtBackdrop(uri = album.artworkUri)
+        }
         LazyColumn(
             state = listState,
             flingBehavior = rememberSoftFlingBehavior(),
-            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+            contentPadding = PaddingValues(vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(
-                            Icons.Filled.ArrowBack,
-                            contentDescription = "Voltar",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = { showEditor = true }) {
-                        Icon(
-                            Icons.Filled.Edit,
-                            contentDescription = "Editar metadados",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                    IconButton(onClick = onToggleFavorite) {
-                        Icon(
-                            imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                            contentDescription = "Curtir album",
-                            tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
-                }
-            }
             item {
                 Column(
                     modifier = Modifier.fillMaxWidth(),
@@ -3540,9 +4478,8 @@ private fun AlbumDetailScreen(
                 ) {
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth(0.72f)
-                            .aspectRatio(1f)
-                            .clip(RoundedCornerShape(8.dp)),
+                            .fillMaxWidth()
+                            .aspectRatio(1f),
                     ) {
                         if (album.isVariousArtists) {
                             AlbumCoverMosaic(
@@ -3572,26 +4509,33 @@ private fun AlbumDetailScreen(
                         )
                     }
                     Spacer(Modifier.height(18.dp))
-                    Text(
-                        album.title,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Black,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        album.artist,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        "${album.songs.size} faixas",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 18.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            album.title,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Black,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            album.artist,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            "${album.songs.size} faixas",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
             }
             item {
@@ -3641,19 +4585,63 @@ private fun AlbumDetailScreen(
                             tint = MaterialTheme.colorScheme.onBackground,
                         )
                     }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = { showEditor = true },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.Edit,
+                            contentDescription = "Editar metadados",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = onToggleFavorite,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                            contentDescription = "Curtir album",
+                            tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    Spacer(Modifier.width(20.dp))
+                    IconButton(
+                        onClick = { shareSongs(context, album.songs, album.title) },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.Share,
+                            contentDescription = "Compartilhar album",
+                            tint = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
                 }
             }
             items(album.songs, key = { it.id }) { song ->
                 val index = album.songs.indexOf(song)
-                AlbumTrackRow(
-                    trackNumber = index + 1,
-                    song = song,
-                    isFavorite = isSongFavorite(song),
-                    onClick = { onPlaySong(index) },
-                    onToggleFavorite = { onToggleSongFavorite(song) },
-                    isPlaying = song.id == currentlyPlayingSongId,
-                    showArtwork = album.isVariousArtists,
-                )
+                Box(Modifier.padding(horizontal = 18.dp)) {
+                    AlbumTrackRow(
+                        trackNumber = index + 1,
+                        song = song,
+                        isFavorite = isSongFavorite(song),
+                        onClick = { onPlaySong(index) },
+                        onToggleFavorite = { onToggleSongFavorite(song) },
+                        isPlaying = song.id == currentlyPlayingSongId,
+                        showArtwork = album.isVariousArtists,
+                    )
+                }
             }
         }
 
@@ -4054,12 +5042,18 @@ private fun RadioDetailScreen(
                     shape = RoundedCornerShape(8.dp),
                     colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.9f)),
                 ) {
-                    Column(Modifier.padding(18.dp)) {
-                        RadioCoverMosaic(
-                            songs = radio.coverSongs,
-                            modifier = Modifier.size(104.dp),
-                        )
+                    Column(Modifier.padding(vertical = 18.dp)) {
+                        val radioAlbumSongs = remember(radio.songs) {
+                            radio.songs.distinctBy { it.albumId }.filter { it.albumId > 0 }
+                        }
+                        val radioAlbumNames = remember(radioAlbumSongs) {
+                            radioAlbumSongs.map { "${it.artist} – ${it.album}" }
+                        }
+                        RadioCoverTicker(songs = radio.songs)
+                        Spacer(Modifier.height(10.dp))
+                        RadioNameTicker(names = radioAlbumNames)
                         Spacer(Modifier.height(16.dp))
+                        Column(Modifier.padding(horizontal = 18.dp)) {
                         Text(
                             radio.name,
                             color = MaterialTheme.colorScheme.onBackground,
@@ -4155,6 +5149,7 @@ private fun RadioDetailScreen(
                                     tint = MaterialTheme.colorScheme.onBackground,
                                 )
                             }
+                        }
                         }
                     }
                 }
@@ -4535,8 +5530,10 @@ private fun AlbumRow(album: LocalAlbum, onClick: () -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick: (() -> Unit)? = null, photoUri: Uri? = null) {
     val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
+    val displayUri = photoUri ?: artworkSong?.artworkUri
+    val displayEmbeddedSource = if (photoUri != null) null else artworkSong?.contentUri
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -4544,8 +5541,8 @@ private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
         ArtworkBox(
-            uri = artworkSong?.artworkUri,
-            embeddedSourceUri = artworkSong?.contentUri,
+            uri = displayUri,
+            embeddedSourceUri = displayEmbeddedSource,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f),
@@ -4984,6 +5981,163 @@ private fun RadioCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifi
     }
 }
 
+// Carrega a capa embutida de VARIAS faixas reaproveitando a MESMA instancia de
+// MediaMetadataRetriever (troca de dataSource via setDataSource, sem recriar) - ver comentario em
+// RadioCoverTicker. Criar/descartar um MediaMetadataRetriever novo por faixa em sequencia rapida
+// (loadEmbeddedArtwork isolado, um por faixa) devolvia bitmaps "validos" (nao-null, dimensoes
+// certas) mas com pixels corrompidos pra todas menos a primeira faixa - reaproveitar a mesma
+// instancia evita esse problema de recursos nativos do MediaMetadataRetriever.
+private fun loadEmbeddedArtworkBatch(context: Context, songs: List<LocalSong>): List<androidx.compose.ui.graphics.ImageBitmap?> {
+    val retriever = android.media.MediaMetadataRetriever()
+    try {
+        return songs.map { song ->
+            runCatching {
+                val cacheKey = "embedded:${song.contentUri}"
+                artworkMemoryCache.get(cacheKey)?.let { return@runCatching it }
+                retriever.setDataSource(context, song.contentUri)
+                val bytes = retriever.embeddedPicture ?: return@runCatching song.artworkUri?.let { loadScaledArtwork(context, it) }
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                val options = BitmapFactory.Options().apply {
+                    inSampleSize = calculateArtworkSampleSize(bounds.outWidth, bounds.outHeight)
+                    inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+                }
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+                if (bitmap != null) artworkMemoryCache.put(cacheKey, bitmap)
+                bitmap
+            }.getOrNull()
+        }
+    } finally {
+        retriever.release()
+    }
+}
+
+// Usa LazyRow (virtualizada) em vez de uma Row gigante com N copias lado a lado. Uma Row comum
+// com muitas capas de 156dp (radios com muitos albuns) chegava a dezenas de milhares de pixels de
+// largura total - isso estourava o limite de textura da GPU do aparelho, corrompendo o desenho de
+// forma intermitente (as vezes aparecia certo, as vezes ficava em branco, dependendo da posicao de
+// scroll e do momento). LazyRow so compoe/desenha o que esta visivel + uma pequena margem, entao a
+// largura real desenhada nunca cresce com a quantidade de capas - o indice "infinito"
+// (Int.MAX_VALUE itens) com `% covers.size` da a volta pras mesmas capas indefinidamente, e um
+// scroll continuo por frame (em vez de Modifier.offset animado) avanca a lista pra sempre.
+@Composable
+private fun RadioCoverTicker(songs: List<LocalSong>, modifier: Modifier = Modifier) {
+    val covers = remember(songs) { songs.distinctBy { it.albumId }.filter { it.albumId > 0 } }
+    if (covers.isEmpty()) return
+    val context = LocalContext.current
+    var images by remember(covers) {
+        mutableStateOf<List<androidx.compose.ui.graphics.ImageBitmap?>>(covers.map { null })
+    }
+    LaunchedEffect(covers) {
+        images = withContext(Dispatchers.IO) { loadEmbeddedArtworkBatch(context, covers) }
+    }
+    val itemSize = 156.dp
+    val spacing = 3.dp
+    val density = LocalDensity.current
+    val startIndex = remember(covers) {
+        val half = Int.MAX_VALUE / 2
+        half - half % covers.size
+    }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = startIndex)
+    LaunchedEffect(listState) {
+        val pxPerSecond = with(density) { 28.dp.toPx() }
+        listState.scroll(MutatePriority.PreventUserInput) {
+            var lastFrameNanos = 0L
+            while (true) {
+                withFrameNanos { frameNanos ->
+                    if (lastFrameNanos != 0L) {
+                        val deltaSeconds = (frameNanos - lastFrameNanos) / 1_000_000_000f
+                        scrollBy(pxPerSecond * deltaSeconds)
+                    }
+                    lastFrameNanos = frameNanos
+                }
+            }
+        }
+    }
+    LazyRow(
+        state = listState,
+        userScrollEnabled = false,
+        modifier = modifier
+            .fillMaxWidth()
+            .height(itemSize)
+            .clipToBounds(),
+        horizontalArrangement = Arrangement.spacedBy(spacing),
+    ) {
+        items(count = Int.MAX_VALUE) { index ->
+            val coverIndex = index % covers.size
+            val bitmap = images.getOrNull(coverIndex)
+            val tileModifier = Modifier
+                .size(itemSize)
+                .clip(RoundedCornerShape(8.dp))
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = tileModifier,
+                )
+            } else {
+                ArtworkPlaceholder(modifier = tileModifier, iconModifier = Modifier.size(32.dp))
+            }
+        }
+    }
+}
+
+// Filete de texto com o nome de todos os artistas/albuns da radio, rolando da direita pra
+// esquerda junto com RadioCoverTicker acima. Largura do texto so se sabe em tempo de execucao
+// (fontes/nomes variam), entao mede 1 copia via onSizeChanged e desloca por essa largura medida -
+// mesma logica de loop sem emenda do ticker de capas, só que com medida em vez de calculo fixo.
+@Composable
+private fun RadioNameTicker(names: List<String>, modifier: Modifier = Modifier) {
+    if (names.isEmpty()) return
+    val segment = remember(names) { names.joinToString("   •   ") + "   •   " }
+    var segmentWidthPx by remember(names) { mutableStateOf(0) }
+    val speedDpPerSecond = 55f
+    val density = LocalDensity.current
+    val durationMillis = remember(segmentWidthPx, density) {
+        if (segmentWidthPx <= 0) {
+            4000
+        } else {
+            (with(density) { segmentWidthPx.toDp().value } / speedDpPerSecond * 1000).toInt().coerceAtLeast(1000)
+        }
+    }
+    val transition = rememberInfiniteTransition(label = "radio-name-ticker")
+    val offsetPx by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = -segmentWidthPx.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = durationMillis, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "radio-name-ticker-offset",
+    )
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clipToBounds(),
+    ) {
+        Row(modifier = Modifier.offset { IntOffset(offsetPx.roundToInt(), 0) }) {
+            Text(
+                segment,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Visible,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.onSizeChanged { segmentWidthPx = it.width },
+            )
+            Text(
+                segment,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Visible,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+    }
+}
+
 // Mosaico de capas pra albuns "various artists" (compilacoes montadas a mao) - as faixas
 // compartilham o mesmo ALBUM_ID no MediaStore, entao nao da pra usar `distinctBy { albumId }`
 // como no RadioCoverMosaic. Prioriza diversidade por artista e usa a capa EMBUTIDA de cada
@@ -5125,77 +6279,80 @@ private fun ContinueListeningCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Card(
-        modifier = modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.9f)),
-    ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
+    Column(modifier = modifier.fillMaxWidth()) {
+        SectionTitle("Continuar ouvindo")
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(onClick = onClick),
         ) {
-            Box(contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)) {
                 ArtworkBox(
                     uri = song.artworkUri,
                     embeddedSourceUri = song.contentUri,
-                    modifier = Modifier.size(154.dp),
-                    iconModifier = Modifier.size(46.dp),
+                    modifier = Modifier.fillMaxSize(),
+                    iconModifier = Modifier.size(64.dp),
                 )
                 Box(
                     modifier = Modifier
-                        .size(54.dp)
+                        .align(Alignment.Center)
+                        .size(64.dp)
                         .clip(CircleShape)
-                        .background(PailerCharcoal.copy(alpha = 0.8f)),
+                        .background(PailerCharcoal.copy(alpha = 0.75f)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
                         Icons.Filled.PlayArrow,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(34.dp),
+                        modifier = Modifier.size(36.dp),
+                    )
+                }
+                // Barra de progresso tipo "linha do tempo" no rodape da capa, igual a marca de
+                // progresso das thumbnails do YouTube - pedido do usuario pra dar mais cara de
+                // player pro card de "continuar ouvindo".
+                val progress = if (song.durationMs > 0) {
+                    (positionMs.toFloat() / song.durationMs.toFloat()).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .background(Color.White.copy(alpha = 0.3f)),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(progress)
+                            .background(MaterialTheme.colorScheme.primary),
                     )
                 }
             }
-            Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Continuar ouvindo",
-                    color = MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    song.album,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    song.artist,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    song.title,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Text(
-                    "Retomar em ${formatDuration(positionMs)}",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                song.title,
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "${song.artist} · ${song.album}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "Retomar em ${formatDuration(positionMs)}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
         }
     }
 }
@@ -5362,6 +6519,7 @@ private fun FullPlayer(
     onToggleAlbumSongFavorite: (LocalSong) -> Unit = {},
     onPlayAlbumSong: (LocalSong) -> Unit = {},
 ) {
+    val context = LocalContext.current
     val isRadio = player.activeRadioName.isNotBlank()
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -5397,6 +6555,16 @@ private fun FullPlayer(
                         imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                         contentDescription = "Curtir faixa",
                         tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+                IconButton(
+                    onClick = { shareSong(context, player.artworkSourceUri, player.title) },
+                    enabled = player.songId != null,
+                ) {
+                    Icon(
+                        Icons.Filled.Share,
+                        contentDescription = "Compartilhar musica",
+                        tint = MaterialTheme.colorScheme.onBackground,
                     )
                 }
                 IconButton(onClick = onClose) {
@@ -5715,12 +6883,20 @@ private fun ArtworkBox(
     embeddedSourceUri: Uri? = null,
 ) {
     val context = LocalContext.current
-    var image by remember(uri, embeddedSourceUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    // Valor inicial busca o cache em memoria NA HORA (sincrono, sem coroutine) - se a capa ja foi
+    // decodificada antes (ex.: voltando pra uma tela ja visitada), aparece na primeira composicao
+    // sem o "pisca" do placeholder enquanto o LaunchedEffect da volta ate a thread de IO so pra
+    // achar o mesmo bitmap que ja estava em memoria.
+    var image by remember(uri, embeddedSourceUri) {
+        mutableStateOf(peekCachedArtwork(uri, embeddedSourceUri))
+    }
 
     LaunchedEffect(uri, embeddedSourceUri) {
-        image = withContext(Dispatchers.IO) {
-            embeddedSourceUri?.let { loadEmbeddedArtwork(context, it) }
-                ?: uri?.let { loadScaledArtwork(context, it) }
+        if (image == null) {
+            image = withContext(Dispatchers.IO) {
+                embeddedSourceUri?.let { loadEmbeddedArtwork(context, it) }
+                    ?: uri?.let { loadScaledArtwork(context, it) }
+            }
         }
     }
 
@@ -5785,7 +6961,123 @@ private fun loadEmbeddedArtwork(context: android.content.Context, contentUri: Ur
         bitmap
     }.getOrNull()
 
-private val artworkMemoryCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(96)
+// Checagem sincrona do cache (sem I/O) - ver uso em ArtworkBox.
+private fun peekCachedArtwork(uri: Uri?, embeddedSourceUri: Uri?): androidx.compose.ui.graphics.ImageBitmap? {
+    embeddedSourceUri?.let { artworkMemoryCache.get("embedded:$it") }?.let { return it }
+    uri?.let { artworkMemoryCache.get(it.toString()) }?.let { return it }
+    return null
+}
+
+// 96 entradas era pouco pra uma biblioteca de verdade (bibliotecas com centenas de albuns
+// estouravam o cache so navegando entre Artistas/Albuns, forcando redecodificar a mesma capa
+// de novo a cada visita) - pedido do usuario (07/09/2026): capas recarregando toda vez que volta
+// pra uma tela ja visitada. Cada entrada e no maximo ~200KB (RGB_565, ate 320x320 - ver
+// ARTWORK_DECODE_TARGET_PX), entao 400 entradas ficam bem abaixo do limite de heap tipico.
+private val artworkMemoryCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(400)
+
+// Fundo personalizado da tela de album/artista: a propria capa, bem reduzida e desfocada,
+// atras do conteudo. Decodifica num tamanho minusculo (BACKDROP_DECODE_TARGET_PX) de proposito -
+// o upscale ja produz um efeito suave por si so, e sobra pouco trabalho pra Modifier.blur() (que
+// so tem efeito real em API 31+; abaixo disso o proprio bitmap pequeno ja resolve visualmente).
+private val backdropArtworkCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(24)
+private const val BACKDROP_DECODE_TARGET_PX = 48
+
+private fun loadBackdropArtwork(context: android.content.Context, uri: Uri): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val cacheKey = uri.toString()
+        backdropArtworkCache.get(cacheKey)?.let { return@runCatching it }
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, bounds)
+        }
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = calculateBackdropSampleSize(bounds.outWidth, bounds.outHeight)
+            inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+        }
+
+        val bitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, options)?.asImageBitmap()
+        }
+        if (bitmap != null) backdropArtworkCache.put(cacheKey, bitmap)
+        bitmap
+    }.getOrNull()
+
+private fun loadEmbeddedBackdropArtwork(context: android.content.Context, contentUri: Uri): androidx.compose.ui.graphics.ImageBitmap? =
+    runCatching {
+        val cacheKey = "embedded:$contentUri"
+        backdropArtworkCache.get(cacheKey)?.let { return@runCatching it }
+        val retriever = android.media.MediaMetadataRetriever()
+        val bitmap = try {
+            retriever.setDataSource(context, contentUri)
+            val bytes = retriever.embeddedPicture ?: return@runCatching null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = calculateBackdropSampleSize(bounds.outWidth, bounds.outHeight)
+                inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+        } finally {
+            retriever.release()
+        }
+        if (bitmap != null) backdropArtworkCache.put(cacheKey, bitmap)
+        bitmap
+    }.getOrNull()
+
+private fun calculateBackdropSampleSize(width: Int, height: Int): Int {
+    if (width <= BACKDROP_DECODE_TARGET_PX && height <= BACKDROP_DECODE_TARGET_PX) return 1
+    var sampleSize = 1
+    var halfWidth = width / 2
+    var halfHeight = height / 2
+    while ((halfWidth / sampleSize) >= BACKDROP_DECODE_TARGET_PX && (halfHeight / sampleSize) >= BACKDROP_DECODE_TARGET_PX) {
+        sampleSize *= 2
+    }
+    return sampleSize.coerceAtLeast(1)
+}
+
+// Camada de fundo personalizada por album/artista: a capa em si, super reduzida, desfocada e com
+// baixa opacidade sobre a cor de fundo do tema - uma "marca dagua" leve que da identidade a tela
+// sem prejudicar a leitura do conteudo por cima. Colocar como primeiro filho do Box da tela (antes
+// da lista), pra tudo o mais desenhar por cima.
+@Composable
+private fun AlbumArtBackdrop(
+    uri: Uri?,
+    embeddedSourceUri: Uri? = null,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var image by remember(uri, embeddedSourceUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+
+    LaunchedEffect(uri, embeddedSourceUri) {
+        image = withContext(Dispatchers.IO) {
+            embeddedSourceUri?.let { loadEmbeddedBackdropArtwork(context, it) }
+                ?: uri?.let { loadBackdropArtwork(context, it) }
+        }
+    }
+
+    val backgroundColor = MaterialTheme.colorScheme.background
+    Box(modifier.fillMaxSize()) {
+        image?.let { bitmap ->
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                alpha = 0.24f,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Modifier.blur(24.dp) else Modifier,
+                    ),
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(backgroundColor.copy(alpha = 0.55f)),
+            )
+        }
+    }
+}
 
 private fun calculateArtworkSampleSize(width: Int, height: Int): Int {
     if (width <= ARTWORK_DECODE_TARGET_PX && height <= ARTWORK_DECODE_TARGET_PX) return 1
@@ -5965,4 +7257,18 @@ private fun formatDuration(durationMs: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%d:%02d".format(minutes, seconds)
+}
+
+private val newsDateFormatter = java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy")
+
+// card.publishedAtMillis vem do <pubDate> do RSS (ver ArtistNewsRepository.parsePubDate) - 0
+// quando o item nao trouxe data, exibida como "" pra ArtistNewsCardView simplesmente omitir a
+// linha.
+private fun formatNewsDate(publishedAtMillis: Long): String {
+    if (publishedAtMillis <= 0L) return ""
+    return runCatching {
+        java.time.Instant.ofEpochMilli(publishedAtMillis)
+            .atZone(java.time.ZoneId.systemDefault())
+            .format(newsDateFormatter)
+    }.getOrDefault("")
 }

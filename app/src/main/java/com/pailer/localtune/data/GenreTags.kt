@@ -44,7 +44,7 @@ val GENRE_TAG_CATALOG: List<String> = listOf(
     "Stoner Rock", "Desert Rock", "Noise Rock", "Symphonic Rock", "Roots Rock",
 
     // Punk e derivados
-    "Punk", "Punk Rock", "Post-Punk", "Coldwave", "Darkwave", "Deathrock", "Goth Rock",
+    "Punk", "Punk Rock", "Post-Punk", "Cold Wave", "Darkwave", "Deathrock", "Goth Rock",
     "Hardcore Punk", "Post-Hardcore", "Pop Punk", "Ska Punk", "Anarcho-Punk", "Garage Punk",
     "Street Punk", "Oi!", "Horror Punk", "Emo", "Screamo", "Riot Grrrl",
 

@@ -274,10 +274,12 @@ class LocalRadioVoiceEngine(
                 // sintetizar um boletim de 6 falas; 4 threads = 496s, PIOROU. Reteste 03/09/2026
                 // com 8 threads (nucleos totais do aparelho) + log por fala confirmou o mesmo
                 // padrao de forma ainda mais extrema: uma unica fala de 159 caracteres levou
-                // 136s sozinha (contra ~68-83s/fala na media do teste de 2-4 threads). Voltado
-                // pro UNICO valor com dado real bom (2) - 3 nunca foi medido, era so um "meio-termo"
-                // sem base; nao subir threads de novo aqui sem medir com log por fala primeiro.
-                numThreads = 2,
+                // 136s sozinha (contra ~68-83s/fala na media do teste de 2-4 threads).
+                // Subido pra 3 (06/09/2026, pedido do usuario) - mesmo teto usado no redator
+                // local agora, pra padronizar os dois motores nativos num unico valor de
+                // seguranca termica. 2 continua sendo o unico valor MEDIDO como bom antes disso;
+                // medir de novo (log por fala) se 3 mostrar sinal de throttling.
+                numThreads = 3,
                 debug = false,
                 provider = "cpu",
             )

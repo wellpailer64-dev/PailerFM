@@ -5,6 +5,7 @@ import android.app.Application
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
@@ -29,6 +30,11 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
 import com.pailer.localtune.data.AlbumMetadataEdit
+import com.pailer.localtune.data.AppFolderRepository
+import com.pailer.localtune.data.ArtistNewsCard
+import com.pailer.localtune.data.ArtistNewsRepository
+import com.pailer.localtune.data.BackupRepository
+import com.pailer.localtune.data.BackupScheduler
 import com.pailer.localtune.data.DuplicateArtistGroup
 import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
@@ -148,6 +154,60 @@ data class AlbumArtworkUiState(
     val appliedVersion: Int = 0,
 )
 
+// Estado do buscador de foto de artista (Deezer, ver MusicLibraryRepository.searchArtistPhotoCandidates)
+// - mesmo padrao do AlbumArtworkUiState, mas sem permissao de escrita no MediaStore: a foto fica
+// so num arquivo do proprio app, entao nao ha etapa de "createWriteRequest" aqui.
+data class ArtistPhotoUiState(
+    val activeArtistKey: String? = null,
+    val isSearching: Boolean = false,
+    val candidates: List<ArtworkCandidate> = emptyList(),
+    val selectedCandidate: ArtworkCandidate? = null,
+    val isDownloadingSelection: Boolean = false,
+    val isApplying: Boolean = false,
+    val message: String? = null,
+    // Incrementado a cada foto aplicada/removida - a UI usa isso pra invalidar o bitmap em cache
+    // (a Uri do arquivo local nao muda de nome, so o conteudo por tras).
+    val appliedVersion: Int = 0,
+)
+
+// Backup manual/automatico de favoritos, overrides de album/artista e fotos de artista (ver
+// BackupRepository) - pedido do usuario 07/09/2026 depois de perder esses dados num
+// "adb uninstall" usado pra debug. hasDestination indica se ja existe um arquivo escolhido pelo
+// usuario (SAF) pro backup automatico diario escrever sozinho (ver BackupScheduler).
+data class BackupUiState(
+    val hasDestination: Boolean = false,
+    val usingOfficialFolder: Boolean = false,
+    val destinationDescription: String? = null,
+    val lastBackupAtMillis: Long = 0L,
+    val isWorking: Boolean = false,
+    val message: String? = null,
+)
+
+// Pasta oficial do Pailer FM (ver AppFolderRepository) - onde o app organiza Backup, Logs,
+// Redator Local e Pacote de Vozes. folderName nulo = usuario ainda nao escolheu nenhuma.
+data class AppFolderUiState(
+    val folderName: String? = null,
+)
+
+// Sessao "arraste pra revelar" da Home com noticias/curiosidades dos artistas favoritados (ver
+// ArtistNewsRepository) - pedido do usuario 06/09/2026. hasLoaded fica true mesmo em caso de erro
+// ou lista vazia, pra loadArtistNewsIfNeeded() nao ficar refazendo a busca toda vez que o painel
+// abre de novo (so recarrega se favoriteArtistNames mudar OU o cache tiver ficado velho - ver
+// loadedAtMillis e checagem em loadArtistNewsIfNeeded).
+data class ArtistNewsUiState(
+    val cards: List<ArtistNewsCard> = emptyList(),
+    val isLoading: Boolean = false,
+    val hasLoaded: Boolean = false,
+    val loadedForArtistNames: List<String> = emptyList(),
+    // Quando o cache atual foi carregado (System.currentTimeMillis()) - usado pra decidir se ja
+    // passou o proximo "5 da manha" desde entao (pedido do usuario 07/09/2026: atualizar
+    // diariamente as 5h). Nao e um agendamento de verdade rodando em segundo plano (o painel so
+    // existe dentro do app, nao ha nada pra mostrar uma notificacao nova com o app fechado) - so
+    // garante que a PRIMEIRA vez que o painel abre depois das 5h de um novo dia, busca de novo em
+    // vez de servir o cache do dia anterior.
+    val loadedAtMillis: Long = 0L,
+)
+
 data class RadioBulletinUiState(
     val settings: RadioBulletinSettings = RadioBulletinSettings(),
     val localWriterInstalled: Boolean = false,
@@ -159,6 +219,11 @@ data class RadioBulletinUiState(
     // pedido do usuario (03/09/2026): escrever o boletim via Gemini (nuvem, rapido) em vez do
     // redator local (Qwen3 4B no aparelho, ver ADR-020), so a sintese de voz continua local.
     val geminiConfigured: Boolean = false,
+    // true quando ha uma chave de API do OpenRouter salva localmente (OpenRouterWriterSettings) -
+    // pedido do usuario (05/09/2026): 2a opcao de nuvem, so tentada se o Gemini falhar (ver
+    // RadioBulletinRepository.enhanceScript), pra cobrir pico de demanda momentaneo de um dos
+    // dois sem cair direto pro redator local.
+    val openRouterConfigured: Boolean = false,
 )
 
 // Estado do buffer de boletins prontos (bulletinBuffer/refillBulletinBuffer, ver ADR-019),
@@ -190,6 +255,14 @@ data class RadioBulletinBufferUiState(
     // ao tocar num item sem audio (achado 03/09/2026, usuario relatou "reproduzir previa nao
     // esta funcionando").
     val hasPlayableAudio: Boolean = false,
+    // Posicoes (dentre as bolinhas preenchidas, 0..readyCount-1) cujo roteiro caiu no fallback
+    // deterministico (RadioScriptSource.Fallback - Gemini E redator local falharam os dois, ou
+    // nenhum dos dois esta disponivel no momento) - pintadas de amarelo na UI em vez da cor
+    // normal, pra identificar de relance quando o boletim que vai tocar e o roteiro
+    // generico/pobre em vez do bate-bola de verdade (pedido do usuario 05/09/2026). Ver
+    // fixFallbackBulletins()/scheduleFallbackAutoFix().
+    val fallbackSlots: Set<Int> = emptySet(),
+    val hasFallback: Boolean = false,
 )
 
 data class RadioVoiceUiState(
@@ -217,9 +290,16 @@ private data class LocalVoiceSynthesisResult(
 // Um item do buffer de boletins (ver bulletinBuffer/refillBulletinBuffer). `file` fica nulo
 // quando a voz local estava desativada ou a sintese falhou/estourou o timeout - nesse caso
 // speakNextNewsBreak cai pro TTS do Android usando script.spokenText.
+// `sourceCore` (06/09/2026, pedido do usuario): guarda o nucleo ORIGINAL (Nivel 1, agnostico de
+// radio) de onde esse item veio, se veio de um - null quando o item foi gerado direto do zero
+// (coreBuffer estava vazio nessa hora). So existe pra clearBulletinBuffer() poder DEVOLVER o
+// nucleo pro coreBuffer em vez de descartar, quando o boletim nunca chegou a tocar (usuario saiu
+// da radio ou trocou antes) - o boletim so e "gasto" de verdade quando toca (removido via
+// speakNextNewsBreak), nunca so por sair da tela/trocar de radio.
 private data class PreparedBulletin(
     val script: RadioScript,
     val file: File?,
+    val sourceCore: PreparedNewsCore? = null,
 )
 
 // Um "nucleo" pre-aquecido (ver coreBuffer/prewarmCoreBuffer, pedido do usuario 03/09/2026:
@@ -242,7 +322,10 @@ private data class PreparedNewsCore(
 
 class LocalTuneViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = MusicLibraryRepository(application)
+    private val backupRepository = BackupRepository(application)
+    private val appFolderRepository = AppFolderRepository(application)
     private val bulletinRepository = RadioBulletinRepository(application)
+    private val artistNewsRepository = ArtistNewsRepository(application)
     private val voicePackageRepository = RadioVoicePackageRepository(application)
     private val writerPackageRepository = RadioWriterPackageRepository(application)
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
@@ -311,6 +394,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // sem bloquear um motor por causa do outro.
     private val llmGenerationMutex = Mutex()
     private val voiceSynthesisMutex = Mutex()
+    // Job da correcao automatica de fallback (ver scheduleFallbackAutoFix/fixFallbackBulletins) -
+    // guarda contra agendar mais de uma correcao sobreposta; roda com um pequeno delay pra dar
+    // tempo de uma falha transitoria (rede, Gemini fora do ar) se resolver antes de tentar de
+    // novo, em vez de bater na mesma falha em loop apertado.
+    private var fallbackAutoFixJob: Job? = null
     // Pausa manual do preparo em segundo plano (pauseBulletinPreparation/resumeBulletinPreparation,
     // pedido do usuario 03/09/2026) - refillBulletinBuffer()/prewarmCoreBuffer() viram no-op
     // enquanto isso for true, em TODOS os pontos de chamada (troca de faixa, fim de boletim,
@@ -334,10 +422,73 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     var albumArtworkState = androidx.compose.runtime.mutableStateOf(AlbumArtworkUiState())
         private set
 
+    var artistPhotoState = androidx.compose.runtime.mutableStateOf(ArtistPhotoUiState())
+        private set
+
+    var backupState = androidx.compose.runtime.mutableStateOf(
+        BackupUiState(
+            hasDestination = backupRepository.hasDestination(),
+            usingOfficialFolder = backupRepository.usingOfficialFolder(),
+            destinationDescription = backupRepository.destinationDescription(),
+            lastBackupAtMillis = backupRepository.lastBackupAt(),
+        ),
+    )
+        private set
+
+    var appFolderState = androidx.compose.runtime.mutableStateOf(
+        AppFolderUiState(folderName = appFolderRepository.folderDisplayName()),
+    )
+        private set
+
+    var artistNewsState = androidx.compose.runtime.mutableStateOf(ArtistNewsUiState())
+        private set
+
+    // Carrega sob demanda (chamado quando o painel de noticias da Home abre) em vez de no start do
+    // app - evita uma chamada de rede que a maioria das sessoes nem chega a ver. Refaz a busca se
+    // a lista de artistas favoritados mudou desde a ultima vez (favoritar/desfavoritar um artista)
+    // OU se o cache atual e de antes do ultimo "5 da manha" (ver isNewsCacheStale) - pedido do
+    // usuario 07/09/2026 de atualizar as noticias todo dia as 5h. Senao mantem o que ja foi
+    // carregado.
+    fun loadArtistNewsIfNeeded(favoriteArtists: List<LocalArtist>) {
+        val names = favoriteArtists.map { it.name }
+        val current = artistNewsState.value
+        if (current.isLoading) return
+        if (current.hasLoaded && current.loadedForArtistNames == names && !isNewsCacheStale(current.loadedAtMillis)) return
+        if (names.isEmpty()) {
+            artistNewsState.value = ArtistNewsUiState(hasLoaded = true, loadedForArtistNames = names, loadedAtMillis = System.currentTimeMillis())
+            return
+        }
+        artistNewsState.value = current.copy(isLoading = true)
+        viewModelScope.launch {
+            val cards = runCatching { artistNewsRepository.loadNewsForArtists(names) }.getOrDefault(emptyList())
+            artistNewsState.value = ArtistNewsUiState(
+                cards = cards,
+                isLoading = false,
+                hasLoaded = true,
+                loadedForArtistNames = names,
+                loadedAtMillis = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    // true quando `loadedAtMillis` e de ANTES do 5h mais recente (hoje as 5h, ou ontem as 5h se
+    // ainda nao deu 5h hoje) - ou seja, o cache e de "ontem" pro efeito de atualizacao diaria.
+    private fun isNewsCacheStale(loadedAtMillis: Long): Boolean {
+        if (loadedAtMillis <= 0L) return true
+        val now = java.time.ZonedDateTime.now()
+        var boundary = now.withHour(5).withMinute(0).withSecond(0).withNano(0)
+        if (now.isBefore(boundary)) boundary = boundary.minusDays(1)
+        return loadedAtMillis < boundary.toInstant().toEpochMilli()
+    }
+
     // Bytes da capa baixada pro candidato selecionado - fora do StateFlow/State de proposito
     // (ByteArray nao tem equals estrutural util pra Compose, e o dado so importa no momento de
     // aplicar). Fica nulo ate selectArtworkCandidate() terminar o download.
     private var pendingArtworkBytes: ByteArray? = null
+
+    // Mesma ideia de pendingArtworkBytes, so que pra foto de artista (ver applyArtistPhoto) -
+    // fora do State de proposito, ByteArray nao tem equals estrutural util pro Compose.
+    private var pendingArtistPhotoBytes: ByteArray? = null
 
     var radioBulletinState = androidx.compose.runtime.mutableStateOf(loadRadioBulletinUiState())
         private set
@@ -467,6 +618,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setRadioBulletinPreferLocalWriter(preferLocalWriter: Boolean) {
         updateRadioBulletinSettings(radioBulletinState.value.settings.copy(preferLocalWriter = preferLocalWriter))
+    }
+
+    // Chave geral Gemini+OpenRouter (06/09/2026, pedido do usuario) - ver
+    // RadioBulletinSettings.cloudWriterEnabled/RadioBulletinRepository.enhanceScript. As chaves
+    // de API continuam salvas, so param de ser tentadas enquanto isso estiver desligado.
+    fun setRadioBulletinCloudWriterEnabled(enabled: Boolean) {
+        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(cloudWriterEnabled = enabled))
     }
 
     fun importRadioWriterPackage(uri: Uri) {
@@ -694,6 +852,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         radioPrefs.edit()
             .putString(KEY_RADIO_BULLETIN_MODE, settings.mode.name)
             .putBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, settings.preferLocalWriter)
+            .putBoolean(KEY_RADIO_BULLETIN_CLOUD_WRITER, settings.cloudWriterEnabled)
             .apply()
         radioBulletinState.value = loadRadioBulletinUiState()
     }
@@ -709,6 +868,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             mode = RadioBulletinMode.Dialogue,
             songsBetweenBulletins = RADIO_BULLETIN_DEFAULT_INTERVAL,
             preferLocalWriter = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, true),
+            cloudWriterEnabled = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_CLOUD_WRITER, true),
         )
         val status = bulletinRepository.localWriterStatus()
         return RadioBulletinUiState(
@@ -717,6 +877,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             localWriterName = status.modelName,
             localWriterDetail = status.detail,
             geminiConfigured = bulletinRepository.geminiSettings().apiKey() != null,
+            openRouterConfigured = bulletinRepository.openRouterSettings().apiKey() != null,
         )
     }
 
@@ -734,6 +895,21 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         bulletinRepository.geminiSettings().clearApiKey()
         radioBulletinState.value = radioBulletinState.value.copy(geminiConfigured = false)
         showToast("Chave do Gemini removida.")
+    }
+
+    // Mesma logica do Gemini acima (OpenRouterWriterSettings, mesmo SharedPreferences local) -
+    // pedido do usuario (05/09/2026): 2a chave de nuvem, so tentada se o Gemini falhar.
+    fun saveOpenRouterApiKey(key: String) {
+        if (key.isBlank()) return
+        bulletinRepository.openRouterSettings().setApiKey(key)
+        radioBulletinState.value = radioBulletinState.value.copy(openRouterConfigured = true)
+        showToast("Chave do OpenRouter salva.")
+    }
+
+    fun clearOpenRouterApiKey() {
+        bulletinRepository.openRouterSettings().clearApiKey()
+        radioBulletinState.value = radioBulletinState.value.copy(openRouterConfigured = false)
+        showToast("Chave do OpenRouter removida.")
     }
 
     private fun loadRadioVoiceUiState(): RadioVoiceUiState =
@@ -805,8 +981,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             favoriteAlbumKeys = loadFavoriteAlbumKeys(),
             favoriteSongIds = loadFavoriteSongIds(),
             favoriteArtistKeys = loadFavoriteArtistKeys(),
-            lastSongId = historyPrefs.getLong(KEY_LAST_SONG_ID, 0L).takeIf { it > 0L },
-            lastPositionMs = historyPrefs.getLong(KEY_LAST_POSITION_MS, 0L),
+            lastSongId = historyPrefs.getLongSafe(KEY_LAST_SONG_ID, 0L).takeIf { it > 0L },
+            lastPositionMs = historyPrefs.getLongSafe(KEY_LAST_POSITION_MS, 0L),
             query = query,
             isLoading = isLoading,
             hasLoaded = hasLoaded,
@@ -1042,6 +1218,105 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // --- Pasta oficial do Pailer FM (Backup/Logs/Redator Local/Pacote de Vozes - ver AppFolderRepository) ---
+
+    fun chooseAppFolder(uri: Uri) {
+        appFolderRepository.setFolder(uri)
+        appFolderState.value = AppFolderUiState(folderName = appFolderRepository.folderDisplayName())
+        // Pasta oficial vira a fonte do backup automaticamente (ver BackupRepository -
+        // prioriza a pasta sobre um arquivo manual escolhido antes) - agenda e faz o primeiro
+        // backup na hora, mesmo esquema de chooseBackupDestination abaixo.
+        BackupScheduler.scheduleNextMidnight(getApplication())
+        backupState.value = backupState.value.copy(isWorking = true, message = null)
+        viewModelScope.launch {
+            val ok = backupRepository.performBackup()
+            backupState.value = backupState.value.copy(
+                hasDestination = backupRepository.hasDestination(),
+                usingOfficialFolder = backupRepository.usingOfficialFolder(),
+                destinationDescription = backupRepository.destinationDescription(),
+                lastBackupAtMillis = backupRepository.lastBackupAt(),
+                isWorking = false,
+                message = if (ok) "Pasta configurada e backup salvo com sucesso." else "Pasta configurada, mas o backup falhou.",
+            )
+        }
+    }
+
+    fun clearAppFolder() {
+        appFolderRepository.clearFolder()
+        appFolderState.value = AppFolderUiState()
+        backupState.value = backupState.value.copy(
+            hasDestination = backupRepository.hasDestination(),
+            usingOfficialFolder = false,
+            destinationDescription = backupRepository.destinationDescription(),
+        )
+        if (!backupState.value.hasDestination) {
+            BackupScheduler.cancel(getApplication())
+        }
+    }
+
+    // --- Backup manual/automatico (favoritos, overrides, fotos de artista - ver BackupRepository) ---
+    // Caminho antigo (arquivo unico escolhido na mao) - continua funcionando pra quem configurou
+    // antes da pasta oficial existir, mas fica em segundo plano: se uma pasta oficial estiver
+    // configurada, BackupRepository sempre prioriza ela (ver hasDestination/usingOfficialFolder).
+
+    fun chooseBackupDestination(uri: Uri) {
+        backupRepository.saveBackupDestination(uri)
+        BackupScheduler.scheduleNextMidnight(getApplication())
+        backupState.value = backupState.value.copy(isWorking = true, message = null)
+        viewModelScope.launch {
+            val ok = backupRepository.performBackup()
+            backupState.value = backupState.value.copy(
+                hasDestination = backupRepository.hasDestination(),
+                usingOfficialFolder = backupRepository.usingOfficialFolder(),
+                destinationDescription = backupRepository.destinationDescription(),
+                lastBackupAtMillis = backupRepository.lastBackupAt(),
+                isWorking = false,
+                message = if (ok) "Backup salvo com sucesso." else "Nao consegui salvar o backup nesse arquivo.",
+            )
+        }
+    }
+
+    fun performBackupNow() {
+        if (!backupState.value.hasDestination) return
+        backupState.value = backupState.value.copy(isWorking = true, message = null)
+        viewModelScope.launch {
+            val ok = backupRepository.performBackup()
+            backupState.value = backupState.value.copy(
+                lastBackupAtMillis = backupRepository.lastBackupAt(),
+                isWorking = false,
+                message = if (ok) "Backup atualizado agora." else "Nao consegui salvar o backup.",
+            )
+        }
+    }
+
+    fun clearBackupDestination() {
+        backupRepository.clearBackupDestination()
+        backupState.value = backupState.value.copy(
+            hasDestination = backupRepository.hasDestination(),
+            usingOfficialFolder = backupRepository.usingOfficialFolder(),
+            destinationDescription = backupRepository.destinationDescription(),
+        )
+        if (!backupState.value.hasDestination) {
+            BackupScheduler.cancel(getApplication())
+        }
+    }
+
+    // Restaura favoritos/overrides/fotos de um arquivo de backup escolhido pelo usuario (SAF) e
+    // recarrega a biblioteca - refreshLibrary() ja re-le todas as SharedPreferences do zero (ver
+    // applyLibrarySongs), entao restaurar os arquivos e chamar ela de novo basta, sem precisar
+    // reiniciar o app.
+    fun restoreBackup(uri: Uri) {
+        backupState.value = backupState.value.copy(isWorking = true, message = null)
+        viewModelScope.launch {
+            val ok = backupRepository.restoreBackup(uri)
+            backupState.value = backupState.value.copy(
+                isWorking = false,
+                message = if (ok) "Backup restaurado." else "Nao consegui ler esse arquivo de backup.",
+            )
+            if (ok) refreshLibrary()
+        }
+    }
+
     fun openArtworkSearch(album: LocalAlbum) {
         pendingArtworkBytes = null
         albumArtworkState.value = albumArtworkState.value.copy(
@@ -1134,6 +1409,91 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         albumArtworkState.value = albumArtworkState.value.copy(
             isApplying = false,
             message = "Permissao cancelada. Nada foi alterado.",
+        )
+    }
+
+    // --- Foto de artista (busca na web, ver MusicLibraryRepository) ---
+
+    fun artistPhotoUri(artist: LocalArtist): Uri? = repository.artistPhotoOverrideUri(artist.key)
+
+    fun openArtistPhotoSearch(artist: LocalArtist) {
+        pendingArtistPhotoBytes = null
+        artistPhotoState.value = artistPhotoState.value.copy(
+            activeArtistKey = artist.key,
+            isSearching = true,
+            candidates = emptyList(),
+            selectedCandidate = null,
+            message = null,
+        )
+        viewModelScope.launch {
+            val results = repository.searchArtistPhotoCandidates(artist.name)
+            if (artistPhotoState.value.activeArtistKey != artist.key) return@launch
+            artistPhotoState.value = artistPhotoState.value.copy(
+                isSearching = false,
+                candidates = results,
+                message = if (results.isEmpty()) "Nenhuma foto encontrada pra \"${artist.name}\"." else null,
+            )
+        }
+    }
+
+    fun closeArtistPhotoSearch() {
+        pendingArtistPhotoBytes = null
+        artistPhotoState.value = artistPhotoState.value.copy(
+            activeArtistKey = null,
+            candidates = emptyList(),
+            selectedCandidate = null,
+            isDownloadingSelection = false,
+        )
+    }
+
+    fun selectArtistPhotoCandidate(candidate: ArtworkCandidate) {
+        pendingArtistPhotoBytes = null
+        artistPhotoState.value = artistPhotoState.value.copy(
+            selectedCandidate = candidate,
+            isDownloadingSelection = true,
+            message = null,
+        )
+        viewModelScope.launch {
+            val bytes = repository.downloadArtwork(candidate.fullUrl)
+            if (artistPhotoState.value.selectedCandidate != candidate) return@launch
+            pendingArtistPhotoBytes = bytes
+            artistPhotoState.value = artistPhotoState.value.copy(
+                isDownloadingSelection = false,
+                message = if (bytes == null) "Nao consegui baixar essa foto, tenta outra." else null,
+            )
+        }
+    }
+
+    // Nao precisa de PendingIntent/permissao de escrita como a capa de album - a foto de artista
+    // fica so num arquivo do proprio app (ver MusicLibraryRepository.applyArtistPhoto).
+    fun applyArtistPhoto(artist: LocalArtist) {
+        val bytes = pendingArtistPhotoBytes
+        if (bytes == null) {
+            artistPhotoState.value = artistPhotoState.value.copy(message = "Escolha uma foto antes de aplicar.")
+            return
+        }
+        artistPhotoState.value = artistPhotoState.value.copy(isApplying = true)
+        viewModelScope.launch {
+            val ok = runCatching { repository.applyArtistPhoto(artist.key, bytes) }.getOrDefault(false)
+            pendingArtistPhotoBytes = null
+            val message = if (ok) "Foto de \"${artist.name}\" atualizada." else "Nao consegui salvar essa foto."
+            artistPhotoState.value = artistPhotoState.value.copy(
+                isApplying = false,
+                activeArtistKey = null,
+                candidates = emptyList(),
+                selectedCandidate = null,
+                appliedVersion = if (ok) artistPhotoState.value.appliedVersion + 1 else artistPhotoState.value.appliedVersion,
+                message = message,
+            )
+            showToast(message)
+        }
+    }
+
+    fun removeArtistPhoto(artist: LocalArtist) {
+        repository.removeArtistPhotoOverride(artist.key)
+        artistPhotoState.value = artistPhotoState.value.copy(
+            appliedVersion = artistPhotoState.value.appliedVersion + 1,
+            message = "Voltou a usar a capa de album como foto de \"${artist.name}\".",
         )
     }
 
@@ -1740,6 +2100,20 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Dispara reload de RSS sempre que o round-robin (nextBulletinIndex) completa uma volta
+    // inteira pelas newsBulletins - chamado logo apos incrementar nextBulletinIndex nos 3 pontos
+    // que consomem uma materia base (refillBulletinBuffer, prewarmCoreBuffer, boletim ao vivo de
+    // emergencia). Sem isso, newsBulletins so carregava UMA vez por sessao (ver
+    // ensureNewsBulletinsLoaded) e a mesma lista de ~16 materias ficava se repetindo palavra por
+    // palavra indefinidamente enquanto a radio tocasse por horas - pedido do usuario
+    // (05/09/2026): noticia do Sirius (ciencia aberta) repetindo varias vezes na mesma sessao.
+    private fun reloadNewsBulletinsIfCycleComplete() {
+        if (newsBulletins.isNotEmpty() && nextBulletinIndex % newsBulletins.size == 0) {
+            Log.d(TAG_RADIO_VOICE, "boletim: completou uma volta pelas ${newsBulletins.size} materias - recarregando RSS")
+            reloadNewsBulletinsIfNeeded()
+        }
+    }
+
     private fun stopRadioNewsMode() {
         radioNewsEnabled = false
         completedRadioSongs = 0
@@ -1829,9 +2203,19 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         val radioName = activeRadioName
+        // So puxa 1 nucleo por chamada, nao ate encher o BULLETIN_BUFFER_TARGET de uma vez -
+        // pedido do usuario (06/09/2026): entrar numa radio (ou trocar de radio) puxava ate 5
+        // nucleos do buffer agnostico (coreBuffer) de uma so vez, encaixando faixa/nome da radio
+        // atual - se o usuario saisse ou trocasse de radio antes do 1o boletim tocar, esses itens
+        // eram descartados (clearBulletinBuffer) E cada um ja tinha disparado prewarmCoreBuffer()
+        // pra repor o nucleo consumido (trabalho caro de verdade: redator local/nuvem), nao so o
+        // encaixe barato. Agora cada chamada preenche so 1 vaga; o resto do buffer volta a
+        // encher sozinho conforme boletins realmente tocam e abrem vaga nova (speakNextNewsBreak
+        // ja chama refillBulletinBuffer() a cada consumo real).
+        val targetForThisCall = (bulletinBuffer.size + 1).coerceAtMost(BULLETIN_BUFFER_TARGET)
         bulletinPrepJob = viewModelScope.launch {
             try {
-                while (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && radioNewsEnabled &&
+                while (bulletinBuffer.size < targetForThisCall && radioNewsEnabled &&
                     activeRadioName == radioName && !bulletinPrepPaused
                 ) {
                     if (coreBuffer.isEmpty() && newsBulletins.isEmpty()) {
@@ -1928,6 +2312,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             val index = nextBulletinIndex % newsBulletins.size
                             val baseScript = newsBulletins[index]
                             nextBulletinIndex += 1
+                            reloadNewsBulletinsIfCycleComplete()
                             Log.d(
                                 TAG_RADIO_VOICE,
                                 "boletim: preparando do zero (nucleo vazio) index=$index posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
@@ -1962,8 +2347,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         if (file == null) {
                             Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio; buffer guarda so o roteiro")
                         }
-                        bulletinBuffer.addLast(PreparedBulletin(script, file))
+                        bulletinBuffer.addLast(PreparedBulletin(script, file, sourceCore = core))
                         Log.d(TAG_RADIO_VOICE, "boletim: buffer agora com ${bulletinBuffer.size}/$BULLETIN_BUFFER_TARGET (audio=${file != null})")
+                        if (script.source == RadioScriptSource.Fallback) scheduleFallbackAutoFix()
                         syncBulletinBufferState(isPreparing = false, statusMessage = null)
                     } catch (e: CancellationException) {
                         throw e
@@ -1989,11 +2375,34 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         syncBulletinBufferState(isPreparing = true)
     }
 
+    // Chamada toda vez que a radio troca/reinicia (startRadioNewsMode) - antes descartava
+    // (apagava arquivo + esquecia o roteiro) QUALQUER boletim que estivesse no buffer da radio
+    // (Nivel 2), mesmo que nenhum tivesse tocado ainda. Pedido do usuario (06/09/2026): "nucleo
+    // puxado pra radio so e gasto se ele for reproduzido, caso nao, volta pro buffer" - um
+    // boletim so e "gasto" de verdade quando toca (removido em speakNextNewsBreak). Agora, item
+    // que veio de um nucleo (sourceCore != null, ver PreparedBulletin) devolve esse nucleo pro
+    // coreBuffer (Nivel 1, agnostico de radio) em vez de jogar fora o trabalho de escrita/sintese
+    // ja feito - so o .wav "encaixado" com faixa/radio especificos (item.file) e descartado
+    // mesmo, porque foi feito pra ESSA radio/faixa e nao serve pra outra. Item sem sourceCore
+    // (gerado do zero, sem nucleo disponivel na hora) nao tem pra onde devolver - descartado como
+    // antes, caso mais raro (so acontece com o Nivel 1 vazio).
     private fun clearBulletinBuffer() {
         bulletinPrepJob?.cancel()
         bulletinPrepJob = null
-        bulletinBuffer.forEach { it.file?.delete() }
+        var returnedAnyCore = false
+        bulletinBuffer.forEach { item ->
+            item.file?.delete()
+            val core = item.sourceCore
+            if (core != null) {
+                coreBuffer.addFirst(core)
+                returnedAnyCore = true
+            }
+        }
         bulletinBuffer.clear()
+        if (returnedAnyCore) {
+            Log.d(TAG_RADIO_VOICE, "boletim: ${coreBuffer.size} nucleo(s) devolvido(s) ao buffer agnostico (radio trocou antes de tocar)")
+            saveCoreBufferManifest()
+        }
         syncBulletinBufferState(isPreparing = false, statusMessage = null)
     }
 
@@ -2022,15 +2431,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         val index = nextBulletinIndex % newsBulletins.size
                         val baseScript = newsBulletins[index]
                         nextBulletinIndex += 1
+                        reloadNewsBulletinsIfCycleComplete()
                         syncCoreBufferStatus("Preparando núcleo do boletim (sem rádio ativa)...")
                         Log.d(TAG_RADIO_VOICE, "nucleo: preparando index=$index redator=${settings.preferLocalWriter}")
-                        var usedGemini = false
+                        var usedCloudWriter = false
                         val enhanced = llmGenerationMutex.withLock {
                             bulletinRepository.enhanceScript(
                                 baseScript, settings, radioName = "", lastPlayedTrack = null, upcomingTrack = null,
                                 onProgress = { message -> syncCoreBufferStatus(message) },
                                 onProgressPercent = { percent -> syncCoreBufferStatus(radioBulletinBufferState.value.statusMessage, percent) },
-                                onWriterUsed = { usedGemini = it },
+                                onWriterUsed = { usedCloudWriter = it },
                             )
                         }
                         // So cacheia audio do "miolo" quando o roteiro saiu com as 6 falas
@@ -2068,6 +2478,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                         coreBuffer.addLast(PreparedNewsCore(enhanced, coreFile, introFile))
                         saveCoreBufferManifest()
+                        if (enhanced.source == RadioScriptSource.Fallback) scheduleFallbackAutoFix()
                         Log.d(TAG_RADIO_VOICE, "nucleo: buffer agora com ${coreBuffer.size}/$BULLETIN_BUFFER_TARGET (core=${coreFile != null}, falas=${enhanced.lines.size})")
                         syncCoreBufferStatus(null)
                         // Cooldown termico entre boletins consecutivos (pedido do usuario 03/09/2026,
@@ -2077,12 +2488,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         // 4t=496s). Da um respiro pro SoC esfriar antes de emendar a proxima geracao
                         // pesada. So espera se ainda falta preparar mais item (senao fica parado 3min
                         // a toa depois do ultimo, sem nada que va se beneficiar do respiro).
-                        // Pulado quando o Gemini escreveu essa (usedGemini) - pedido do usuario
-                        // (04/09/2026): a escrita saiu da nuvem, so sobra a sintese de voz local
-                        // sozinha (bem mais leve que LLM local + sintese juntos, a causa original
-                        // do cooldown). Continua normal se caiu pro redator local Qwen3 (sem chave
-                        // configurada, ou Gemini falhou nessa hora) - ver ADR-021.
-                        if (coreBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !usedGemini) {
+                        // Pulado quando Gemini OU OpenRouter escreveram essa (usedCloudWriter) -
+                        // pedido do usuario (04/09/2026, estendido 05/09/2026 pro OpenRouter): a
+                        // escrita saiu da nuvem, so sobra a sintese de voz local sozinha (bem mais
+                        // leve que LLM local + sintese juntos, a causa original do cooldown).
+                        // Continua normal se caiu pro redator local Qwen3 (sem nenhuma chave
+                        // configurada, ou os dois de nuvem falharam nessa hora) - ver ADR-021.
+                        if (coreBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !usedCloudWriter) {
                             val cooldownStart = System.currentTimeMillis()
                             while (System.currentTimeMillis() - cooldownStart < COOLDOWN_BETWEEN_BULLETINS_MS && !bulletinPrepPaused) {
                                 val remainingS = ((COOLDOWN_BETWEEN_BULLETINS_MS - (System.currentTimeMillis() - cooldownStart)) / 1000)
@@ -2177,7 +2589,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE).writeText(array.toString())
-            val referenced = (coreBuffer.mapNotNull { it.coreFile?.name } + coreBuffer.mapNotNull { it.introFile?.name }).toSet()
+            // Protege tambem os .wav "emprestados" pra um item do bulletinBuffer (Nivel 2) que
+            // ainda nao tocou (ver PreparedBulletin.sourceCore, 06/09/2026) - sem isso, o proprio
+            // ato de puxar um nucleo pro buffer da radio apagava o .wav original antes mesmo de
+            // saber se o boletim ia tocar ou nao, impossibilitando devolver ele depois.
+            val onLoan = bulletinBuffer.mapNotNull { it.sourceCore }
+            val referenced = (
+                coreBuffer.mapNotNull { it.coreFile?.name } + coreBuffer.mapNotNull { it.introFile?.name } +
+                    onLoan.mapNotNull { it.coreFile?.name } + onLoan.mapNotNull { it.introFile?.name }
+                ).toSet()
             coreBufferDir.listFiles { file -> file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced }
                 ?.forEach { it.delete() }
         }.onFailure { Log.w(TAG_RADIO_VOICE, "nucleo: falha ao salvar manifest do buffer em disco", it) }
@@ -2237,6 +2657,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // statusMessage=null pra "limpar" nao deixa um percentual velho grudado na tela.
         progressPercent: Int? = if (statusMessage == null) null else radioBulletinBufferState.value.progressPercent,
     ) {
+        // Mesmo nivel que decide readyCount abaixo (bulletinBuffer se tiver algo, senao coreBuffer)
+        // - fallbackSlots tem que vir da MESMA lista, senao os indices nao batem com as bolinhas
+        // que a UI desenha (RadioBulletinBufferStatusCard, uma por posicao de readyCount).
+        val activeSources = if (bulletinBuffer.isNotEmpty()) {
+            bulletinBuffer.map { it.script.source }
+        } else {
+            coreBuffer.map { it.script.source }
+        }
         radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
             // Sem radio tocando o Nivel 2 (bulletinBuffer) nunca enche - cai pro Nivel 1
             // (coreBuffer) pras bolinhas refletirem o preparo automatico de verdade, em vez de
@@ -2252,6 +2680,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             // tocar (playReadyBufferedBulletin(index)), nao precisa de lista pre-calculada aqui.
             hasCorePreview = bulletinBuffer.isEmpty() && coreBuffer.isNotEmpty(),
             hasPlayableAudio = bulletinBuffer.any { it.file != null } || coreBuffer.any { it.coreFile != null },
+            fallbackSlots = activeSources.withIndex().filter { (_, source) -> source == RadioScriptSource.Fallback }
+                .map { (index, _) -> index }.toSet(),
+            hasFallback = activeSources.any { it == RadioScriptSource.Fallback },
         )
     }
 
@@ -2268,6 +2699,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // pipeline (ver PreparedNewsCore).
         corePrepJob?.cancel()
         corePrepJob = null
+        fallbackAutoFixJob?.cancel()
+        fallbackAutoFixJob = null
         syncBulletinBufferState(isPreparing = false, statusMessage = null)
     }
 
@@ -2288,6 +2721,54 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         if (!bulletinPrepPaused) {
             prewarmCoreBuffer()
             if (radioNewsEnabled) refillBulletinBuffer()
+        }
+    }
+
+    // Botao manual "Corrigir fallback" (pedido do usuario 05/09/2026): descarta so os itens que
+    // cairam no roteiro generico (RadioScriptSource.Fallback - Gemini E redator local falharam
+    // os dois, ou nenhum dos dois estava disponivel) dos dois niveis do buffer, e deixa o preparo
+    // normal (prewarmCoreBuffer/refillBulletinBuffer) repor essas vagas do zero - o que tenta
+    // Gemini primeiro de novo, com a mesma prioridade/retry de qualquer boletim novo. Nao mexe
+    // nos itens que ja saíram com roteiro de LLM (Gemini ou redator local), so remove o que
+    // precisa mesmo ser reescrito. Mesma funcao roda sozinha via scheduleFallbackAutoFix() assim
+    // que um fallback novo entra no buffer, sem precisar o usuario apertar nada.
+    fun fixFallbackBulletins() {
+        val fallbackBulletins = bulletinBuffer.filter { it.script.source == RadioScriptSource.Fallback }
+        if (fallbackBulletins.isNotEmpty()) {
+            fallbackBulletins.forEach { it.file?.delete() }
+            bulletinBuffer.removeAll(fallbackBulletins)
+        }
+        val fallbackCores = coreBuffer.filter { it.script.source == RadioScriptSource.Fallback }
+        if (fallbackCores.isNotEmpty()) {
+            fallbackCores.forEach { it.coreFile?.delete() }
+            coreBuffer.removeAll(fallbackCores)
+            saveCoreBufferManifest()
+        }
+        if (fallbackBulletins.isEmpty() && fallbackCores.isEmpty()) return
+        Log.d(
+            TAG_RADIO_VOICE,
+            "boletim: corrigindo fallback - removidos ${fallbackBulletins.size} do buffer e ${fallbackCores.size} do nucleo pra regenerar",
+        )
+        syncBulletinBufferState()
+        if (!bulletinPrepPaused) {
+            prewarmCoreBuffer()
+            if (radioNewsEnabled) refillBulletinBuffer()
+        }
+    }
+
+    // Dispara fixFallbackBulletins() sozinho assim que o sistema percebe um item de fallback
+    // novo em qualquer um dos 2 niveis (ver os 2 sites que chamam isso: bulletinBuffer.addLast em
+    // refillBulletinBuffer e coreBuffer.addLast em prewarmCoreBuffer) - pedido do usuario
+    // (05/09/2026): "que ele mesmo comece a rodar a correcao" sem precisar apertar o botao manual
+    // toda vez. FALLBACK_AUTO_FIX_DELAY_MS de respiro antes de tentar, e o guard de job ativo
+    // evita agendar em cima de uma correcao que ja esta rodando - se a causa raiz (sem internet,
+    // Gemini fora do ar, chave invalida) ainda nao se resolveu, a proxima geracao tambem vai cair
+    // em fallback e agendar de novo sozinha, criando um retry periodico (nao um loop apertado).
+    private fun scheduleFallbackAutoFix() {
+        if (fallbackAutoFixJob?.isActive == true) return
+        fallbackAutoFixJob = viewModelScope.launch {
+            delay(FALLBACK_AUTO_FIX_DELAY_MS)
+            fixFallbackBulletins()
         }
     }
 
@@ -2325,6 +2806,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val index = nextBulletinIndex % newsBulletins.size
             val baseBulletin = newsBulletins[index]
             nextBulletinIndex += 1
+            reloadNewsBulletinsIfCycleComplete()
             val upcomingTrack = player.currentMediaItem?.toUpcomingTrack()
             bulletin = baseBulletin
                 .withLastPlayedIntro(lastPlayedTrack)
@@ -2748,13 +3230,40 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controllerFuture = future
         future.addListener(
             {
-                controller = future.get().also {
-                    it.addListener(playerListener)
-                    updatePlayerState(it)
-                }
+                val connectedController = future.get()
+                // Atribui o campo ANTES de restaurar a radio - startRadioNewsMode() le
+                // controller?.currentMediaItem internamente, e "controller = X.also { ... }"
+                // so atualiza o campo DEPOIS que o also{} termina, entao chamar a restauracao
+                // de dentro do also{} leria o controller antigo (null na 1a conexao).
+                controller = connectedController
+                connectedController.addListener(playerListener)
+                updatePlayerState(connectedController)
+                restoreRadioSessionIfNeeded(connectedController)
             },
             MoreExecutors.directExecutor(),
         )
+    }
+
+    // Restaura o "modo radio" (boletins/buffer) quando o ViewModel e recriado do zero mas o
+    // MediaSessionService sobrevive tocando uma radio - pedido do usuario (06/09/2026): "se eu
+    // sair do app e abrir outro, a radio se desfaz sozinha, fica tocando as musicas mas fora da
+    // radio". Causa raiz: o Android mata o PROCESSO do app em segundo plano pra liberar memoria
+    // (app pesado - redator local carrega ate ~2,3GB de modelo), o que destroi este ViewModel e
+    // reseta radioNewsEnabled/activeRadioName pro default (false/""). O MediaSessionService (
+    // MusicPlaybackService) e um componente Android separado, sobrevive e continua tocando -
+    // dai a musica seguir mas o boletim nunca mais falar. O nome da radio ja fica gravado em
+    // MediaMetadata.station de cada item (ver LocalSong.toMediaItem) dentro do proprio servico,
+    // entao da pra recuperar sem nenhuma persistencia propria nova: se o ViewModel acabou de
+    // conectar (nunca esteve em modo radio nesta instancia) e a faixa atual tem station
+    // preenchido, e porque uma radio real ja estava tocando antes deste ViewModel existir.
+    // startRadioNewsMode() sozinho ja faz exatamente o que precisamos aqui (liga radioNewsEnabled,
+    // reconstroi o buffer de boletins) sem mexer na fila/reproducao, que ja esta correta.
+    private fun restoreRadioSessionIfNeeded(player: Player) {
+        if (activeRadioName.isNotBlank()) return
+        val stationName = player.currentMediaItem?.mediaMetadata?.station?.toString()
+        if (stationName.isNullOrBlank()) return
+        Log.d(TAG_RADIO_VOICE, "radio: restaurando sessao apos recriacao do processo - '$stationName'")
+        startRadioNewsMode(stationName)
     }
 
     private fun updatePlayerState(player: Player) {
@@ -2859,6 +3368,20 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             ?.take(MAX_HISTORY_ITEMS)
             ?: emptyList()
 
+    // getLong() normal crasha (ClassCastException) se a chave foi gravada como Integer em vez de
+    // Long - aconteceu de verdade em campo 07/09/2026 com um bug no restore de backup
+    // (BackupRepository serializava Long sem marcar o tipo; org.json le de volta como Integer
+    // quando o valor cabe num Int, e o codigo de restauracao gravava com putInt por engano,
+    // travando o app pra sempre na proxima leitura). Corrigido no BackupRepository, mas um
+    // usuario que ja tinha restaurado um backup com o bug antigo ficaria preso num crash-loop
+    // sem conseguir nem abrir o app - esse fallback AUTO-REPARA removendo a chave corrompida em
+    // vez de travar, sem exigir reinstalar/perder o resto dos dados.
+    private fun SharedPreferences.getLongSafe(key: String, default: Long): Long =
+        runCatching { getLong(key, default) }.getOrElse {
+            edit().remove(key).apply()
+            default
+        }
+
     private fun loadFavoriteAlbumKeys(): Set<String> =
         favoritePrefs.getStringSet(KEY_FAVORITE_ALBUMS, emptySet())?.toSet() ?: emptySet()
 
@@ -2892,13 +3415,25 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_FAVORITE_ARTISTS = "favorite_artist_keys"
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
         const val KEY_RADIO_BULLETIN_LOCAL_WRITER = "radio_bulletin_local_writer"
+        const val KEY_RADIO_BULLETIN_CLOUD_WRITER = "radio_bulletin_cloud_writer"
         const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
         const val CORE_BUFFER_MANIFEST_FILE = "manifest.json"
         // Pausa entre boletins consecutivos do preparo automatico (Nivel 1) pra deixar o SoC
         // esfriar - ver comentario em prewarmCoreBuffer. Status atualiza a cada
         // COOLDOWN_STATUS_TICK_MS pra usuario acompanhar a contagem regressiva.
-        const val COOLDOWN_BETWEEN_BULLETINS_MS = 180_000L
+        // Reduzido de 180s pra 60s (06/09/2026, pedido do usuario) - com o cache de prefixo do
+        // redator local (ver LocalLlamaTextGenerator/ensurePrefixCacheNative), o prefill caiu de
+        // ~230s pra ~30s por boletim, entao o mesmo throttling termico que motivou os 180s
+        // originais (ADR-020, medido ANTES do cache existir) deve pesar menos agora. Ainda existe
+        // risco de acumular calor em sessoes longas - se voltar a aparecer throttling visivel
+        // (decode caindo bem abaixo de ~2 tok/s), subir esse valor de novo.
+        const val COOLDOWN_BETWEEN_BULLETINS_MS = 60_000L
         const val COOLDOWN_STATUS_TICK_MS = 15_000L
+        // Respiro antes de scheduleFallbackAutoFix() tentar de novo sozinho (ver fixFallbackBulletins)
+        // - evita loop apertado batendo no Gemini/redator local sem parar quando a causa da falha
+        // (sem internet, chave invalida, os dois writers fora do ar) ainda nao se resolveu; da
+        // tempo real pra uma falha transitoria passar antes da proxima tentativa automatica.
+        const val FALLBACK_AUTO_FIX_DELAY_MS = 45_000L
         const val MAX_HISTORY_ITEMS = 80
         const val POSITION_SAVE_INTERVAL_MS = 3000L
         const val RADIO_BULLETIN_DEFAULT_INTERVAL = 3

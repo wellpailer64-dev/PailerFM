@@ -122,6 +122,14 @@ class NewsBulletinRepository(private val context: Context) {
             .replace("&amp;", "e")
             .replace("&#39;", "'")
             .replace("&nbsp;", " ")
+            // Slug de nome de arquivo de imagem (ex.: "SI_jingle-campanha-eleitoral_site",
+            // "ME_pepino-do-mar_site") grudado sem espaco no fim do titulo/resumo de algumas
+            // materias da Super (historia/mundo-estranho) - visto em campo colado direto apos
+            // a pontuacao final do titulo (06/09/2026). O <title> da RSS em si esta limpo (
+            // conferido buscando o feed direto), entao a causa exata fica em aberto; removido
+            // aqui como rede de seguranca porque o padrao (sigla maiuscula + slug com hifen +
+            // "_site") e especifico o bastante pra nao arriscar cortar texto legitimo.
+            .replace(Regex("[A-Z]{2,6}_[a-z0-9]+(?:-[a-z0-9]+)*_site\\b"), "")
             .replace(Regex("\\s+"), " ")
             .trim()
 

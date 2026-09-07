@@ -28,6 +28,11 @@ data class RadioBulletinSettings(
     val mode: RadioBulletinMode = RadioBulletinMode.Dialogue,
     val songsBetweenBulletins: Int = 3,
     val preferLocalWriter: Boolean = true,
+    // Chave geral pra ligar/desligar Gemini+OpenRouter de uma vez (06/09/2026, pedido do
+    // usuario) - desligado, enhanceScript() nem tenta as chaves salvas, so o redator local
+    // escreve. Util pra testar o redator local isoladamente sem apagar as chaves de API salvas
+    // (que continuam guardadas, so ignoradas enquanto isso estiver desligado).
+    val cloudWriterEnabled: Boolean = true,
 )
 
 data class NewsStory(
@@ -190,6 +195,7 @@ class RadioBulletinRepository(context: Context) {
     private val newsRepository = NewsBulletinRepository(context)
     private val localWriter = OptionalLocalLlmRadioScriptWriter(context)
     private val geminiWriter = RemoteGeminiRadioScriptWriter(context)
+    private val openRouterWriter = RemoteOpenRouterRadioScriptWriter(context)
     private val fallbackWriter = FallbackRadioScriptWriter()
 
     fun localWriterStatus(): LocalRadioWriterStatus = localWriter.status()
@@ -198,9 +204,20 @@ class RadioBulletinRepository(context: Context) {
     // GeminiWriterSettings/LocalTuneViewModel.
     fun geminiSettings(): GeminiWriterSettings = geminiWriter.settings
 
+    // Exposto pra UI mostrar/gerenciar a chave do OpenRouter nas Configuracoes - ver
+    // OpenRouterWriterSettings/LocalTuneViewModel.
+    fun openRouterSettings(): OpenRouterWriterSettings = openRouterWriter.settings
+
     suspend fun loadScripts(settings: RadioBulletinSettings, radioName: String): List<RadioScript> {
         if (settings.mode == RadioBulletinMode.Off) return emptyList()
-        val stories = newsRepository.loadStories()
+        // Embaralhado aqui (06/09/2026, pedido do usuario: "a MESMA noticia esta sendo
+        // reproduzida sempre") - newsRepository.loadStories() devolve sempre a mesma ordem
+        // deterministica (round-robin por feed, ver interleave()), e nextBulletinIndex
+        // (LocalTuneViewModel) sempre reinicia em 0 a cada abertura do app. Sem embaralhar, a
+        // 1a materia consumida era SEMPRE a manchete atual do 1o feed (g1 Mundo) em toda sessao
+        // nova - o usuario so percebia variedade se a radio tocasse tempo suficiente pra avancar
+        // o indice, o que a geracao lenta (redator local/nuvem) raramente da tempo de acontecer.
+        val stories = newsRepository.loadStories().shuffled()
         return stories.map { story ->
             // Duracao nao e mais escolha do usuario: cada materia decide sozinha quanto da pra
             // render (quanto mais resumo/gancho tiver, mais fala) - ver pickDuration().
@@ -223,12 +240,13 @@ class RadioBulletinRepository(context: Context) {
         onProgressPercent: (Int) -> Unit = {},
         // Pedido do usuario (04/09/2026): prewarmCoreBuffer usa isso pra pular o cooldown termico
         // (ver COOLDOWN_BETWEEN_BULLETINS_MS em LocalTuneViewModel) quando a escrita saiu 100% na
-        // nuvem - so a sintese de voz continua pesando local nesse caso, bem menos sozinha do que
-        // LLM local + sintese juntos (a causa original do cooldown, ver ADR-020/021). Callback em
-        // vez de campo novo em RadioScript porque so esse UM caller precisa saber - nenhum outro
-        // consumidor distingue Gemini de redator local por design (ver RemoteGeminiRadioScript
-        // Writer.writeContextual).
-        onWriterUsed: (usedGemini: Boolean) -> Unit = {},
+        // nuvem (Gemini OU OpenRouter, ver 05/09/2026) - so a sintese de voz continua pesando
+        // local nesse caso, bem menos sozinha do que LLM local + sintese juntos (a causa original
+        // do cooldown, ver ADR-020/021). Callback em vez de campo novo em RadioScript porque so
+        // esse UM caller precisa saber - nenhum outro consumidor distingue qual dos 3 motores
+        // escreveu por design (ver RemoteGeminiRadioScriptWriter/RemoteOpenRouterRadioScript
+        // Writer.writeContextual, mesmo RadioScriptSource.LocalLlm pros dois).
+        onWriterUsed: (usedCloudWriter: Boolean) -> Unit = {},
     ): RadioScript {
         if (settings.mode != RadioBulletinMode.Dialogue || !settings.preferLocalWriter) return script
         val context = RadioScriptContext(radioName = radioName, duration = pickDuration(script.story))
@@ -245,7 +263,11 @@ class RadioBulletinRepository(context: Context) {
         // costuma responder em segundos. So a redacao vai pra nuvem; sintese de voz continua
         // 100% local (LocalRadioVoiceEngine), o audio final nunca sai do aparelho. Sem chave,
         // nem tenta - cai direto pro redator local, app continua 100% funcional offline.
-        if (geminiWriter.isConfigured()) {
+        //
+        // settings.cloudWriterEnabled (06/09/2026): chave geral que desliga Gemini+OpenRouter
+        // de uma vez, mesmo com chaves salvas - pedido do usuario pra poder testar/usar so o
+        // redator local sem apagar as chaves de API.
+        if (settings.cloudWriterEnabled && geminiWriter.isConfigured()) {
             onProgress("Escrevendo o bate-bola com o Gemini...")
             Log.d(TAG_RADIO_WRITER, "gemini iniciando para '${script.story.title}'")
             val result = runCatching {
@@ -255,6 +277,27 @@ class RadioBulletinRepository(context: Context) {
             }.onFailure {
                 Log.w(TAG_RADIO_WRITER, "gemini falhou; tentando redator local para '${script.story.title}'", it)
                 onProgress("Gemini falhou (${it.message ?: it::class.simpleName}); tentando redator local...")
+            }
+            if (result.isSuccess) {
+                onWriterUsed(true)
+                return result.getOrThrow()
+            }
+        }
+
+        // OpenRouter e a 2a chance de nuvem, so tentada DEPOIS do Gemini falhar - pedido do
+        // usuario (05/09/2026), motivado por um pico de demanda real do Gemini (503 em 2 materias
+        // seguidas nas 2 tentativas) que so o redator local (lento) sobrava pra cobrir. Provedor/
+        // infra diferente do Gemini de proposito, pra os dois nao caisrem juntos pela mesma causa.
+        if (settings.cloudWriterEnabled && openRouterWriter.isConfigured()) {
+            onProgress("Escrevendo o bate-bola com o OpenRouter...")
+            Log.d(TAG_RADIO_WRITER, "openrouter iniciando para '${script.story.title}'")
+            val result = runCatching {
+                openRouterWriter.writeContextual(script.story, context, lastPlayedTrack, upcomingTrack)
+            }.map(trackContext).onSuccess {
+                Log.d(TAG_RADIO_WRITER, "openrouter gerou ${it.lines.size} falas para '${script.story.title}'")
+            }.onFailure {
+                Log.w(TAG_RADIO_WRITER, "openrouter falhou; tentando redator local para '${script.story.title}'", it)
+                onProgress("OpenRouter falhou (${it.message ?: it::class.simpleName}); tentando redator local...")
             }
             if (result.isSuccess) {
                 onWriterUsed(true)
@@ -323,12 +366,14 @@ private fun buildSystemInstructions(): String = """
     escreva a fala de verdade, como um locutor falaria ao vivo, DIFERENTE a cada vez -
     nunca reuse a mesma abertura ou o mesmo bordão de um boletim pro outro. Exemplo
     (matéria fictícia sobre trânsito, só pra mostrar o estilo esperado):
-    [{"speaker":"Female","text":"Isso aí que tocou já entra na lista dos meus favoritos. E olha a notícia que chegou: a prefeitura anunciou um novo corredor de ônibus pra Avenida Central."},
-    {"speaker":"Male","text":"Bonito no papel. Só falta combinar com a Câmara, que adora aprovar promessa e esquecer o financiamento."},
-    {"speaker":"Female","text":"Ei, deixa eu sonhar um pouco, Nico. Se sair do papel, é um baita alívio pra quem enfrenta esse trânsito todo dia."},
-    {"speaker":"Male","text":"Sonha, mas guarda o troco: eu já vi essa novela passar umas cinco vezes e o final nunca muda."},
-    {"speaker":"Male","text":"Tem um quê de Kafka nisso: a promessa vira regra, a regra vira espera, e a espera a gente já conhece de cor."},
-    {"speaker":"Female","text":"Tá filosófico E ácido hoje, hein? Combinação perigosa. Mas segura aí que eu já trago a próxima faixa de volta."}]
+    [{"speaker":"Female","text":"Ainda com esse som na cabeça, chegou uma notícia curiosa: a prefeitura anunciou um novo corredor de ônibus pra Avenida Central."},
+    {"speaker":"Male","text":"No papel tá bonito. Bora ver se essa verba não some no caminho, que já vi prometerem coisa parecida antes."},
+    {"speaker":"Female","text":"Confesso que fiquei animada, viu? Se emplacar de verdade, é um respiro pra quem enfrenta esse trânsito todo santo dia."},
+    {"speaker":"Male","text":"Anota aí: prometeram algo parecido faz uns dois anos e virou zero. Só acredito quando ver o asfalto sendo cortado."},
+    {"speaker":"Male","text":"Tem um quê de Sísifo nisso - empurra o projeto morro acima, ele rola pra baixo de novo, e a gente segue empurrando."},
+    {"speaker":"Female","text":"Você tá com essa cara de quem já viu esse filme repetido, hein? Mas segura o climão que a próxima faixa já tá chegando."}]
+    O exemplo acima e so ILUSTRACAO DE ESTILO (era sobre transito, materia fictícia) - a
+    materia de verdade de hoje e outro assunto completamente diferente, ver abaixo.
     Estrutura das 6 falas desta matéria:
     1 Female/Fran: reaja de verdade à "Faixa que acabou de tocar" (cite o nome se vier
     informado, nunca invente um se vier "desconhecida") e emende pra notícia - varie
@@ -385,6 +430,9 @@ private fun buildUserContent(
         Resumo: $summary
         Faixa que acabou de tocar: $lastTrackLine
         Artista da próxima faixa: $nextArtistLine
+        Escreva as 6 falas sobre ESSA matéria ($title) - a piada, a ironia e a reflexão
+        do Nico têm que nascer desse assunto específico, nunca do exemplo de trânsito
+        mostrado antes.
     """.trimIndent()
 }
 
@@ -434,8 +482,7 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
     ): RadioScript = withContext(Dispatchers.IO) {
         val apiKey = settings.apiKey() ?: error("Gemini sem chave de API configurada")
         val userContent = buildUserContent(story, lastPlayedTrack, upcomingTrack)
-        val generated = callGeminiWithRetry(apiKey, userContent)
-        val lines = parseGeneratedLines(generated)
+        val lines = generateWithRetry(apiKey, userContent)
         Log.d(TAG_RADIO_WRITER, "gemini texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
         RadioScript(
             story = story,
@@ -450,26 +497,30 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         )
     }
 
-    // Erro 503 "high demand"/429 "rate limit" costumam ser picos passageiros do lado da Google
-    // (a propria mensagem do 503 diz "usually temporary") - vale tentar de novo com um pequeno
-    // atraso antes de desistir e cair pro redator local, que nesse aparelho e MUITO mais lento
-    // (ADR-020: Qwen3 4B passa de 300s). Nao reentra em 4xx que nao seja rate limit (ex.: 404 de
-    // modelo errado, 400 de payload invalido) - repetir a mesma requisicao invalida so atrasa a
-    // queda pro fallback sem chance nenhuma de dar certo. Roda em segundo plano durante a musica,
-    // entao o tempo extro de 1-2 tentativas custa pouco perto do ganho de nao cair pro local.
-    private suspend fun callGeminiWithRetry(apiKey: String, userContent: String): String {
+    // O Gemini e SEMPRE a prioridade (pedido explicito do usuario 05/09/2026: "sempre precisamos
+    // priorizar a redação do Gemini... se falhar, precisamos tentar mais uma vez") - por isso
+    // reentra em QUALQUER falha (rede, timeout, JSON invalido/incompleto do parseGeneratedLines),
+    // nao so em 503/429/500 de rede como antes. Essa restricao anterior deixava passar batido o
+    // caso mais comum na pratica: resposta truncada pelo "raciocinio" invisivel do modelo (ver
+    // maxOutputTokens acima) cai direto pro redator local sem nenhuma nova tentativa, mesmo sendo
+    // so um blip. So desiste de verdade (e cai pro redator local, ver enhanceScript) depois de
+    // GEMINI_MAX_ATTEMPTS falhas seguidas. Roda em segundo plano durante a musica, entao o tempo
+    // extra de uma tentativa a mais custa pouco perto do ganho de nao cair pro local (MUITO mais
+    // lento nesse aparelho, ADR-020: Qwen3 4B passa de 300s) nem pro fallback deterministico
+    // (roteiro generico/repetitivo que o usuario quer ver so como ultimo recurso).
+    private suspend fun generateWithRetry(apiKey: String, userContent: String): List<RadioScriptLine> {
         val systemInstruction = buildSystemInstructions()
         for (attempt in 0 until GEMINI_MAX_ATTEMPTS) {
             val result = runCatching {
-                withTimeoutOrNull(GEMINI_TIMEOUT_MS) { callGemini(apiKey, systemInstruction, userContent) }
+                val generated = withTimeoutOrNull(GEMINI_TIMEOUT_MS) { callGemini(apiKey, systemInstruction, userContent) }
                     ?: error("Gemini demorou demais pra responder")
+                parseGeneratedLines(generated)
             }
             result.onSuccess { return it }
             val failure = result.exceptionOrNull()!!
             val isLastAttempt = attempt == GEMINI_MAX_ATTEMPTS - 1
-            val retryable = RETRYABLE_ERROR_CODES.any { code -> failure.message?.contains("erro $code") == true }
-            if (isLastAttempt || !retryable) throw failure
-            Log.w(TAG_RADIO_WRITER, "gemini erro transitorio (tentativa ${attempt + 1}/$GEMINI_MAX_ATTEMPTS), tentando de novo em ${GEMINI_RETRY_DELAY_MS}ms", failure)
+            if (isLastAttempt) throw failure
+            Log.w(TAG_RADIO_WRITER, "gemini erro (tentativa ${attempt + 1}/$GEMINI_MAX_ATTEMPTS), tentando de novo em ${GEMINI_RETRY_DELAY_MS}ms", failure)
             delay(GEMINI_RETRY_DELAY_MS)
         }
         error("inalcancavel") // GEMINI_MAX_ATTEMPTS >= 1 garante return ou throw no loop acima
@@ -579,11 +630,170 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         // (refillBulletinBuffer, buffer de ate BULLETIN_BUFFER_TARGET boletins de folga) e nao trava a entrada da
         // radio, entao esperar mais o Gemini custa bem menos que cair pro motor local lento.
         const val GEMINI_TIMEOUT_MS = 120_000L
-        // Erro transitorio (503/429/500) - ver callGeminiWithRetry: 2 tentativas no total (1
-        // retry), com um respiro curto entre elas antes de desistir e cair pro redator local.
+        // Ver generateWithRetry: 2 tentativas no total (1 retry) pra QUALQUER falha, com um
+        // respiro curto entre elas antes de desistir e cair pro redator local.
         const val GEMINI_MAX_ATTEMPTS = 2
         const val GEMINI_RETRY_DELAY_MS = 4_000L
-        val RETRYABLE_ERROR_CODES = listOf(503, 429, 500)
+    }
+}
+
+// Guarda a chave de API do OpenRouter localmente no aparelho, mesmo mecanismo/prefs proprio do
+// GeminiWriterSettings (nunca commitada nem enviada pra lugar nenhum alem da propria chamada) -
+// pedido do usuario (05/09/2026): segundo redator na nuvem, gratuito, pra ter uma alternativa
+// independente do Gemini quando ele estiver com pico de demanda (503 visto ao vivo no mesmo dia,
+// duas materias seguidas bateram 503 nas 2 tentativas do Gemini).
+class OpenRouterWriterSettings(context: Context) {
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun apiKey(): String? = prefs.getString(KEY_API_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun setApiKey(key: String) {
+        prefs.edit().putString(KEY_API_KEY, key.trim()).apply()
+    }
+
+    fun clearApiKey() {
+        prefs.edit().remove(KEY_API_KEY).apply()
+    }
+
+    private companion object {
+        const val PREFS_NAME = "openrouter_writer"
+        const val KEY_API_KEY = "api_key"
+    }
+}
+
+// Redator remoto via OpenRouter (agregador de varios provedores, com modelos genuinamente
+// gratuitos sob uma chave so - ver openrouter.ai/models?max_price=0) - segunda opcao de nuvem,
+// INDEPENDENTE do Gemini (empresa/infra diferente), pra cobrir picos de demanda momentaneos de
+// um dos dois sem cair direto pro redator local (bem mais lento nesse aparelho, ver ADR-020).
+// So entra DEPOIS do Gemini falhar (ver RadioBulletinRepository.enhanceScript) - mesma prioridade
+// "nuvem antes de local" de sempre, agora com uma 2a fonte de nuvem antes de desistir de vez.
+// API compativel com o formato chat/completions da OpenAI; mesmo texto de instrucao
+// (buildSystemInstructions/buildUserContent) que o Gemini e o redator local usam.
+private class RemoteOpenRouterRadioScriptWriter(context: Context) {
+    val settings = OpenRouterWriterSettings(context)
+
+    fun isConfigured(): Boolean = settings.apiKey() != null
+
+    suspend fun writeContextual(
+        story: NewsStory,
+        context: RadioScriptContext,
+        lastPlayedTrack: RadioLastPlayedTrack?,
+        upcomingTrack: RadioLastPlayedTrack?,
+    ): RadioScript = withContext(Dispatchers.IO) {
+        val apiKey = settings.apiKey() ?: error("OpenRouter sem chave de API configurada")
+        val userContent = buildUserContent(story, lastPlayedTrack, upcomingTrack)
+        val lines = generateWithRetry(apiKey, userContent)
+        Log.d(TAG_RADIO_WRITER, "openrouter texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
+        RadioScript(
+            story = story,
+            // Mesmo "source" do Gemini/redator local de proposito - ver comentario identico em
+            // RemoteGeminiRadioScriptWriter.writeContextual, mesma razao (nenhum consumidor hoje
+            // precisa distinguir qual dos 3 motores escreveu).
+            source = RadioScriptSource.LocalLlm,
+            lines = lines,
+            duration = context.duration,
+        )
+    }
+
+    // Mesma politica do Gemini (ver RemoteGeminiRadioScriptWriter.generateWithRetry): reentra em
+    // QUALQUER falha, nao so codigo HTTP especifico - um JSON truncado/mal formado de um modelo
+    // gratuito tambem merece uma segunda chance antes de desistir e cair pro redator local.
+    // 06/09/2026 (pedido do usuario: "openrouter nunca funcionou"): diagnostico em campo mostrou
+    // 429 "Provider returned error" - rate limit do PROVEDOR gratuito por tras do modelo unico
+    // configurado (comum em modelo gratuito popular no OpenRouter, capacidade compartilhada entre
+    // todo mundo). Cada tentativa agora roda num modelo DIFERENTE de OPENROUTER_MODELS (ver
+    // companion) em vez de bater sempre no mesmo - mesma logica de "infra diferente pra nao cair
+    // junto" ja usada entre Gemini e OpenRouter, agora dentro do proprio OpenRouter tambem.
+    private suspend fun generateWithRetry(apiKey: String, userContent: String): List<RadioScriptLine> {
+        val systemInstruction = buildSystemInstructions()
+        for (attempt in 0 until OPENROUTER_MAX_ATTEMPTS) {
+            val model = OPENROUTER_MODELS[attempt % OPENROUTER_MODELS.size]
+            val result = runCatching {
+                val generated = withTimeoutOrNull(OPENROUTER_TIMEOUT_MS) {
+                    callOpenRouter(apiKey, model, systemInstruction, userContent)
+                } ?: error("OpenRouter demorou demais pra responder")
+                parseGeneratedLines(generated)
+            }
+            result.onSuccess { return it }
+            val failure = result.exceptionOrNull()!!
+            val isLastAttempt = attempt == OPENROUTER_MAX_ATTEMPTS - 1
+            if (isLastAttempt) throw failure
+            Log.w(
+                TAG_RADIO_WRITER,
+                "openrouter erro no modelo $model (tentativa ${attempt + 1}/$OPENROUTER_MAX_ATTEMPTS), tentando ${OPENROUTER_MODELS[(attempt + 1) % OPENROUTER_MODELS.size]} em ${OPENROUTER_RETRY_DELAY_MS}ms",
+                failure,
+            )
+            delay(OPENROUTER_RETRY_DELAY_MS)
+        }
+        error("inalcancavel") // OPENROUTER_MAX_ATTEMPTS >= 1 garante return ou throw no loop acima
+    }
+
+    // Formato chat/completions compativel com OpenAI (Authorization: Bearer <key>, messages
+    // system/user) - mesmo padrao sincrono via HttpURLConnection que o resto do projeto usa (ver
+    // callGemini/NewsBulletinRepository.fetchFeed).
+    private fun callOpenRouter(apiKey: String, model: String, systemInstruction: String, userContent: String): String {
+        val connection = (URL(OPENROUTER_ENDPOINT).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = OPENROUTER_TIMEOUT_MS.toInt()
+            readTimeout = OPENROUTER_TIMEOUT_MS.toInt()
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Authorization", "Bearer $apiKey")
+            setRequestProperty("X-Title", "Pailer FM")
+        }
+        val body = JSONObject().apply {
+            put("model", model)
+            put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", systemInstruction))
+                    .put(JSONObject().put("role", "user").put("content", userContent)),
+            )
+            put("temperature", 0.6)
+        }
+        connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+        val responseCode = connection.responseCode
+        val responseText = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
+            ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+        connection.disconnect()
+
+        if (responseCode !in 200..299) {
+            val apiMessage = runCatching {
+                JSONObject(responseText).optJSONObject("error")?.optString("message")
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+            error("erro $responseCode${apiMessage?.let { ": $it" } ?: ""}")
+        }
+
+        val text = JSONObject(responseText)
+            .optJSONArray("choices")?.optJSONObject(0)
+            ?.optJSONObject("message")?.optString("content")
+        return text?.takeIf { it.isNotBlank() } ?: error("OpenRouter não devolveu texto (resposta vazia)")
+    }
+
+    private companion object {
+        const val OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+        // Lista de modelos gratuitos (tag ":free"), tentados em ordem por generateWithRetry - se
+        // o 1o levar 429/erro, a proxima tentativa cai num modelo de OUTRO provedor/pool de
+        // capacidade, nao insiste no mesmo que acabou de saturar. Confirmados validos via GET
+        // https://openrouter.ai/api/v1/models em 06/09/2026 (filtrar id terminado em ":free") -
+        // os gratuitos do OpenRouter mudam com frequencia, reconfirmar antes de trocar de novo.
+        // 1) Gemma 4 31B (Google) - mesma escolha de 05/09/2026: bom portugues, "it"
+        //    (instruction-tuned) sem raciocinio invisivel, resposta direto em JSON.
+        // 2) LFM 2.5 2.6B (Liquid AI) - provedor/infra totalmente diferente do Google, tambem
+        //    instruction-tuned sem raciocinio; modelo menor entra como 2a chance MAIS RAPIDA
+        //    (nao so mais uma tentativa no mesmo pool congestionado).
+        val OPENROUTER_MODELS = listOf(
+            "google/gemma-4-31b-it:free",
+            "liquid/lfm-2.5-2.6b:free",
+        )
+        const val OPENROUTER_TIMEOUT_MS = 60_000L
+        // Ver generateWithRetry: 2 tentativas no total (1 retry, em modelo diferente) pra
+        // QUALQUER falha, com um respiro curto entre elas antes de desistir e cair pro redator
+        // local.
+        const val OPENROUTER_MAX_ATTEMPTS = 2
+        const val OPENROUTER_RETRY_DELAY_MS = 4_000L
     }
 }
 
@@ -643,7 +853,16 @@ private class OptionalLocalLlmRadioScriptWriter(
                 }
             }
             val generated = withTimeoutOrNull(LOCAL_WRITER_TIMEOUT_MS) {
-                LocalLlamaTextGenerator.generate(config, buildPrompt(story, lastPlayedTrack, upcomingTrack), progressListener)
+                LocalLlamaTextGenerator.generate(
+                    config,
+                    prompt = buildPrompt(story, lastPlayedTrack, upcomingTrack),
+                    // Ver LocalLlamaTextGenerator.generate/ensurePrefixCacheNative (06/09/2026):
+                    // esse pedaco (instrucoes de sistema + exemplo few-shot) e IDENTICO em todo
+                    // boletim - passado separado pra dar pro motor nativo cachear o prefill dele
+                    // uma unica vez, em vez de reprocessar do zero a cada chamada.
+                    promptPrefix = buildPromptPrefix(),
+                    onProgress = progressListener,
+                )
             } ?: error("Redator local demorou demais")
             val lines = parseGeneratedLines(generated)
             Log.d(TAG_RADIO_WRITER, "redator local texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
@@ -655,22 +874,44 @@ private class OptionalLocalLlmRadioScriptWriter(
             )
         }
 
+    // Formato ChatML especifico do llama.cpp/Qwen3 - pre-semeia o "[" de abertura e um bloco
+    // <think></think> vazio (ver ADR-002, Qwen3 as vezes gasta o orcamento de tokens todo
+    // "pensando" em vez de escrever JSON direto). O Gemini (RemoteGeminiRadioScriptWriter) usa o
+    // MESMO conteudo de instrucao (buildSystemInstructions/buildUserContent abaixo) mas sem
+    // esses marcadores - a API dele ja separa system/user de outro jeito, e nao precisa do
+    // truque de pre-seed pra pular o "pensar".
+    //
+    // Dividido em prefixo (buildPromptPrefix, IDENTICO em toda chamada) + sufixo
+    // (buildPromptSuffix, muda por materia) desde 06/09/2026 - ver LocalLlamaTextGenerator.
+    // generate/ensurePrefixCacheNative: o motor nativo cacheia o KV-state do prefixo pra nao
+    // reprocessar do zero em todo boletim. buildPrompt() continua devolvendo o mesmo texto de
+    // sempre (prefixo + sufixo concatenados, byte a byte igual à versão anterior) - só quem
+    // chama LocalLlamaTextGenerator.generate() precisa saber da divisão.
     private fun buildPrompt(
         story: NewsStory,
         lastPlayedTrack: RadioLastPlayedTrack?,
         upcomingTrack: RadioLastPlayedTrack?,
-    ): String {
-        // Formato ChatML especifico do llama.cpp/Qwen3 - pre-semeia o "[" de abertura e um
-        // bloco <think></think> vazio (ver ADR-002, Qwen3 as vezes gasta o orcamento de
-        // tokens todo "pensando" em vez de escrever JSON direto). O Gemini (RemoteGeminiRadio
-        // ScriptWriter) usa o MESMO conteudo de instrucao (buildSystemInstructions/
-        // buildUserContent abaixo) mas sem esses marcadores - a API dele ja separa
-        // system/user de outro jeito, e nao precisa do truque de pre-seed pra pular o "pensar".
-        return """
+    ): String = buildPromptPrefix() + buildPromptSuffix(story, lastPlayedTrack, upcomingTrack)
+
+    // Cuidado: buildPromptPrefix()+buildPromptSuffix() precisam concatenar byte a byte igual ao
+    // buildPrompt() original (bloco unico). trimIndent() calcula indentacao minima olhando TODAS
+    // as linhas do texto ja interpolado - como buildSystemInstructions() e buildUserContent() sao
+    // ambos multi-linha e ja vem em coluna 0 (proprio trimIndent() deles), cada metade aqui
+    // calcula indentacao minima 0 sozinha, igual ao bloco unico calculava antes. Se um dia
+    // qualquer um dos dois virar texto de uma linha so, essa premissa quebra e os marcadores
+    // ChatML (<|im_start|> etc.) podem sair com indentacao diferente entre as duas metades -
+    // conferir concatenando as duas e comparando com o prompt antigo se isso mudar.
+    private fun buildPromptPrefix(): String = """
             <|im_start|>system
             ${buildSystemInstructions()}
             <|im_end|>
-            <|im_start|>user
+            <|im_start|>user""".trimIndent()
+
+    private fun buildPromptSuffix(
+        story: NewsStory,
+        lastPlayedTrack: RadioLastPlayedTrack?,
+        upcomingTrack: RadioLastPlayedTrack?,
+    ): String = "\n" + """
             ${buildUserContent(story, lastPlayedTrack, upcomingTrack)}
             /no_think
             <|im_end|>
@@ -681,7 +922,6 @@ private class OptionalLocalLlmRadioScriptWriter(
 
             [
         """.trimIndent()
-    }
 
     private companion object {
         // 02/09/2026: decode real medido em ~27s neste aparelho (Dimensity 1200, 3 threads,
@@ -705,7 +945,7 @@ private class OptionalLocalLlmRadioScriptWriter(
 // (ver buildSystemInstructions) e precisam da mesma validacao/rede de seguranca.
 private const val ACCENTED_CHARS = "áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ"
 
-private fun parseGeneratedLines(generated: String): List<RadioScriptLine> {
+private fun parseGeneratedLines(generated: String): List<RadioScriptLine> = runCatching {
     // O prompt ja pre-semeia o "[" de abertura no motor local (ver buildPrompt) - generated
     // normalmente vem sem ele; o Gemini nao tem esse pre-seed mas pode devolver com ou sem
     // colchetes dependendo de como respeitou a instrucao. Modelos pequenos (Qwen3 1.7B) as
@@ -717,7 +957,7 @@ private fun parseGeneratedLines(generated: String): List<RadioScriptLine> {
     val trimmed = generated.trim().removePrefix("[")
     val body = trimmed.substringBeforeLast(']')
     val array = JSONArray("[$body]")
-    return (0 until array.length()).mapNotNull { index ->
+    (0 until array.length()).mapNotNull { index ->
         val item = array.optJSONObject(index) ?: return@mapNotNull null
         val speaker = when (item.optString("speaker")) {
             "Female" -> RadioSpeaker.Female
@@ -734,7 +974,14 @@ private fun parseGeneratedLines(generated: String): List<RadioScriptLine> {
     }.take(6).takeIf { lines ->
         lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female && hasAccentuation(lines)
     } ?: error("O redator devolveu um roteiro inválido")
-}
+}.onFailure {
+    // Sem isso, uma falha de parse (JSON malformado/truncado) so aparecia no log como
+    // "JSONTokener.syntaxError" sem NENHUM contexto do que o modelo realmente escreveu -
+    // impossivel diagnosticar em campo (achado 05/09/2026: redator local falhou 2x na mesma
+    // sessao, em materias diferentes, sem essa linha nao da pra saber se e o mesmo bug ou
+    // coisas distintas). Truncado pra nao inundar o logcat com boletins muito longos.
+    Log.w(TAG_RADIO_WRITER, "parse do roteiro falhou (${it::class.simpleName}: ${it.message}); texto bruto gerado: ${generated.take(1500)}")
+}.getOrThrow()
 
 // Texto de português corrido deste tamanho praticamente sempre tem pelo menos um caractere
 // acentuado ("não", "é", "está", "notícia"...) - se não tiver nenhum, é sinal de que o
