@@ -53,7 +53,12 @@ data class LocalAlbum(
     val artworkUri: Uri?,
     val songs: List<LocalSong>,
 ) {
-    val key: String = "$id:$title:$artist"
+    // So id+title (sem o artist agregado) - albumsFrom ja agrupa por "$albumId:$album", entao
+    // esse par ja identifica o album sozinho. Incluir o artist aqui quebrava ocultar/favoritar
+    // albuns tipo "WhatsApp Audio": o campo artist e um resumo de ate 2 artistas distintos das
+    // faixas, que muda toda vez que uma nova mensagem de voz de outro remetente chega, fazendo a
+    // chave salva em hiddenAlbumKeys/favoriteAlbumKeys nao bater mais com o album reconstruido.
+    val key: String = "$id:$title"
     val dateAdded: Long = songs.maxOfOrNull { it.dateAdded } ?: 0L
     val genre: String = songs.firstOrNull { it.genre.isNotBlank() }?.genre.orEmpty()
 

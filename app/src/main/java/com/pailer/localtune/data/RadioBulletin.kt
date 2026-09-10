@@ -33,6 +33,12 @@ data class RadioBulletinSettings(
     // escreve. Util pra testar o redator local isoladamente sem apagar as chaves de API salvas
     // (que continuam guardadas, so ignoradas enquanto isso estiver desligado).
     val cloudWriterEnabled: Boolean = true,
+    // Motor de SINTESE DE VOZ do boletim (Fran/Nico) - nao confundir com preferLocalWriter/
+    // cloudWriterEnabled acima, que sao sobre quem ESCREVE o roteiro. Experimental (10/09/2026,
+    // pedido do usuario), ver BulletinTtsProvider/GeminiTtsModel em RadioBulletinTts.kt. Default
+    // CURRENT preserva o comportamento de sempre pra quem ja tem o app instalado.
+    val ttsProvider: BulletinTtsProvider = BulletinTtsProvider.CURRENT,
+    val ttsModel: GeminiTtsModel = GeminiTtsModel.GEMINI_3_1_FLASH,
 )
 
 data class NewsStory(
@@ -64,13 +70,6 @@ data class RadioScript(
     // context.duration explicito. Guardado aqui pra withPhilosophicalCloser() escolher a reflexao
     // do Nico (leve/funda) sem precisar recalcular a partir da materia.
     val duration: RadioBulletinDuration = RadioBulletinDuration.Normal,
-    // true so quando o script foi gerado com lastPlayedTrack/upcomingTrack reais (sessao de radio
-    // ativa) - false pro "nucleo" pre-aquecido sem radio nenhuma tocando (ver
-    // LocalTuneViewModel.prewarmCoreBuffer/RadioBulletinRepository.enhanceScript). Substitui o
-    // sinal antigo "source == LocalLlm && lines.size >= 6" em withLastPlayedIntro/
-    // withPhilosophicalCloser (03/09/2026): esse sinal assumia que um script de 6 falas do LLM
-    // sempre tinha contexto de faixa real, o que deixou de ser verdade com o pre-aquecimento.
-    val hasTrackContext: Boolean = false,
 ) {
     val displayText: String
         get() = story.title
@@ -81,94 +80,33 @@ data class RadioScript(
         get() = lines.joinToString(" ") { it.text }
 }
 
-// genre/year default vazio/0 pra nao quebrar os usos existentes (so title/artist) - reaproveitado
-// tanto pra "ultima musica" (withLastPlayedIntro) quanto pra "proxima musica"
-// (withPhilosophicalCloser, que usa genre/year pra escolher a curiosidade em musicTrivia()).
-data class RadioLastPlayedTrack(
-    val title: String,
-    val artist: String = "",
-    val genre: String = "",
-    val year: Int = 0,
-)
-
-fun RadioScript.withLastPlayedIntro(track: RadioLastPlayedTrack?): RadioScript {
-    val playedTrack = track ?: return this
-    if (lines.isEmpty()) return this
-    // Redator local (>=6 falas, COM contexto de faixa real - hasTrackContext) ja escreveu a
-    // reacao a faixa anterior na propria fala 1, usando titulo/artista reais (ver
-    // OptionalLocalLlmRadioScriptWriter.buildPrompt) - o template fixo abaixo ("Você acaba de
-    // ouvir...") so entra quando o roteiro veio do fallback deterministico, o LLM nao emplacou
-    // as 6 falas dessa vez, OU o script e um "nucleo" pre-aquecido sem contexto real ainda (ver
-    // RadioScript.hasTrackContext) - pedido do usuario (03/09/2026): essa frase sempre igual era
-    // exatamente o tipo de "texto pronto" que ele nao queria mais.
-    if (hasTrackContext && lines.size >= 6) return this
-    val cleanTitle = playedTrack.title.toRadioSentence().limitWords(14)
-    if (cleanTitle.isBlank()) return this
-    val cleanArtist = playedTrack.artist.toRadioSentence().limitWords(8)
-    val intro = if (cleanArtist.isBlank()) {
-        "Você acaba de ouvir $cleanTitle, e vamos às notícias."
-    } else {
-        "Você acaba de ouvir $cleanTitle, de $cleanArtist, e vamos às notícias."
-    }
-    return copy(lines = lines.mapIndexed { index, line ->
-        if (index == 0) line.copy(text = "$intro ${line.text}") else line
-    })
-}
-
-// Cola a reacao da Fran chamando a proxima musica (nome do artista + curiosidade de
-// genero/epoca, nunca inventada - ver musicTrivia()) no fim do boletim, e a reflexao
-// existencialista/absurdista do Nico quando ainda nao tiver uma.
-// Aplicada DEPOIS da geracao (igual withLastPlayedIntro) porque a proxima faixa da fila so e
-// conhecida em tempo de reproducao, nunca em loadScripts() - ver LocalTuneViewModel.
-//
-// Reflexao do Nico (fala 5) e reacao de fechamento da Fran (fala 6): quando o redator local
-// escreveu o bate-bola completo (ver OptionalLocalLlmRadioScriptWriter.buildPrompt), as duas
-// JA SAO geradas na hora em cima da noticia/faixa real, nao frase generica de banco. Só cai
-// pro banco fixo (NICO_REFLECTIONS_LIGHT/DEEP, FRAN_CLOSER_REACTIONS) quando o roteiro veio do
-// fallback determinístico ou o LLM nao emplacou as 6 falas dessa vez - pedido do usuário
-// (02/09 e reforçado em 03/09/2026): as frases prontas do banco soavam repetitivas/genéricas
-// demais, o LLM e quem consegue comentar de fato "na hora" a partir do conteúdo real.
-//
-// A curiosidade musical (musicTrivia) continua vindo SEMPRE do banco fixo, mesmo quando o LLM
-// escreveu a reacao - decisao deliberada anterior do usuario: o redator local e pequeno demais
-// pra arriscar inventar dado sobre banda pouco conhecida da biblioteca (ver comentario em
-// MUSIC_TRIVIA_BY_GENRE_FAMILY). O LLM só assina a reação/energia da fala, não o fato em si.
-fun RadioScript.withPhilosophicalCloser(radioName: String, nextTrack: RadioLastPlayedTrack?): RadioScript {
+// Garante que o boletim feche com 6 falas completas - a reflexao do Nico (fala 5) e a reacao de
+// fechamento da Fran (fala 6) JA SAO geradas na hora pelo LLM em cima da noticia real (ver
+// OptionalLocalLlmRadioScriptWriter.buildPrompt/buildSystemInstructions), nao frase generica de
+// banco. So cai pro banco fixo (NICO_REFLECTIONS_LIGHT/DEEP, FRAN_CLOSER_REACTIONS) quando o
+// roteiro veio do fallback deterministico ou o LLM nao emplacou as 6 falas dessa vez - pedido do
+// usuário (02/09 e reforçado em 03/09/2026): as frases prontas do banco soavam repetitivas/
+// genéricas demais, o LLM e quem consegue comentar de fato "na hora" a partir do conteúdo real.
+// Pedido do usuario (09/09/2026): boletim virou 100% radio-agnostico - nunca mais cita musica/
+// artista/radio nenhuma (ver buildSystemInstructions), entao isso nao precisa mais de contexto
+// de faixa/radio pra decidir o fechamento, so do proprio roteiro.
+fun RadioScript.withPhilosophicalCloser(): RadioScript {
     if (lines.isEmpty()) return this
     val llmWroteFullCloser = source == RadioScriptSource.LocalLlm &&
         lines.size >= 6 &&
         lines[4].speaker == RadioSpeaker.Male &&
         lines[5].speaker == RadioSpeaker.Female
-    if (llmWroteFullCloser) {
-        val franLine = RadioScriptLine(
-            RadioSpeaker.Female,
-            buildFranCloser(radioName, nextTrack, reaction = lines[5].text).limitWords(32),
-        )
-        return copy(lines = lines.take(5) + franLine)
-    }
+    if (llmWroteFullCloser) return this
     val llmAlreadyWroteReflection = source == RadioScriptSource.LocalLlm &&
         lines.size >= 5 &&
         lines.last().speaker == RadioSpeaker.Male
-    val franLine = RadioScriptLine(RadioSpeaker.Female, buildFranCloser(radioName, nextTrack, reaction = null).limitWords(32))
+    val franLine = RadioScriptLine(RadioSpeaker.Female, FRAN_CLOSER_REACTIONS.random().limitWords(32))
     if (llmAlreadyWroteReflection) {
         return copy(lines = lines + franLine)
     }
     val reflectionBank = if (duration == RadioBulletinDuration.Long) NICO_REFLECTIONS_DEEP else NICO_REFLECTIONS_LIGHT
     val nicoLine = RadioScriptLine(RadioSpeaker.Male, reflectionBank.random().ensureFinalPeriod().limitWords(28))
     return copy(lines = lines + nicoLine + franLine)
-}
-
-private fun buildFranCloser(radioName: String, nextTrack: RadioLastPlayedTrack?, reaction: String?): String {
-    val track = nextTrack
-    val cleanArtist = track?.artist?.toRadioSentence()?.limitWords(6).orEmpty()
-    val opener = reaction?.trim()?.takeIf { it.isNotBlank() } ?: FRAN_CLOSER_REACTIONS.random()
-    if (track == null || cleanArtist.isBlank()) {
-        // Sem faixa seguinte conhecida (fim de fila, ou fila ainda nao carregada) - degrada pra
-        // frase generica de sempre, sem citar artista nem curiosidade.
-        return "$opener Segue o mundo torto, segue a nossa trilha. Agora a música volta na Rádio $radioName."
-    }
-    val trivia = musicTrivia(track.genre, track.year)
-    return "$opener Chega mais $cleanArtist aí: $trivia Segue com a gente na Rádio $radioName."
 }
 
 enum class RadioScriptSource {
@@ -195,18 +133,14 @@ class RadioBulletinRepository(context: Context) {
     private val newsRepository = NewsBulletinRepository(context)
     private val localWriter = OptionalLocalLlmRadioScriptWriter(context)
     private val geminiWriter = RemoteGeminiRadioScriptWriter(context)
-    private val openRouterWriter = RemoteOpenRouterRadioScriptWriter(context)
     private val fallbackWriter = FallbackRadioScriptWriter()
 
     fun localWriterStatus(): LocalRadioWriterStatus = localWriter.status()
 
-    // Exposto pra UI mostrar/gerenciar a chave do Gemini nas Configuracoes - ver
-    // GeminiWriterSettings/LocalTuneViewModel.
-    fun geminiSettings(): GeminiWriterSettings = geminiWriter.settings
-
-    // Exposto pra UI mostrar/gerenciar a chave do OpenRouter nas Configuracoes - ver
-    // OpenRouterWriterSettings/LocalTuneViewModel.
-    fun openRouterSettings(): OpenRouterWriterSettings = openRouterWriter.settings
+    // Exposto pra UI mostrar/gerenciar as chaves do Gemini nas Configuracoes (ate 5, testadas em
+    // cadeia - ver GeminiApiKeySettings) - o MESMO pool e usado tanto por este redator quanto
+    // por GeminiFlashTtsEngine.kt (sintese de voz experimental).
+    fun geminiSettings(): GeminiApiKeySettings = geminiWriter.settings
 
     suspend fun loadScripts(settings: RadioBulletinSettings, radioName: String): List<RadioScript> {
         if (settings.mode == RadioBulletinMode.Off) return emptyList()
@@ -234,70 +168,43 @@ class RadioBulletinRepository(context: Context) {
         script: RadioScript,
         settings: RadioBulletinSettings,
         radioName: String,
-        lastPlayedTrack: RadioLastPlayedTrack? = null,
-        upcomingTrack: RadioLastPlayedTrack? = null,
         onProgress: (String) -> Unit = {},
         onProgressPercent: (Int) -> Unit = {},
         // Pedido do usuario (04/09/2026): prewarmCoreBuffer usa isso pra pular o cooldown termico
         // (ver COOLDOWN_BETWEEN_BULLETINS_MS em LocalTuneViewModel) quando a escrita saiu 100% na
-        // nuvem (Gemini OU OpenRouter, ver 05/09/2026) - so a sintese de voz continua pesando
-        // local nesse caso, bem menos sozinha do que LLM local + sintese juntos (a causa original
-        // do cooldown, ver ADR-020/021). Callback em vez de campo novo em RadioScript porque so
-        // esse UM caller precisa saber - nenhum outro consumidor distingue qual dos 3 motores
-        // escreveu por design (ver RemoteGeminiRadioScriptWriter/RemoteOpenRouterRadioScript
-        // Writer.writeContextual, mesmo RadioScriptSource.LocalLlm pros dois).
+        // nuvem (Gemini) - so a sintese de voz continua pesando local nesse caso, bem menos
+        // sozinha do que LLM local + sintese juntos (a causa original do cooldown, ver ADR-020/
+        // 021). Callback em vez de campo novo em RadioScript porque so esse UM caller precisa
+        // saber - nenhum outro consumidor distingue local de nuvem por design (ver
+        // RemoteGeminiRadioScriptWriter.writeContextual, mesmo RadioScriptSource.LocalLlm pros
+        // dois).
         onWriterUsed: (usedCloudWriter: Boolean) -> Unit = {},
     ): RadioScript {
         if (settings.mode != RadioBulletinMode.Dialogue || !settings.preferLocalWriter) return script
         val context = RadioScriptContext(radioName = radioName, duration = pickDuration(script.story))
-        val trackContext = { s: RadioScript ->
-            // Marca se a geracao teve faixa real disponivel - usado por withLastPlayedIntro pra
-            // decidir se ainda precisa prepender a intro real (ver comentario no campo
-            // RadioScript.hasTrackContext). Sem faixa nenhuma conhecida, fica false mesmo se
-            // upcomingTrack tiver vindo (fala 6 nao depende disso, ver withPhilosophicalCloser).
-            s.copy(hasTrackContext = lastPlayedTrack != null || upcomingTrack != null)
-        }
 
-        // Gemini primeiro quando tem chave configurada - a etapa de ESCRITA e o gargalo real
-        // (ver ADR-020: prefill+decode do Qwen3 4B local passa de 300s), uma chamada de API
-        // costuma responder em segundos. So a redacao vai pra nuvem; sintese de voz continua
-        // 100% local (LocalRadioVoiceEngine), o audio final nunca sai do aparelho. Sem chave,
-        // nem tenta - cai direto pro redator local, app continua 100% funcional offline.
+        // Gemini primeiro quando tem pelo menos 1 chave configurada - a etapa de ESCRITA e o
+        // gargalo real (ver ADR-020: prefill+decode do Qwen3 4B local passa de 300s), uma chamada
+        // de API costuma responder em segundos. So a redacao vai pra nuvem; sintese de voz
+        // continua 100% local (LocalRadioVoiceEngine) a menos que Gemini Flash TTS tambem esteja
+        // ligado (ver GeminiFlashTtsEngine.kt). Sem chave nenhuma, nem tenta - cai direto pro
+        // redator local, app continua 100% funcional offline.
         //
-        // settings.cloudWriterEnabled (06/09/2026): chave geral que desliga Gemini+OpenRouter
-        // de uma vez, mesmo com chaves salvas - pedido do usuario pra poder testar/usar so o
-        // redator local sem apagar as chaves de API.
+        // settings.cloudWriterEnabled (06/09/2026): chave geral que desliga o Gemini de uma vez,
+        // mesmo com chaves salvas - pedido do usuario pra poder testar/usar so o redator local
+        // sem apagar as chaves de API. geminiWriter.generateWithRetry() (abaixo) ja testa TODAS
+        // as chaves configuradas em cadeia (pedido do usuario 10/09/2026: ate 5 chaves, se a 1a
+        // falhar tenta a 2a, e assim por diante) antes de desistir e cair pro redator local.
         if (settings.cloudWriterEnabled && geminiWriter.isConfigured()) {
             onProgress("Escrevendo o bate-bola com o Gemini...")
             Log.d(TAG_RADIO_WRITER, "gemini iniciando para '${script.story.title}'")
             val result = runCatching {
-                geminiWriter.writeContextual(script.story, context, lastPlayedTrack, upcomingTrack)
-            }.map(trackContext).onSuccess {
+                geminiWriter.writeContextual(script.story, context)
+            }.onSuccess {
                 Log.d(TAG_RADIO_WRITER, "gemini gerou ${it.lines.size} falas para '${script.story.title}'")
             }.onFailure {
-                Log.w(TAG_RADIO_WRITER, "gemini falhou; tentando redator local para '${script.story.title}'", it)
+                Log.w(TAG_RADIO_WRITER, "gemini falhou (todas as chaves); tentando redator local para '${script.story.title}'", it)
                 onProgress("Gemini falhou (${it.message ?: it::class.simpleName}); tentando redator local...")
-            }
-            if (result.isSuccess) {
-                onWriterUsed(true)
-                return result.getOrThrow()
-            }
-        }
-
-        // OpenRouter e a 2a chance de nuvem, so tentada DEPOIS do Gemini falhar - pedido do
-        // usuario (05/09/2026), motivado por um pico de demanda real do Gemini (503 em 2 materias
-        // seguidas nas 2 tentativas) que so o redator local (lento) sobrava pra cobrir. Provedor/
-        // infra diferente do Gemini de proposito, pra os dois nao caisrem juntos pela mesma causa.
-        if (settings.cloudWriterEnabled && openRouterWriter.isConfigured()) {
-            onProgress("Escrevendo o bate-bola com o OpenRouter...")
-            Log.d(TAG_RADIO_WRITER, "openrouter iniciando para '${script.story.title}'")
-            val result = runCatching {
-                openRouterWriter.writeContextual(script.story, context, lastPlayedTrack, upcomingTrack)
-            }.map(trackContext).onSuccess {
-                Log.d(TAG_RADIO_WRITER, "openrouter gerou ${it.lines.size} falas para '${script.story.title}'")
-            }.onFailure {
-                Log.w(TAG_RADIO_WRITER, "openrouter falhou; tentando redator local para '${script.story.title}'", it)
-                onProgress("OpenRouter falhou (${it.message ?: it::class.simpleName}); tentando redator local...")
             }
             if (result.isSuccess) {
                 onWriterUsed(true)
@@ -315,8 +222,8 @@ class RadioBulletinRepository(context: Context) {
         onProgress("Escrevendo o bate-bola com o redator local (Qwen3)...")
         Log.d(TAG_RADIO_WRITER, "redator local iniciando para '${script.story.title}'")
         return runCatching {
-            localWriter.writeContextual(script.story, context, lastPlayedTrack, upcomingTrack, onProgress, onProgressPercent)
-        }.map(trackContext).onSuccess {
+            localWriter.writeContextual(script.story, context, onProgress, onProgressPercent)
+        }.onSuccess {
             Log.d(TAG_RADIO_WRITER, "redator local gerou ${it.lines.size} falas para '${script.story.title}'")
         }.onFailure {
             Log.w(TAG_RADIO_WRITER, "redator local falhou; usando roteiro base para '${script.story.title}'", it)
@@ -353,110 +260,124 @@ private fun buildSystemInstructions(): String = """
     Fran e Nico são amigos de trabalho de longa data, têm intimidade pra brincar um com
     o outro no ar. Fran tem senso de humor de verdade: solta piada, faz alívio cômico,
     gosta de trazer informação útil/relevante e levantar o astral - sem soar boba ou
-    ingênua. Nico é cético, sério, político (manja de capitalismo, imperialismo, lobby,
-    corporativismo, mas não cita isso toda fala), e também tem humor - só que ácido,
-    seco, cutuca a ferida do assunto (ironia/sarcasmo/deboche), nunca piadinha fofa. Nico
-    é meio porra-louca, já viveu bastante, tem aquela pegada de motoqueiro de jaqueta de
-    couro que não se abala com nada - isso aparece na ATITUDE da fala dele, não precisa
-    citar jaqueta/moto toda hora.
+    ingênua; o humor dela é debochado (zoeira leve, brincadeira solta). Nico é cético,
+    sério, político (manja de capitalismo, imperialismo, lobby, corporativismo, mas não
+    cita isso toda fala), e também tem humor - só que ácido, seco, cutuca a ferida do
+    assunto (ironia/sarcasmo), nunca piadinha fofa e nunca deboche bobo igual a Fran -
+    o dele corta, o dela solta. Nico é meio porra-louca, já viveu bastante, tem aquela
+    pegada de motoqueiro de jaqueta de couro que não se abala com nada - isso aparece na
+    ATITUDE da fala dele, não precisa citar jaqueta/moto toda hora. Os dois são GENTE:
+    sentem o clima de cada notícia (leve, séria, engraçada, triste, perigosa, absurda) e
+    reagem de acordo - nunca no automático, nunca sempre do mesmo jeito matéria após
+    matéria.
     Responda só JSON válido, um array de 6 objetos:
     [{"speaker":"Female","text":"..."},{"speaker":"Male","text":"..."}]
     As instruções abaixo dizem O QUE cada fala deve fazer - NÃO são texto pra repetir.
     Nunca escreva a instrução em si (tipo a palavra "provocação") como se fosse a fala;
     escreva a fala de verdade, como um locutor falaria ao vivo, DIFERENTE a cada vez -
-    nunca reuse a mesma abertura ou o mesmo bordão de um boletim pro outro. Exemplo
-    (matéria fictícia sobre trânsito, só pra mostrar o estilo esperado):
-    [{"speaker":"Female","text":"Ainda com esse som na cabeça, chegou uma notícia curiosa: a prefeitura anunciou um novo corredor de ônibus pra Avenida Central."},
-    {"speaker":"Male","text":"No papel tá bonito. Bora ver se essa verba não some no caminho, que já vi prometerem coisa parecida antes."},
-    {"speaker":"Female","text":"Confesso que fiquei animada, viu? Se emplacar de verdade, é um respiro pra quem enfrenta esse trânsito todo santo dia."},
-    {"speaker":"Male","text":"Anota aí: prometeram algo parecido faz uns dois anos e virou zero. Só acredito quando ver o asfalto sendo cortado."},
-    {"speaker":"Male","text":"Tem um quê de Sísifo nisso - empurra o projeto morro acima, ele rola pra baixo de novo, e a gente segue empurrando."},
-    {"speaker":"Female","text":"Você tá com essa cara de quem já viu esse filme repetido, hein? Mas segura o climão que a próxima faixa já tá chegando."}]
-    O exemplo acima e so ILUSTRACAO DE ESTILO (era sobre transito, materia fictícia) - a
-    materia de verdade de hoje e outro assunto completamente diferente, ver abaixo.
+    nunca reuse a mesma abertura ou o mesmo bordão de um boletim pro outro. Esse boletim
+    é RADIO-AGNÓSTICO: nunca mencione nome de rádio, nem de música/faixa/artista tocando
+    antes ou depois - ele precisa fazer sentido tocando em qualquer rádio, a qualquer
+    hora, sem nenhuma referência externa. Exemplo (matéria fictícia sobre uma biblioteca,
+    só pra mostrar o estilo esperado - as frases abaixo são só ILUSTRAÇÃO, nunca as repita
+    nem adapte pra matéria de verdade, mesmo trocando palavra por palavra):
+    [{"speaker":"Female","text":"Justo hoje que eu ia dormir cedo: a biblioteca central anunciou que vai abrir até meia-noite a partir da semana que vem."},
+    {"speaker":"Male","text":"Duvido que dure um mês. Bora ver quem paga a conta de luz extra quando cortarem verba de novo."},
+    {"speaker":"Female","text":"Pode ser, mas confesso que já ia lá estudar de madrugada nem que fosse só pra fugir de casa."},
+    {"speaker":"Male","text":"Aposto que enchem a sala no primeiro fim de semana e esvazia igual academia em fevereiro."},
+    {"speaker":"Male","text":"Tem gente que só valoriza silêncio quando bota preço nele - engraçado como a gente sempre descobre isso tarde."},
+    {"speaker":"Female","text":"Confesso que gostei dessa provocação seca, viu? Bora ver se isso pega de verdade. Voltamos já."}]
+    O exemplo acima é SÓ pra mostrar o formato JSON e o tom de conversa - a matéria de
+    verdade de hoje é outro assunto completamente diferente, ver abaixo. Se você perceber
+    que uma frase sua ficou parecida com alguma do exemplo, reescreva - o exemplo nunca
+    deve aparecer, nem em pedaço, no boletim de verdade.
     Estrutura das 6 falas desta matéria:
-    1 Female/Fran: reaja de verdade à "Faixa que acabou de tocar" (cite o nome se vier
-    informado, nunca invente um se vier "desconhecida") e emende pra notícia - varie
-    sempre o jeito de puxar assunto, nunca use a mesma frase de novo. Se vier
-    "desconhecida", SEMPRE responda com as 6 falas completas mesmo assim, só pulando a
-    parte de citar a faixa - exemplo de fala 1 pra esse caso (faixa desconhecida):
-    {"speaker":"Female","text":"Chegou uma notícia que vale a pena parar pra ouvir: a prefeitura anunciou um novo corredor de ônibus."}
+    1 Female/Fran: puxe a notícia do zero, direto - varie sempre o jeito de abrir, nunca
+    use a mesma frase/molde de novo.
     2 Male/Nico: traga um detalhe da matéria com leitura crítica - pode vir com o tom
     ácido/seco dele, sem crueldade gratuita.
     3 Female/Fran: reaja com otimismo realista OU com uma piada/comentário leve que
     alivia o clima, sem soar ingênua.
     4 Male/Nico: rebata com outra visão, pode cutucar com sarcasmo/ironia (cutuca a
-    ferida do ASSUNTO, nunca da Fran), sem chamar de volta pra rádio (isso vem depois,
-    automático).
-    5 Male/Nico: feche com um comentário existencialista/absurdista GERADO NA HORA a
-    partir do que ESSA notícia específica sugere - nunca uma frase genérica que serviria
-    pra qualquer matéria. Pode se inspirar em Camus, Sartre, Nietzsche, Kafka, Beckett ou
-    Cioran, mas só cite o nome do pensador se tiver certeza da atribuição; senão comente
-    por tema/estilo sem citar ninguém. Pode vir com o mesmo tom ácido de sempre. Não
-    repita o que já foi dito nas falas 1 a 4.
+    ferida do ASSUNTO, nunca da Fran).
+    5 Male/Nico: feche do jeito que o CLIMA dessa notícia específica pedir - sinta se ela
+    é leve, séria, engraçada, triste, perigosa ou absurda, e reaja de acordo, GERADO NA
+    HORA a partir do que ESSA notícia sugere, nunca uma frase genérica que serviria pra
+    qualquer matéria. Nem toda matéria merece filosofia: numa notícia leve/boba, um
+    comentário ácido ou uma piada seca encerra melhor que forçar profundidade; numa
+    notícia realmente grave (tragédia, violência), nada de piada - reação séria, ainda
+    assim com a voz cética/dura do Nico; só puxe pra reflexão existencialista/absurdista
+    (pode se inspirar em Camus, Sartre, Nietzsche, Kafka, Beckett ou Cioran, citando o
+    pensador só se tiver certeza da atribuição, senão comente por tema/estilo sem citar
+    ninguém) quando o ASSUNTO da matéria realmente pedir esse peso - não é obrigatório em
+    toda matéria. Não repita o que já foi dito nas falas 1 a 4.
     6 Female/Fran: reaja ao comentário do Nico com humor de verdade (piada, provocação
-    carinhosa ou concordância divertida - varie) e puxe a despedida numa nota positiva,
-    levantando o astral; se o "Artista da próxima faixa" vier informado, cite o nome
-    dele torcendo pra reação, mas NUNCA invente fato sobre a banda nem sobre a música
-    (isso vem depois, automático). Não diga o nome da rádio nem "a música volta", isso
-    também vem depois automático.
+    carinhosa ou concordância divertida - varie) e feche com uma transição curta e
+    genérica pra volta da música (tipo "a gente já volta"), SEM citar nome de artista,
+    faixa ou rádio nenhuma.
     Não invente fatos. Máximo 18 palavras por fala (falas 1 a 4 e 6) ou 28 palavras (fala 5).
 """.trimIndent()
 
-private fun buildUserContent(
-    story: NewsStory,
-    lastPlayedTrack: RadioLastPlayedTrack?,
-    upcomingTrack: RadioLastPlayedTrack?,
-): String {
+private fun buildUserContent(story: NewsStory): String {
     val title = story.title.toRadioSentence().limitWords(22)
     val summary = story.summary.ifBlank { "Sem resumo disponível." }.toRadioSentence().limitWords(55)
-    // Faixa anterior/seguinte: usadas pra fala 1 (reacao a faixa que acabou de tocar) e fala 6
-    // (reacao de fechamento puxando a proxima faixa) serem geradas na hora pelo LLM em vez de
-    // template fixo (ver withLastPlayedIntro/withPhilosophicalCloser) - pedido do usuario
-    // (03/09/2026): as frases prontas ali soavam sempre iguais. So o NOME da proxima faixa vai
-    // pro prompt (nunca genero/ano) porque a curiosidade musical continua vindo do banco
-    // verificado (musicTrivia) - o LLM e pequeno demais pra arriscar inventar dado de banda.
-    val lastTrackLine = lastPlayedTrack?.let { track ->
-        val cleanTitle = track.title.toRadioSentence().limitWords(14)
-        val cleanArtist = track.artist.toRadioSentence().limitWords(8)
-        if (cleanTitle.isBlank()) null
-        else if (cleanArtist.isBlank()) cleanTitle else "$cleanTitle, de $cleanArtist"
-    } ?: "desconhecida - não cite nome de faixa nenhuma, só emende direto pra notícia"
-    val nextArtistLine = upcomingTrack?.artist?.toRadioSentence()?.limitWords(8)?.takeIf { it.isNotBlank() }
-        ?: "desconhecido - não cite nome de artista nenhum, reaja de forma genérica"
     return """
         Fonte: ${story.source}
         Título: $title
         Resumo: $summary
-        Faixa que acabou de tocar: $lastTrackLine
-        Artista da próxima faixa: $nextArtistLine
         Escreva as 6 falas sobre ESSA matéria ($title) - a piada, a ironia e a reflexão
         do Nico têm que nascer desse assunto específico, nunca do exemplo de trânsito
         mostrado antes.
     """.trimIndent()
 }
 
-// Guarda a chave de API do Gemini localmente no aparelho (SharedPreferences privado do app,
-// mesmo mecanismo que o resto do app ja usa pra preferencias simples). NUNCA e commitada no
-// git nem enviada pra lugar nenhum alem da propria chamada ao Gemini - pedido do usuario
-// (03/09/2026): "não passa a chave pelo chat", entrada so pela UI de Configuracoes do app.
-class GeminiWriterSettings(context: Context) {
+// Guarda ATE 5 chaves de API do Gemini localmente no aparelho (SharedPreferences privado do
+// app, mesmo mecanismo que o resto do app ja usa pra preferencias simples). NUNCA e commitada
+// no git nem enviada pra lugar nenhum alem da propria chamada ao Gemini - pedido do usuario
+// (03/09/2026): "não passa a chave pelo chat", entrada so pela UI de Configuracoes do app
+// (pagina propria "Chaves do Gemini", ver GeminiApiKeysSettingsPanel em LocalTuneApp.kt).
+//
+// Multi-chave (10/09/2026, pedido do usuario): "quando tem mais de uma opção de chave do
+// gemini, se a primeira falhar ele testa a segunda, se falhar testa a terceira" - motivado por
+// HTTP 429 de cota real visto em campo no mesmo dia. Compartilhada entre o redator
+// (RemoteGeminiRadioScriptWriter) e a sintese de voz experimental (GeminiFlashTtsEngine.kt) -
+// UM pool so, os dois testam as mesmas chaves na mesma ordem. `init` migra silenciosamente a
+// chave unica antiga (versoes anteriores a essa mudanca) pro slot 0 na primeira leitura, sem
+// o usuario precisar colar de novo.
+class GeminiApiKeySettings(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun apiKey(): String? = prefs.getString(KEY_API_KEY, null)?.takeIf { it.isNotBlank() }
-
-    fun setApiKey(key: String) {
-        prefs.edit().putString(KEY_API_KEY, key.trim()).apply()
+    init {
+        val legacyKey = prefs.getString(KEY_LEGACY_API_KEY, null)?.trim()?.takeIf { it.isNotBlank() }
+        if (legacyKey != null && apiKeyAt(0) == null) {
+            prefs.edit().putString(slotKey(0), legacyKey).remove(KEY_LEGACY_API_KEY).apply()
+        }
     }
 
-    fun clearApiKey() {
-        prefs.edit().remove(KEY_API_KEY).apply()
+    // Em ordem (indice 0 = 1a tentativa) - so as preenchidas, pra generateWithRetry nao precisar
+    // filtrar null.
+    fun apiKeys(): List<String> = (0 until MAX_KEYS).mapNotNull { apiKeyAt(it) }
+
+    fun apiKeyAt(index: Int): String? = prefs.getString(slotKey(index), null)?.trim()?.takeIf { it.isNotBlank() }
+
+    fun setApiKey(index: Int, key: String) {
+        prefs.edit().putString(slotKey(index), key.trim()).apply()
     }
 
-    private companion object {
-        const val PREFS_NAME = "gemini_writer"
-        const val KEY_API_KEY = "api_key"
+    fun clearApiKey(index: Int) {
+        prefs.edit().remove(slotKey(index)).apply()
+    }
+
+    private fun slotKey(index: Int) = "$KEY_API_KEY_PREFIX$index"
+
+    companion object {
+        const val MAX_KEYS = 5
+        private const val PREFS_NAME = "gemini_writer"
+        private const val KEY_API_KEY_PREFIX = "api_key_"
+        // Nome antigo (chave unica, antes da mudanca pra multi-chave) - so lido pela migracao no
+        // init acima, nunca mais escrito.
+        private const val KEY_LEGACY_API_KEY = "api_key"
     }
 }
 
@@ -465,32 +386,29 @@ class GeminiWriterSettings(context: Context) {
 // Qwen3 4B local passam de 300s no aparelho), enquanto uma chamada de API em geral responde
 // em segundos. So a REDACAO vai pro Gemini - a sintese de voz continua 100% local/offline (ver
 // LocalRadioVoiceEngine), o audio final do boletim nunca sai do aparelho, so o titulo/resumo
-// da materia (texto publico de RSS) e o "roteiro" de contexto vao pra API. Sem chave
-// configurada (GeminiWriterSettings.apiKey() == null), RadioBulletinRepository.enhanceScript()
+// da materia (texto publico de RSS) e o "roteiro" de contexto vao pra API. Sem chave nenhuma
+// configurada (GeminiApiKeySettings.apiKeys() vazio), RadioBulletinRepository.enhanceScript()
 // nem tenta esse caminho - cai direto pro redator local, mantendo o app 100% funcional offline
-// como sempre foi (nenhum comportamento existente muda pra quem nao configurar a chave).
+// como sempre foi (nenhum comportamento existente muda pra quem nao configurar chave nenhuma).
 private class RemoteGeminiRadioScriptWriter(context: Context) {
-    val settings = GeminiWriterSettings(context)
+    val settings = GeminiApiKeySettings(context)
 
-    fun isConfigured(): Boolean = settings.apiKey() != null
+    fun isConfigured(): Boolean = settings.apiKeys().isNotEmpty()
 
     suspend fun writeContextual(
         story: NewsStory,
         context: RadioScriptContext,
-        lastPlayedTrack: RadioLastPlayedTrack?,
-        upcomingTrack: RadioLastPlayedTrack?,
     ): RadioScript = withContext(Dispatchers.IO) {
-        val apiKey = settings.apiKey() ?: error("Gemini sem chave de API configurada")
-        val userContent = buildUserContent(story, lastPlayedTrack, upcomingTrack)
-        val lines = generateWithRetry(apiKey, userContent)
+        val userContent = buildUserContent(story)
+        val lines = generateWithRetry(userContent)
         Log.d(TAG_RADIO_WRITER, "gemini texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
         RadioScript(
             story = story,
             // Mesmo "source" do redator local de proposito - do ponto de vista do resto do app
-            // (withLastPlayedIntro/withPhilosophicalCloser, RadioBulletinBufferStatusCard) e a
-            // mesma coisa (roteiro gerado por LLM com qualidade pra usar de verdade), so muda
-            // ONDE a geracao rodou. Nao ha hoje nenhum consumidor que precise distinguir local
-            // de remoto - se precisar no futuro, adicionar um `RadioScriptSource.Gemini` novo.
+            // (withPhilosophicalCloser, RadioBulletinBufferStatusCard) e a mesma coisa (roteiro
+            // gerado por LLM com qualidade pra usar de verdade), so muda ONDE a geracao rodou.
+            // Nao ha hoje nenhum consumidor que precise distinguir local de remoto - se precisar
+            // no futuro, adicionar um `RadioScriptSource.Gemini` novo.
             source = RadioScriptSource.LocalLlm,
             lines = lines,
             duration = context.duration,
@@ -499,18 +417,21 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
 
     // O Gemini e SEMPRE a prioridade (pedido explicito do usuario 05/09/2026: "sempre precisamos
     // priorizar a redação do Gemini... se falhar, precisamos tentar mais uma vez") - por isso
-    // reentra em QUALQUER falha (rede, timeout, JSON invalido/incompleto do parseGeneratedLines),
-    // nao so em 503/429/500 de rede como antes. Essa restricao anterior deixava passar batido o
-    // caso mais comum na pratica: resposta truncada pelo "raciocinio" invisivel do modelo (ver
-    // maxOutputTokens acima) cai direto pro redator local sem nenhuma nova tentativa, mesmo sendo
-    // so um blip. So desiste de verdade (e cai pro redator local, ver enhanceScript) depois de
-    // GEMINI_MAX_ATTEMPTS falhas seguidas. Roda em segundo plano durante a musica, entao o tempo
-    // extra de uma tentativa a mais custa pouco perto do ganho de nao cair pro local (MUITO mais
-    // lento nesse aparelho, ADR-020: Qwen3 4B passa de 300s) nem pro fallback deterministico
-    // (roteiro generico/repetitivo que o usuario quer ver so como ultimo recurso).
-    private suspend fun generateWithRetry(apiKey: String, userContent: String): List<RadioScriptLine> {
+    // reentra em QUALQUER falha (rede, timeout, JSON invalido/incompleto do parseGeneratedLines).
+    // Testa cada chave configurada EM ORDEM, 1 tentativa por chave (pedido do usuario 10/09/2026:
+    // ate 5 chaves, "se a primeira falhar ele testa a segunda... e assim vai") - a rotacao de
+    // chave E o retry agora, a MESMA chave nao e tentada 2x seguidas: um HTTP 429 de cota (visto
+    // em campo o dia inteiro) nao se resolve batendo de novo na mesma chave, so trocando ou
+    // esperando a cota resetar. So desiste de verdade (cai pro redator local, ver enhanceScript)
+    // depois de esgotar TODAS as chaves configuradas. Roda em segundo plano durante a musica,
+    // entao o tempo extra custa pouco perto do ganho de nao cair pro local (MUITO mais lento
+    // nesse aparelho, ADR-020: Qwen3 4B passa de 300s) nem pro fallback deterministico (roteiro
+    // generico/repetitivo que o usuario quer ver so como ultimo recurso).
+    private suspend fun generateWithRetry(userContent: String): List<RadioScriptLine> {
         val systemInstruction = buildSystemInstructions()
-        for (attempt in 0 until GEMINI_MAX_ATTEMPTS) {
+        val apiKeys = settings.apiKeys()
+        if (apiKeys.isEmpty()) error("Gemini sem chave de API configurada")
+        apiKeys.forEachIndexed { index, apiKey ->
             val result = runCatching {
                 val generated = withTimeoutOrNull(GEMINI_TIMEOUT_MS) { callGemini(apiKey, systemInstruction, userContent) }
                     ?: error("Gemini demorou demais pra responder")
@@ -518,12 +439,12 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
             }
             result.onSuccess { return it }
             val failure = result.exceptionOrNull()!!
-            val isLastAttempt = attempt == GEMINI_MAX_ATTEMPTS - 1
-            if (isLastAttempt) throw failure
-            Log.w(TAG_RADIO_WRITER, "gemini erro (tentativa ${attempt + 1}/$GEMINI_MAX_ATTEMPTS), tentando de novo em ${GEMINI_RETRY_DELAY_MS}ms", failure)
+            val isLastKey = index == apiKeys.lastIndex
+            if (isLastKey) throw failure
+            Log.w(TAG_RADIO_WRITER, "gemini erro na chave ${index + 1}/${apiKeys.size}, tentando a proxima em ${GEMINI_RETRY_DELAY_MS}ms", failure)
             delay(GEMINI_RETRY_DELAY_MS)
         }
-        error("inalcancavel") // GEMINI_MAX_ATTEMPTS >= 1 garante return ou throw no loop acima
+        error("inalcancavel") // apiKeys nao vazio garante return ou throw no loop acima
     }
 
     // Chamada sincrona (HttpURLConnection puro, mesmo padrao ja usado em
@@ -630,172 +551,17 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         // (refillBulletinBuffer, buffer de ate BULLETIN_BUFFER_TARGET boletins de folga) e nao trava a entrada da
         // radio, entao esperar mais o Gemini custa bem menos que cair pro motor local lento.
         const val GEMINI_TIMEOUT_MS = 120_000L
-        // Ver generateWithRetry: 2 tentativas no total (1 retry) pra QUALQUER falha, com um
-        // respiro curto entre elas antes de desistir e cair pro redator local.
-        const val GEMINI_MAX_ATTEMPTS = 2
+        // Ver generateWithRetry: respiro curto entre uma chave e a proxima (nao entre tentativas
+        // na MESMA chave - essa reentrada nao existe mais, ver comentario la).
         const val GEMINI_RETRY_DELAY_MS = 4_000L
     }
 }
 
-// Guarda a chave de API do OpenRouter localmente no aparelho, mesmo mecanismo/prefs proprio do
-// GeminiWriterSettings (nunca commitada nem enviada pra lugar nenhum alem da propria chamada) -
-// pedido do usuario (05/09/2026): segundo redator na nuvem, gratuito, pra ter uma alternativa
-// independente do Gemini quando ele estiver com pico de demanda (503 visto ao vivo no mesmo dia,
-// duas materias seguidas bateram 503 nas 2 tentativas do Gemini).
-class OpenRouterWriterSettings(context: Context) {
-    private val prefs: SharedPreferences =
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
-    fun apiKey(): String? = prefs.getString(KEY_API_KEY, null)?.takeIf { it.isNotBlank() }
-
-    fun setApiKey(key: String) {
-        prefs.edit().putString(KEY_API_KEY, key.trim()).apply()
-    }
-
-    fun clearApiKey() {
-        prefs.edit().remove(KEY_API_KEY).apply()
-    }
-
-    private companion object {
-        const val PREFS_NAME = "openrouter_writer"
-        const val KEY_API_KEY = "api_key"
-    }
-}
-
-// Redator remoto via OpenRouter (agregador de varios provedores, com modelos genuinamente
-// gratuitos sob uma chave so - ver openrouter.ai/models?max_price=0) - segunda opcao de nuvem,
-// INDEPENDENTE do Gemini (empresa/infra diferente), pra cobrir picos de demanda momentaneos de
-// um dos dois sem cair direto pro redator local (bem mais lento nesse aparelho, ver ADR-020).
-// So entra DEPOIS do Gemini falhar (ver RadioBulletinRepository.enhanceScript) - mesma prioridade
-// "nuvem antes de local" de sempre, agora com uma 2a fonte de nuvem antes de desistir de vez.
-// API compativel com o formato chat/completions da OpenAI; mesmo texto de instrucao
-// (buildSystemInstructions/buildUserContent) que o Gemini e o redator local usam.
-private class RemoteOpenRouterRadioScriptWriter(context: Context) {
-    val settings = OpenRouterWriterSettings(context)
-
-    fun isConfigured(): Boolean = settings.apiKey() != null
-
-    suspend fun writeContextual(
-        story: NewsStory,
-        context: RadioScriptContext,
-        lastPlayedTrack: RadioLastPlayedTrack?,
-        upcomingTrack: RadioLastPlayedTrack?,
-    ): RadioScript = withContext(Dispatchers.IO) {
-        val apiKey = settings.apiKey() ?: error("OpenRouter sem chave de API configurada")
-        val userContent = buildUserContent(story, lastPlayedTrack, upcomingTrack)
-        val lines = generateWithRetry(apiKey, userContent)
-        Log.d(TAG_RADIO_WRITER, "openrouter texto: " + lines.joinToString(" | ") { "${it.speaker}: ${it.text}" })
-        RadioScript(
-            story = story,
-            // Mesmo "source" do Gemini/redator local de proposito - ver comentario identico em
-            // RemoteGeminiRadioScriptWriter.writeContextual, mesma razao (nenhum consumidor hoje
-            // precisa distinguir qual dos 3 motores escreveu).
-            source = RadioScriptSource.LocalLlm,
-            lines = lines,
-            duration = context.duration,
-        )
-    }
-
-    // Mesma politica do Gemini (ver RemoteGeminiRadioScriptWriter.generateWithRetry): reentra em
-    // QUALQUER falha, nao so codigo HTTP especifico - um JSON truncado/mal formado de um modelo
-    // gratuito tambem merece uma segunda chance antes de desistir e cair pro redator local.
-    // 06/09/2026 (pedido do usuario: "openrouter nunca funcionou"): diagnostico em campo mostrou
-    // 429 "Provider returned error" - rate limit do PROVEDOR gratuito por tras do modelo unico
-    // configurado (comum em modelo gratuito popular no OpenRouter, capacidade compartilhada entre
-    // todo mundo). Cada tentativa agora roda num modelo DIFERENTE de OPENROUTER_MODELS (ver
-    // companion) em vez de bater sempre no mesmo - mesma logica de "infra diferente pra nao cair
-    // junto" ja usada entre Gemini e OpenRouter, agora dentro do proprio OpenRouter tambem.
-    private suspend fun generateWithRetry(apiKey: String, userContent: String): List<RadioScriptLine> {
-        val systemInstruction = buildSystemInstructions()
-        for (attempt in 0 until OPENROUTER_MAX_ATTEMPTS) {
-            val model = OPENROUTER_MODELS[attempt % OPENROUTER_MODELS.size]
-            val result = runCatching {
-                val generated = withTimeoutOrNull(OPENROUTER_TIMEOUT_MS) {
-                    callOpenRouter(apiKey, model, systemInstruction, userContent)
-                } ?: error("OpenRouter demorou demais pra responder")
-                parseGeneratedLines(generated)
-            }
-            result.onSuccess { return it }
-            val failure = result.exceptionOrNull()!!
-            val isLastAttempt = attempt == OPENROUTER_MAX_ATTEMPTS - 1
-            if (isLastAttempt) throw failure
-            Log.w(
-                TAG_RADIO_WRITER,
-                "openrouter erro no modelo $model (tentativa ${attempt + 1}/$OPENROUTER_MAX_ATTEMPTS), tentando ${OPENROUTER_MODELS[(attempt + 1) % OPENROUTER_MODELS.size]} em ${OPENROUTER_RETRY_DELAY_MS}ms",
-                failure,
-            )
-            delay(OPENROUTER_RETRY_DELAY_MS)
-        }
-        error("inalcancavel") // OPENROUTER_MAX_ATTEMPTS >= 1 garante return ou throw no loop acima
-    }
-
-    // Formato chat/completions compativel com OpenAI (Authorization: Bearer <key>, messages
-    // system/user) - mesmo padrao sincrono via HttpURLConnection que o resto do projeto usa (ver
-    // callGemini/NewsBulletinRepository.fetchFeed).
-    private fun callOpenRouter(apiKey: String, model: String, systemInstruction: String, userContent: String): String {
-        val connection = (URL(OPENROUTER_ENDPOINT).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = OPENROUTER_TIMEOUT_MS.toInt()
-            readTimeout = OPENROUTER_TIMEOUT_MS.toInt()
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            setRequestProperty("Authorization", "Bearer $apiKey")
-            setRequestProperty("X-Title", "Pailer FM")
-        }
-        val body = JSONObject().apply {
-            put("model", model)
-            put(
-                "messages",
-                JSONArray()
-                    .put(JSONObject().put("role", "system").put("content", systemInstruction))
-                    .put(JSONObject().put("role", "user").put("content", userContent)),
-            )
-            put("temperature", 0.6)
-        }
-        connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-
-        val responseCode = connection.responseCode
-        val responseText = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
-            ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-        connection.disconnect()
-
-        if (responseCode !in 200..299) {
-            val apiMessage = runCatching {
-                JSONObject(responseText).optJSONObject("error")?.optString("message")
-            }.getOrNull()?.takeIf { it.isNotBlank() }
-            error("erro $responseCode${apiMessage?.let { ": $it" } ?: ""}")
-        }
-
-        val text = JSONObject(responseText)
-            .optJSONArray("choices")?.optJSONObject(0)
-            ?.optJSONObject("message")?.optString("content")
-        return text?.takeIf { it.isNotBlank() } ?: error("OpenRouter não devolveu texto (resposta vazia)")
-    }
-
-    private companion object {
-        const val OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-        // Lista de modelos gratuitos (tag ":free"), tentados em ordem por generateWithRetry - se
-        // o 1o levar 429/erro, a proxima tentativa cai num modelo de OUTRO provedor/pool de
-        // capacidade, nao insiste no mesmo que acabou de saturar. Confirmados validos via GET
-        // https://openrouter.ai/api/v1/models em 06/09/2026 (filtrar id terminado em ":free") -
-        // os gratuitos do OpenRouter mudam com frequencia, reconfirmar antes de trocar de novo.
-        // 1) Gemma 4 31B (Google) - mesma escolha de 05/09/2026: bom portugues, "it"
-        //    (instruction-tuned) sem raciocinio invisivel, resposta direto em JSON.
-        // 2) LFM 2.5 2.6B (Liquid AI) - provedor/infra totalmente diferente do Google, tambem
-        //    instruction-tuned sem raciocinio; modelo menor entra como 2a chance MAIS RAPIDA
-        //    (nao so mais uma tentativa no mesmo pool congestionado).
-        val OPENROUTER_MODELS = listOf(
-            "google/gemma-4-31b-it:free",
-            "liquid/lfm-2.5-2.6b:free",
-        )
-        const val OPENROUTER_TIMEOUT_MS = 60_000L
-        // Ver generateWithRetry: 2 tentativas no total (1 retry, em modelo diferente) pra
-        // QUALQUER falha, com um respiro curto entre elas antes de desistir e cair pro redator
-        // local.
-        const val OPENROUTER_MAX_ATTEMPTS = 2
-        const val OPENROUTER_RETRY_DELAY_MS = 4_000L
-    }
-}
+// OpenRouter (2a opcao de nuvem pra escrita) removido 10/09/2026 a pedido do usuario ("pode tirar
+// a do openrouter, nem vamos usar") - agora que o Gemini suporta ate 5 chaves em cadeia
+// (GeminiApiKeySettings/RemoteGeminiRadioScriptWriter.generateWithRetry acima), o mesmo problema
+// que motivou o OpenRouter em 05/09/2026 (Gemini sobrecarregado) fica coberto trocando de chave
+// em vez de trocar de provedor.
 
 private class OptionalLocalLlmRadioScriptWriter(
     private val context: Context,
@@ -816,13 +582,11 @@ private class OptionalLocalLlmRadioScriptWriter(
     }
 
     override suspend fun write(story: NewsStory, context: RadioScriptContext): RadioScript =
-        writeContextual(story, context, lastPlayedTrack = null, upcomingTrack = null)
+        writeContextual(story, context)
 
     suspend fun writeContextual(
         story: NewsStory,
         context: RadioScriptContext,
-        lastPlayedTrack: RadioLastPlayedTrack?,
-        upcomingTrack: RadioLastPlayedTrack?,
         onProgress: (String) -> Unit = {},
         onProgressPercent: (Int) -> Unit = {},
     ): RadioScript =
@@ -855,7 +619,7 @@ private class OptionalLocalLlmRadioScriptWriter(
             val generated = withTimeoutOrNull(LOCAL_WRITER_TIMEOUT_MS) {
                 LocalLlamaTextGenerator.generate(
                     config,
-                    prompt = buildPrompt(story, lastPlayedTrack, upcomingTrack),
+                    prompt = buildPrompt(story),
                     // Ver LocalLlamaTextGenerator.generate/ensurePrefixCacheNative (06/09/2026):
                     // esse pedaco (instrucoes de sistema + exemplo few-shot) e IDENTICO em todo
                     // boletim - passado separado pra dar pro motor nativo cachear o prefill dele
@@ -887,11 +651,7 @@ private class OptionalLocalLlmRadioScriptWriter(
     // reprocessar do zero em todo boletim. buildPrompt() continua devolvendo o mesmo texto de
     // sempre (prefixo + sufixo concatenados, byte a byte igual à versão anterior) - só quem
     // chama LocalLlamaTextGenerator.generate() precisa saber da divisão.
-    private fun buildPrompt(
-        story: NewsStory,
-        lastPlayedTrack: RadioLastPlayedTrack?,
-        upcomingTrack: RadioLastPlayedTrack?,
-    ): String = buildPromptPrefix() + buildPromptSuffix(story, lastPlayedTrack, upcomingTrack)
+    private fun buildPrompt(story: NewsStory): String = buildPromptPrefix() + buildPromptSuffix(story)
 
     // Cuidado: buildPromptPrefix()+buildPromptSuffix() precisam concatenar byte a byte igual ao
     // buildPrompt() original (bloco unico). trimIndent() calcula indentacao minima olhando TODAS
@@ -907,12 +667,8 @@ private class OptionalLocalLlmRadioScriptWriter(
             <|im_end|>
             <|im_start|>user""".trimIndent()
 
-    private fun buildPromptSuffix(
-        story: NewsStory,
-        lastPlayedTrack: RadioLastPlayedTrack?,
-        upcomingTrack: RadioLastPlayedTrack?,
-    ): String = "\n" + """
-            ${buildUserContent(story, lastPlayedTrack, upcomingTrack)}
+    private fun buildPromptSuffix(story: NewsStory): String = "\n" + """
+            ${buildUserContent(story)}
             /no_think
             <|im_end|>
             <|im_start|>assistant
@@ -937,7 +693,11 @@ private class OptionalLocalLlmRadioScriptWriter(
         // maxTokens 260->420) - sempre um pouco ACIMA de LOCAL_WRITER_NATIVE_TIMEOUT_MS (340s,
         // em RadioWriterPackageRepository.kt) pra deixar o timeout interno abortar primeiro e
         // devolver erro gracioso, em vez desse aqui cortar a chamada nativa no meio.
-        const val LOCAL_WRITER_TIMEOUT_MS = 360_000L
+        // 09/09/2026: subido pra 490s junto de maxTokens 420->600 (pedido do usuario: falas 5/6
+        // caindo demais pro banco fixo de reflexoes genericas - ver NICO_REFLECTIONS_LIGHT/DEEP -
+        // porque o modelo ficava sem orcamento antes de fechar as 6 falas). Continua sempre um
+        // pouco ACIMA de LOCAL_WRITER_NATIVE_TIMEOUT_MS (470s, subido junto), mesmo motivo.
+        const val LOCAL_WRITER_TIMEOUT_MS = 490_000L
     }
 }
 
@@ -969,8 +729,8 @@ private fun parseGeneratedLines(generated: String): List<RadioScriptLine> = runC
         // Cap em 6: as 4 falas do bate-bola + a reflexao existencialista (fala 5) + a reacao
         // de fechamento (fala 6, ver buildSystemInstructions/withPhilosophicalCloser). Fica so
         // no >=4 pra baixo pra nao jogar fora um bate-bola bom so porque o modelo nao emplacou
-        // a 5a/6a fala dessa vez - withLastPlayedIntro/withPhilosophicalCloser degradam pro
-        // template fixo quando faltar a 6a fala.
+        // a 5a/6a fala dessa vez - withPhilosophicalCloser degrada pro banco fixo quando faltar
+        // a 5a/6a fala.
     }.take(6).takeIf { lines ->
         lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female && hasAccentuation(lines)
     } ?: error("O redator devolveu um roteiro inválido")
@@ -1028,84 +788,16 @@ private val NICO_REFLECTIONS_DEEP = listOf(
     "Isso tem cheiro de Cioran: existir já é meio inconveniente, e mesmo assim a gente segue dando entrevista sobre.",
 )
 
-// Curiosidade genérica sobre a proxima faixa (withPhilosophicalCloser/buildFranCloser) - SO
-// fatos gerais e verdadeiros de genero/epoca, nunca especificos do artista (decisao do usuario:
-// o redator local e pequeno demais pra arriscar inventar dado sobre banda pouco conhecida da
-// biblioteca - mesma regra de "nao invente fatos" que ja vale pras noticias).
-private val MUSIC_TRIVIA_BY_GENRE_FAMILY: List<Pair<List<String>, List<String>>> = listOf(
-    listOf("punk", "post-punk", "post punk", "coldwave", "darkwave", "hardcore", "emo", "screamo") to listOf(
-        "punk nasceu no fim dos anos 70 como reação direta ao rock progressivo, que tinha virado longo demais e cheio de solo.",
-        "post-punk pegou a agressividade do punk e trocou parte do caos por letra mais introspectiva e som mais experimental.",
-    ),
-    listOf("metal", "doom", "sludge", "grind", "core") to listOf(
-        "heavy metal puxou boa parte da distorção pesada do blues rock do fim dos anos 60.",
-        "banda de metal clássico ficou famosa por show extremamente alto, alguns entraram pra história como os mais altos já registrados.",
-    ),
-    listOf("grunge") to listOf(
-        "grunge misturou punk com rock mais lento e sujo, e virou o som que definiu Seattle no começo dos anos 90.",
-    ),
-    listOf("house", "techno", "trance", "edm", "eletronica", "electro", "dubstep", "drum and bass", "synth") to listOf(
-        "house nasceu em Chicago no começo dos anos 80, em clube underground, e techno surgiu logo depois em Detroit.",
-        "muita faixa eletrônica clássica foi feita com sintetizador analógico e sequenciador que travava ao vivo, parte do charme da época.",
-    ),
-    listOf("hip-hop", "hip hop", "rap", "trap", "boom bap") to listOf(
-        "hip-hop nasceu no Bronx, em Nova York, nos anos 70, direto de festa de rua com DJ tocando break de disco.",
-        "no começo, muito rap era feito sobre batida sampleada de disco de soul e funk antigo.",
-    ),
-    listOf("mpb", "samba", "bossa", "pagode", "forro", "axe", "sertanejo", "tropicalia") to listOf(
-        "bossa nova nasceu no Rio de Janeiro no fim dos anos 50, misturando samba com harmonia de jazz.",
-        "MPB virou um guarda-chuva enorme nos anos 60 e 70 pra qualquer coisa que misturasse música popular brasileira com ousadia.",
-    ),
-    listOf("jazz", "blues", "bebop", "swing") to listOf(
-        "jazz nasceu em Nova Orleans no início do século 20, misturando blues, ragtime e música de banda militar.",
-        "muito clássico de blues foi gravado quase direto, sem edição, o que dá aquele som cru e imperfeito de propósito.",
-    ),
-    listOf("soul", "funk", "r&b", "r b", "motown") to listOf(
-        "soul nasceu misturando gospel com R&B, ganhando aquela potência vocal quase de igreja.",
-        "funk clássico é construído em cima do groove do baixo e da bateria, a melodia vem depois.",
-    ),
-    listOf("pop") to listOf(
-        "pop sempre foi feito pra rádio: refrão curto, fácil de cantar junto, gancho logo nos primeiros segundos.",
-    ),
-    listOf("folk", "country", "americana", "bluegrass") to listOf(
-        "folk sempre teve essa vocação de contar história real, muitas vezes ligada a algum movimento social.",
-    ),
-)
-
-private val MUSIC_TRIVIA_BY_DECADE: List<Pair<IntRange, String>> = listOf(
-    1960..1969 to "os anos 60 foram quando o estúdio virou instrumento de verdade, não só lugar de gravar ao vivo.",
-    1970..1979 to "nos anos 70, o álbum virou obra pra ouvir inteira, não só coleção de single solto.",
-    1980..1989 to "os anos 80 foram a década em que o sintetizador deixou de ser exceção e virou som padrão de rádio.",
-    1990..1999 to "nos anos 90, gravadora ainda apostava pesado em lançamento físico, CD vendia igual disco de ouro.",
-    2000..2009 to "nos anos 2000, o download digital começou a virar a forma real de descobrir música nova.",
-    2010..2029 to "de 2010 pra cá, streaming virou a porta de entrada principal pra descobrir artista novo.",
-)
-
-private val MUSIC_TRIVIA_FALLBACK = listOf(
-    "toda música carrega um pedacinho da época e do lugar onde foi gravada, mesmo quando a letra não fala nada disso.",
-    "vale prestar atenção no que toca em seguida, cada faixa tem uma história de estúdio por trás.",
-)
-
+// Reacao de fechamento generica da Fran (withPhilosophicalCloser) - usada quando o LLM ja
+// escreveu a reflexao do Nico (fala 5) mas nao a propria fala 6, ou como abertura da fala 6
+// completa no caminho 100% fallback. Nunca cita musica/artista/radio - boletim e radio-agnostico
+// (pedido do usuario 09/09/2026).
 private val FRAN_CLOSER_REACTIONS = listOf(
-    "Tá filosófico hoje, hein, $NICO.",
-    "Lá vem você fundo demais de novo, $NICO, mas faz sentido.",
-    "Segura essa reflexão que eu trago a trilha de volta.",
-    "Deixa comigo que eu trago a gente de volta pro chão.",
+    "Tá filosófico hoje, hein, $NICO. A gente já volta.",
+    "Lá vem você fundo demais de novo, $NICO, mas faz sentido. Já voltamos.",
+    "Segura essa reflexão que a gente já volta.",
+    "Deixa comigo que eu trago a gente de volta pro chão. Já já a gente volta.",
 )
-
-// gênero → época → genérico, na ordem pedida pelo usuario ("do gênero, ou da época").
-private fun musicTrivia(genre: String, year: Int): String {
-    val normalizedTags = splitGenreTags(genre).map { stripDiacritics(it.lowercase()) }
-    val genreMatch = MUSIC_TRIVIA_BY_GENRE_FAMILY.firstOrNull { (keywords, _) ->
-        normalizedTags.any { tag -> keywords.any { tag.contains(it) } }
-    }?.second?.random()
-    if (genreMatch != null) return genreMatch.ensureFinalPeriod()
-
-    val decadeMatch = MUSIC_TRIVIA_BY_DECADE.firstOrNull { (range, _) -> year in range }?.second
-    if (decadeMatch != null) return decadeMatch.ensureFinalPeriod()
-
-    return MUSIC_TRIVIA_FALLBACK.random().ensureFinalPeriod()
-}
 
 private enum class NewsTopic {
     CIENCIA_TECNOLOGIA,

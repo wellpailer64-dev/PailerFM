@@ -13,7 +13,9 @@ import com.pailer.localtune.data.RadioScriptLine
 import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageConfig
 import com.pailer.localtune.data.RadioVoicePackageRepository
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -43,10 +45,15 @@ class LocalRadioVoiceEngine(
         outFile
     }
 
-    // "Nucleo" pre-aquecido (falas 2-5, sem faixa/radio - ver LocalTuneViewModel.prewarmCoreBuffer)
-    // sintetizado e salvo SEM musica de fundo (o fade in/out de mixBackgroundMusic depende do
-    // tamanho final do audio, que so fica definido depois do encaixe das pontas em spliceEdges) -
-    // WAV "seco", igual ao formato normal, so falta o bed.
+    // "Nucleo" pre-aquecido (6 falas completas, 100% radio-agnostico - ver
+    // LocalTuneViewModel.prewarmCoreBuffer) sintetizado com musica de fundo (igual synthesize())
+    // mas salvo em filesDir (nao cacheDir) - precisa sobreviver entre reinicios do app pra
+    // LocalTuneViewModel.loadCoreBufferManifest() poder restaurar o buffer do disco (pedido do
+    // usuario 03/09/2026: nao quer perder boletins ja escritos so porque o Android limpou o cache
+    // ou o processo morreu). Mesma pasta que o ViewModel le/escreve o manifest.json
+    // (CORE_BUFFER_DIR_NAME em LocalTuneViewModel.kt) - filesDir e privado do app, sem permissao
+    // nenhuma necessaria, e o mesmo caminho fisico vale tanto pro processo principal quanto pro
+    // :radio_voice (cacheDir/filesDir sao por app, nao por processo).
     suspend fun synthesizeCore(
         lines: List<RadioScriptLine>,
         onLineDone: (index: Int, total: Int) -> Unit = { _, _ -> },
@@ -54,49 +61,11 @@ class LocalRadioVoiceEngine(
         val config = packageRepository.config() ?: return@withContext null
         val merged = synthesizeLinesToSamples(lines, config, onLineDone) ?: return@withContext null
         val (samples, sampleRate) = merged
-        // filesDir (nao cacheDir) - o nucleo precisa sobreviver entre reinicios do app pra
-        // LocalTuneViewModel.loadCoreBufferManifest() poder restaurar o buffer do disco (pedido
-        // do usuario 03/09/2026: nao quer perder boletins ja escritos so porque o Android limpou
-        // o cache ou o processo morreu). Mesma pasta que o ViewModel le/escreve o manifest.json
-        // (CORE_BUFFER_DIR_NAME em LocalTuneViewModel.kt) - filesDir e privado do app, sem
-        // permissao nenhuma necessaria, e o mesmo caminho fisico vale tanto pro processo principal
-        // quanto pro :radio_voice (cacheDir/filesDir sao por app, nao por processo).
+        val mixed = mixBackgroundMusic(samples, sampleRate, config)
         val outFile = context.filesDir.resolve(CORE_BUFFER_DIR_NAME).apply { mkdirs() }
             .resolve("radio_core_${System.currentTimeMillis()}.wav")
-        writeWav(outFile, GeneratedAudio(samples, sampleRate))
-        Log.d(TAG, "wrote core wav bytes=${outFile.length()} sampleRate=$sampleRate samples=${samples.size}")
-        outFile
-    }
-
-    // Encaixe das pontas (fala 1 = reacao a faixa real, fala 6 = fechamento com radio/proxima
-    // faixa real) num nucleo ja pronto - sintetiza so essas 2 falas (rapido) e cola em volta do
-    // audio "seco" do nucleo (synthesizeCore), depois mixa musica de fundo no resultado final
-    // inteiro (precisa ser por ultimo, o fade depende do tamanho total). Ver ADR-002/003 - motivo
-    // de nao re-sintetizar o boletim inteiro de novo aqui.
-    suspend fun spliceEdges(
-        coreFile: File,
-        introLine: RadioScriptLine,
-        closerLine: RadioScriptLine,
-    ): File? = withContext(Dispatchers.Default) {
-        val config = packageRepository.config() ?: return@withContext null
-        val core = readWav(coreFile) ?: return@withContext null
-        val (coreSamples, sampleRate) = core
-        val engine = loadEngine(config) ?: return@withContext null
-        val introSpeakerId = speakerId(config, introLine.speaker)
-        val closerSpeakerId = speakerId(config, closerLine.speaker)
-        val introAudio = synthesizeLine(engine, config, introLine.text, introSpeakerId)
-        val closerAudio = synthesizeLine(engine, config, closerLine.text, closerSpeakerId)
-        if (introAudio == null || closerAudio == null) {
-            Log.e(TAG, "splice failed intro=${introAudio != null} closer=${closerAudio != null}")
-            return@withContext null
-        }
-        val gap = List((sampleRate * 0.18f).roundToInt()) { 0f }
-        val samples = (introAudio.samples.toList() + gap + coreSamples.toList() + gap + closerAudio.samples.toList())
-            .toFloatArray()
-        val mixed = mixBackgroundMusic(samples, sampleRate, config)
-        val outFile = context.cacheDir.resolve("radio_voice_${System.currentTimeMillis()}.wav")
         writeWav(outFile, GeneratedAudio(mixed, sampleRate))
-        Log.d(TAG, "wrote spliced wav bytes=${outFile.length()} sampleRate=$sampleRate samples=${mixed.size}")
+        Log.d(TAG, "wrote core wav bytes=${outFile.length()} sampleRate=$sampleRate samples=${mixed.size}")
         outFile
     }
 
@@ -105,7 +74,14 @@ class LocalRadioVoiceEngine(
         RadioSpeaker.Male -> config.maleSpeakerId
     }
 
-    private fun synthesizeLinesToSamples(
+    // suspend (09/09/2026, pedido do usuario): sem isso, cancelar o job que chamou synthesize()/
+    // synthesizeCore() (ver RadioVoiceSynthesisService, chamador desiste da espera - ex.: timeout,
+    // pedido abandonado) nao tinha NENHUM ponto de checagem real ate o final das 6 falas - achado
+    // em campo: um pedido cancelado continuava sintetizando TODAS as falas sozinho, disputando CPU
+    // com o proximo pedido que entrasse. ensureActive() entre falas faz a cancelacao valer a partir
+    // da proxima fala (a que ja estiver em andamento ainda termina - sintese nativa nao e
+    // interrompivel no meio - mas as seguintes nunca comecam).
+    private suspend fun synthesizeLinesToSamples(
         lines: List<RadioScriptLine>,
         config: RadioVoicePackageConfig,
         onLineDone: (index: Int, total: Int) -> Unit,
@@ -113,6 +89,7 @@ class LocalRadioVoiceEngine(
         Log.d(TAG, "package=${config.name} root=${config.rootDir.absolutePath}")
         val total = lines.size
         val chunks = lines.mapIndexedNotNull { index, line ->
+            coroutineContext.ensureActive()
             val lineStartedAt = System.currentTimeMillis()
             val engine = loadEngine(config) ?: return@mapIndexedNotNull null
             val audio = synthesizeLine(engine, config, line.text, speakerId(config, line.speaker))
@@ -328,21 +305,6 @@ class LocalRadioVoiceEngine(
                 output.writeShortLe(pcm)
             }
         }
-    }
-
-    // Inverso de writeWav() - so precisa entender o formato fixo que ela mesma escreve (RIFF/WAVE
-    // PCM16 mono, header de 44 bytes sempre nessa ordem de chunk), usado por spliceEdges() pra
-    // reler o "nucleo" pre-sintetizado (synthesizeCore) antes de colar as pontas em volta.
-    private fun readWav(file: File): Pair<FloatArray, Int>? {
-        val bytes = file.readBytes()
-        if (bytes.size <= WAV_HEADER_SIZE) return null
-        val sampleRate = ByteBuffer.wrap(bytes, 24, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        val shorts = ShortArray((bytes.size - WAV_HEADER_SIZE) / 2)
-        ByteBuffer.wrap(bytes, WAV_HEADER_SIZE, bytes.size - WAV_HEADER_SIZE)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .asShortBuffer()
-            .get(shorts)
-        return FloatArray(shorts.size) { shorts[it] / 32768f } to sampleRate
     }
 
     private fun FileOutputStream.writeAscii(value: String) {

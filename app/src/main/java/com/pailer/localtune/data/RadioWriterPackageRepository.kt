@@ -136,7 +136,15 @@ class RadioWriterPackageRepository(private val context: Context) {
             // critica/reflexao (por isso a troca) e por consequencia usa mais tokens por fala -
             // com o teto antigo ele cortava no meio da fala 2 antes de terminar as 6 (ver
             // manifest.json de radio-writer-models/qwen3-4b-q4km, maxTokens=380).
-            maxTokens = manifest.optInt("maxTokens", 72).coerceIn(32, 420),
+            // Teto subido de novo, 420 pra 600 (09/09/2026, pedido do usuario): mesmo com 420 as
+            // falas 5/6 continuavam ficando de fora com frequencia (parseGeneratedLines aceita
+            // >=4 falas como "valido" de proposito, ver comentario la - o resto cai pro banco
+            // fixo de reflexoes genericas). Ha folga real no contexto do modelo pra isso (ver
+            // pailer_llama_jni.cpp, mesmo teto de 600) - o orcamento antigo nunca foi limitado
+            // pelo tamanho do contexto, so pelo tempo de decode neste aparelho (~2 tok/s
+            // medido) - por isso os timeouts abaixo (LOCAL_WRITER_NATIVE_TIMEOUT_MS) e em
+            // RadioBulletin.kt (LOCAL_WRITER_TIMEOUT_MS) subiram junto.
+            maxTokens = manifest.optInt("maxTokens", 72).coerceIn(32, 600),
             temperature = manifest.optDouble("temperature", 0.55).toFloat().coerceIn(0.1f, 1.2f),
             // Teto subido de 6 pra 8 (03/09/2026, pedido do usuario) - aparelho tem 8 nucleos de
             // verdade (Dimensity 1200, confirmado com `adb shell nproc`), testando o maximo
@@ -301,5 +309,9 @@ object LocalLlamaTextGenerator {
     // Subido pra 340s, sempre abaixo do externo (ver LOCAL_WRITER_TIMEOUT_MS, subido junto pra
     // 360s) pelo mesmo motivo de sempre: o interno tem que abortar primeiro e devolver
     // "ERROR:" graciosamente, nunca o externo cortando a chamada nativa no meio.
-    private const val LOCAL_WRITER_NATIVE_TIMEOUT_MS = 340_000
+    // 09/09/2026: maxTokens subiu de 420 pra 600 (coerceIn acima) - escalado proporcional
+    // (340s * 600/420 ~ 470s) pra dar tempo real de decodificar os tokens extras a ~2 tok/s
+    // (medido neste aparelho, ver ADR-020). Sempre abaixo do externo (LOCAL_WRITER_TIMEOUT_MS
+    // em RadioBulletin.kt, subido junto pra 490s), mesmo motivo de sempre.
+    private const val LOCAL_WRITER_NATIVE_TIMEOUT_MS = 470_000
 }

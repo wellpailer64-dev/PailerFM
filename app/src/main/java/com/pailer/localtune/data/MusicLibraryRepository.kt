@@ -10,7 +10,9 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jaudiotagger.audio.AudioFileIO
 import org.jaudiotagger.tag.FieldKey
 import org.jaudiotagger.tag.images.ArtworkFactory
@@ -22,6 +24,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.text.Normalizer
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -62,6 +65,7 @@ class MusicLibraryRepository(private val context: Context) {
     }
 
     suspend fun loadSongs(includeDeviceGenres: Boolean = true): List<LocalSong> = withContext(Dispatchers.IO) {
+        requestFullMediaScanAndAwaitSettle()
         val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
         val cachedGenreBySongId = if (includeDeviceGenres) {
             emptyMap()
@@ -132,6 +136,64 @@ class MusicLibraryRepository(private val context: Context) {
                     }
                 }
             } ?: emptyList()
+    }
+
+    // Botao "Sincronizar biblioteca" (refreshLibrary -> loadSongs) so pegava albuns novos depois
+    // de reiniciar o aparelho (pedido do usuario 10/09/2026) - copiar/mover arquivos via
+    // USB/gerenciador de arquivos nao dispara o scanner do MediaStore sozinho no Android 11+
+    // (storage con escopo), so a query normal em cima do indice que ja existia. Reiniciar
+    // "resolvia" porque o boot roda um scan completo em primeiro plano.
+    //
+    // Validado direto no aparelho (adb) antes de escrever isso, porque a 1a tentativa (so
+    // "scan_volume" + poll) NAO funcionava:
+    // 1) "scan_volume" (mesmo metodo que o boot usa - so alcancavel passando a string crua pro
+    //    ContentResolver.call() publico, o campo Java MediaStore.SCAN_VOLUME_CALL e @hide) insere
+    //    uma linha stub PRA CADA arquivo novo na hora, com _data (caminho real) ja preenchido, mas
+    //    DURATION/IS_MUSIC ficam NULL indefinidamente - ele NAO faz a extracao de metadado
+    //    sozinho, so avisa o MediaStore que o arquivo existe. Fiquei mais de 40s pollando sem
+    //    nunca resolver.
+    // 2) MediaScannerConnection.scanFile() por caminho e que faz a extracao de verdade (mesmo
+    //    mecanismo que MEDIA_SCANNER_SCAN_FILE, testado via broadcast manual e confirmado: duration
+    //    e is_music populam na hora) - e ja usado em pathForRescan() pra outra coisa, entao sabemos
+    //    que _data e legivel pelo app pras proprias linhas do MediaStore.
+    // Junta os dois: scan_volume garante que TODO arquivo novo vira linha (mesmo um que o app
+    // nunca viu), depois scanFile em cada linha ainda pendente (duration/is_music nulos) forca a
+    // extracao de verdade com callback (sem poll as cegas). So roda em Android 11+ (scan_volume
+    // nao existe antes disso); versoes mais antigas usam o scanner tradicional sem essa ajuda.
+    private suspend fun requestFullMediaScanAndAwaitSettle() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        runCatching {
+            context.contentResolver.call(MediaStore.AUTHORITY_URI, "scan_volume", MediaStore.VOLUME_EXTERNAL, null)
+        }
+        val pendingPaths = runCatching { pendingScanPaths() }.getOrDefault(emptyList())
+        if (pendingPaths.isEmpty()) return
+        rescanPathsAndAwaitCompletion(pendingPaths)
+    }
+
+    private fun pendingScanPaths(): List<String> {
+        val selection = "${MediaStore.Audio.Media.DURATION} IS NULL OR ${MediaStore.Audio.Media.IS_MUSIC} IS NULL"
+        return context.contentResolver.query(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Audio.Media.DATA),
+            selection,
+            null,
+            null,
+        )?.use { cursor ->
+            val dataColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+            buildList { while (cursor.moveToNext()) cursor.getString(dataColumn)?.let { add(it) } }
+        }.orEmpty()
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun rescanPathsAndAwaitCompletion(paths: List<String>) {
+        withTimeoutOrNull(MEDIA_SCAN_TIMEOUT_MS) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                val remaining = AtomicInteger(paths.size)
+                MediaScannerConnection.scanFile(context, paths.toTypedArray(), null) { _, _ ->
+                    if (remaining.decrementAndGet() <= 0 && cont.isActive) cont.resume(Unit, onCancellation = null)
+                }
+            }
+        }
     }
 
     private fun readCachedSongsFromDisk(): List<LocalSong> =
@@ -245,6 +307,37 @@ class MusicLibraryRepository(private val context: Context) {
 
     fun unhideAllRadios() {
         metadataPrefs.edit().remove(KEY_HIDDEN_RADIOS).apply()
+    }
+
+    // --- Artistas/albuns ocultos (pedido do usuario 09/09/2026: faixas que nao sao musica de
+    // verdade - audio de WhatsApp, gravacoes soltas etc. - precisavam sumir da biblioteca sem
+    // precisar apagar o arquivo do aparelho, diferente do "excluir"). Chave = LocalArtist.key/
+    // LocalAlbum.key (ver LocalSong.kt). Guardado em metadataPrefs (mesma prefs de
+    // hiddenRadioKeys acima) pra entrar de graca no backup (ver BackupRepository.BACKED_UP_PREFS_NAMES).
+    fun hiddenArtistKeys(): Set<String> =
+        metadataPrefs.getStringSet(KEY_HIDDEN_ARTISTS, emptySet())?.toSet() ?: emptySet()
+
+    fun hideArtist(artist: LocalArtist) {
+        metadataPrefs.edit()
+            .putStringSet(KEY_HIDDEN_ARTISTS, hiddenArtistKeys() + artist.key)
+            .apply()
+    }
+
+    fun unhideAllArtists() {
+        metadataPrefs.edit().remove(KEY_HIDDEN_ARTISTS).apply()
+    }
+
+    fun hiddenAlbumKeys(): Set<String> =
+        metadataPrefs.getStringSet(KEY_HIDDEN_ALBUMS, emptySet())?.toSet() ?: emptySet()
+
+    fun hideAlbum(album: LocalAlbum) {
+        metadataPrefs.edit()
+            .putStringSet(KEY_HIDDEN_ALBUMS, hiddenAlbumKeys() + album.key)
+            .apply()
+    }
+
+    fun unhideAllAlbums() {
+        metadataPrefs.edit().remove(KEY_HIDDEN_ALBUMS).apply()
     }
 
     // --- Radios personalizadas (a partir de album/artista) ---
@@ -436,7 +529,13 @@ class MusicLibraryRepository(private val context: Context) {
         }
     }
 
-    fun allGenreRadios(songs: List<LocalSong>): List<LocalRadio> = dynamicGenreRadios(songs)
+    // A aba de Categorias precisa listar TODO genero com pelo menos 1 musica taggeada (pedido do
+    // usuario 10/09/2026 - ele sentia que faltava coisa la, e faltava mesmo: generos com poucas
+    // faixas ficavam invisiveis por causa do minSize=MIN_RADIO_SIZE abaixo, que existe pra evitar
+    // "radios" minusculas de 2-3 faixas na aba Radios/Home). minSize=1 aqui pra Categorias; os
+    // outros usos de dynamicGenreRadios (radiosFrom, resolucao de radio por customId) continuam
+    // com o minimo padrao pra nao poluir a aba de radios de verdade.
+    fun allGenreRadios(songs: List<LocalSong>): List<LocalRadio> = dynamicGenreRadios(songs, minSize = 1)
 
     fun radioSessionFrom(radio: LocalRadio): List<LocalSong> {
         // Radio personalizada de album/artista unico e uma lista fechada de poucos artistas de
@@ -1361,7 +1460,7 @@ class MusicLibraryRepository(private val context: Context) {
     // decisao explicita do usuario em troca de fragmentar generos legados mal escritos que ainda
     // nao passaram pelo editor de tags novo (ex.: "Alt Rock" e "Alternative Rock" agora viram 2
     // categorias em vez de 1 so).
-    private fun dynamicGenreRadios(songs: List<LocalSong>): List<LocalRadio> {
+    private fun dynamicGenreRadios(songs: List<LocalSong>, minSize: Int = MIN_RADIO_SIZE): List<LocalRadio> {
         data class GenreHit(val song: LocalSong, val key: String, val display: String)
 
         val hits = songs.flatMap { song -> genreEntriesFor(song).map { (key, display) -> GenreHit(song, key, display) } }
@@ -1369,7 +1468,7 @@ class MusicLibraryRepository(private val context: Context) {
         return hits.groupBy { it.key }
             .mapNotNull { (genreKey, group) ->
                 val uniqueSongs = group.map { it.song }.distinctBy { it.id }
-                if (uniqueSongs.size < MIN_RADIO_SIZE) return@mapNotNull null
+                if (uniqueSongs.size < minSize) return@mapNotNull null
 
                 val name = GENRE_DISPLAY_NAMES[genreKey]
                     ?: group.groupingBy { it.display }.eachCount().maxByOrNull { it.value }?.key
@@ -1378,9 +1477,12 @@ class MusicLibraryRepository(private val context: Context) {
                 // sortedWith abaixo roda O(n log n) vezes, e recalcular isso por comparacao
                 // (Normalizer.normalize por musica) travava o carregamento com bibliotecas grandes.
                 val distinctArtistCount = uniqueSongs.map { primaryArtistKey(it.artist) }.distinct().size
+                val trackCount = uniqueSongs.size.coerceAtMost(RADIO_LIMIT)
                 distinctArtistCount to LocalRadio(
                     name = name,
-                    description = "${uniqueSongs.size.coerceAtMost(RADIO_LIMIT)} faixas classificadas",
+                    // Concordancia de numero importa agora que minSize pode ser 1 (aba de
+                    // Categorias, ver allGenreRadios) - "1 faixas classificadas" soava errado.
+                    description = if (trackCount == 1) "1 faixa classificada" else "$trackCount faixas classificadas",
                     songs = uniqueSongs,
                     coverSongs = previewCovers(uniqueSongs, "genre:$genreKey"),
                 )
@@ -1504,11 +1606,14 @@ class MusicLibraryRepository(private val context: Context) {
         const val KEY_METADATA_SCHEMA_VERSION = "metadata_schema_version"
         const val KEY_CUSTOM_RADIOS = "custom_radio_definitions"
         const val KEY_HIDDEN_RADIOS = "hidden_radio_keys"
+        const val KEY_HIDDEN_ARTISTS = "hidden_artist_keys"
+        const val KEY_HIDDEN_ALBUMS = "hidden_album_keys"
         const val ARTWORK_CANDIDATE_LIMIT = 10
         const val METADATA_SCHEMA_VERSION = 2
         const val RADIO_LIMIT = 30
         const val TAG = "PailerTags"
         const val MIN_RADIO_SIZE = 8
+        const val MEDIA_SCAN_TIMEOUT_MS = 12_000L
         const val MIN_CURATED_RADIO_SIZE = 3
         const val MAX_HOME_RADIOS = 10
         const val RADIO_SESSION_ATTEMPTS = 5

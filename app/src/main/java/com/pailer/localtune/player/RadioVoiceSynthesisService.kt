@@ -15,31 +15,49 @@ import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 class RadioVoiceSynthesisService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    // Um Job por requestId (ver EXTRA_REQUEST_ID/ACTION_CANCEL) - pedido do usuario (09/09/2026):
+    // quando quem pediu a sintese desiste de esperar (timeout, boletim descartado), o processo
+    // isolado continuava sintetizando TODAS as falas sozinho, disputando CPU com o proximo pedido
+    // (achado em campo: um boletim cancelado ainda rodando quando o seguinte comecava, os dois
+    // disputando as mesmas threads). Guardar o Job aqui deixa o ramo ACTION_CANCEL abaixo
+    // interromper so ESSE pedido, sem afetar outros rodando ao mesmo tempo no mesmo processo.
+    private val activeJobs = ConcurrentHashMap<Long, Job>()
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val startedAt = System.currentTimeMillis()
-        val receiver = intent?.getParcelableExtra<ResultReceiver>(EXTRA_RECEIVER)
-        val texts = intent?.getStringArrayListExtra(EXTRA_TEXTS).orEmpty()
-        val speakers = intent?.getIntArrayExtra(EXTRA_SPEAKERS) ?: intArrayOf()
-        val mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_FULL
-        val coreFilePath = intent?.getStringExtra(EXTRA_CORE_FILE_PATH)
-        if (receiver == null || texts.isEmpty() || (mode == MODE_SPLICE && coreFilePath.isNullOrBlank())) {
-            Log.w(TAG, "invalid voice request receiver=${receiver != null} texts=${texts.size} mode=$mode")
+        if (intent?.action == ACTION_CANCEL) {
+            val requestId = intent.getLongExtra(EXTRA_REQUEST_ID, NO_REQUEST_ID)
+            val job = activeJobs.remove(requestId)
+            Log.d(TAG, "cancel requested for requestId=$requestId found=${job != null}")
+            job?.cancel()
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
 
-        scope.launch {
-            Log.d(TAG, "start synthesis mode=$mode lines=${texts.size} chars=${texts.sumOf { it.length }}")
+        val startedAt = System.currentTimeMillis()
+        val receiver = intent?.getParcelableExtra<ResultReceiver>(EXTRA_RECEIVER)
+        val texts = intent?.getStringArrayListExtra(EXTRA_TEXTS).orEmpty()
+        val speakers = intent?.getIntArrayExtra(EXTRA_SPEAKERS) ?: intArrayOf()
+        val persistent = intent?.getBooleanExtra(EXTRA_PERSISTENT, false) ?: false
+        val requestId = intent?.getLongExtra(EXTRA_REQUEST_ID, NO_REQUEST_ID) ?: NO_REQUEST_ID
+        if (receiver == null || texts.isEmpty()) {
+            Log.w(TAG, "invalid voice request receiver=${receiver != null} texts=${texts.size}")
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+
+        val job = scope.launch {
+            Log.d(TAG, "start synthesis lines=${texts.size} chars=${texts.sumOf { it.length }} persistent=$persistent requestId=$requestId")
             val result = runCatching {
                 val lines = texts.mapIndexed { index, text ->
                     RadioScriptLine(
@@ -71,22 +89,18 @@ class RadioVoiceSynthesisService : Service() {
                         )
                         Unit
                     }
-                    val file = when (mode) {
-                        MODE_CORE -> engine.synthesizeCore(lines, onLineDone)
-                        MODE_SPLICE -> {
-                            // texts/speakers carrega exatamente 2 falas nessa ordem: [0]=intro
-                            // (fala 1, cola ANTES do nucleo), [1]=closer (fala 6, cola DEPOIS) -
-                            // ver LocalTuneViewModel.requestSpliceSynthesis/spliceIntent.
-                            engine.spliceEdges(File(coreFilePath!!), lines[0], lines[1])
-                        }
-                        else -> {
-                            val script = RadioScript(
-                                story = NewsStory(title = texts.first(), source = "Pailer FM"),
-                                source = RadioScriptSource.Fallback,
-                                lines = lines,
-                            )
-                            engine.synthesize(script, onLineDone)
-                        }
+                    val file = if (persistent) {
+                        // Buffer do boletim (ver LocalTuneViewModel.prewarmCoreBuffer) - precisa
+                        // sobreviver a reinicio do app/processo, ver LocalRadioVoiceEngine.
+                        // synthesizeCore.
+                        engine.synthesizeCore(lines, onLineDone)
+                    } else {
+                        val script = RadioScript(
+                            story = NewsStory(title = texts.first(), source = "Pailer FM"),
+                            source = RadioScriptSource.Fallback,
+                            lines = lines,
+                        )
+                        engine.synthesize(script, onLineDone)
                     }
                     Log.d(TAG, "audio result path=${file?.absolutePath.orEmpty()} bytes=${file?.length() ?: 0}")
                     file
@@ -124,6 +138,10 @@ class RadioVoiceSynthesisService : Service() {
             )
             stopSelfResult(startId)
         }
+        if (requestId != NO_REQUEST_ID) {
+            activeJobs[requestId] = job
+            job.invokeOnCompletion { activeJobs.remove(requestId, job) }
+        }
         return START_NOT_STICKY
     }
 
@@ -155,43 +173,37 @@ class RadioVoiceSynthesisService : Service() {
         const val EXTRA_PROGRESS_TOTAL = "progress_total"
         const val SPEAKER_FEMALE = 0
         const val SPEAKER_MALE = 1
-        // EXTRA_MODE: "full" (default, comportamento de sempre - script inteiro, com musica de
-        // fundo), "core" (so sintetiza, sem musica de fundo - ver
-        // LocalRadioVoiceEngine.synthesizeCore, usado no pre-aquecimento radio-agnostico) ou
-        // "splice" (encaixa 2 falas de ponta [intro, closer] em volta de um nucleo ja pronto -
-        // ver LocalRadioVoiceEngine.spliceEdges, usado quando entra numa radio de verdade).
-        const val EXTRA_MODE = "mode"
-        const val MODE_FULL = "full"
-        const val MODE_CORE = "core"
-        const val MODE_SPLICE = "splice"
-        const val EXTRA_CORE_FILE_PATH = "core_file_path"
+        // Buffer do boletim (ver LocalTuneViewModel.prewarmCoreBuffer/persistentIntent): quando
+        // true, o audio vai pra filesDir (sobrevive a reinicio do app) em vez do cacheDir efemero
+        // de sempre - ver LocalRadioVoiceEngine.synthesizeCore.
+        const val EXTRA_PERSISTENT = "persistent"
+        // Identifica um pedido de sintese pra poder cancela-lo individualmente depois (ver
+        // ACTION_CANCEL/activeJobs) - gerado pelo chamador (LocalTuneViewModel.requestVoiceSynthesis),
+        // unico por pedido. -1L (NO_REQUEST_ID) significa "nao rastreavel", mantem compatibilidade
+        // com qualquer chamador que nao precise cancelar.
+        const val EXTRA_REQUEST_ID = "request_id"
+        const val NO_REQUEST_ID = -1L
+        // Pedido do usuario (09/09/2026): cancela so o pedido com esse requestId, sem afetar
+        // outros rodando ao mesmo tempo no mesmo processo isolado - ver activeJobs.
+        const val ACTION_CANCEL = "com.pailer.localtune.action.CANCEL_VOICE_SYNTHESIS"
         private const val TAG = "PailerRadioVoice"
 
-        fun intent(context: Context, script: RadioScript, receiver: ResultReceiver): Intent =
-            linesIntent(context, script.lines, receiver)
+        fun intent(context: Context, script: RadioScript, receiver: ResultReceiver, requestId: Long = NO_REQUEST_ID): Intent =
+            linesIntent(context, script.lines, receiver, requestId)
 
-        // Nucleo pre-aquecido: so as falas do meio (radio-agnosticas), sem musica de fundo.
-        fun coreIntent(context: Context, lines: List<RadioScriptLine>, receiver: ResultReceiver): Intent =
-            linesIntent(context, lines, receiver).apply { putExtra(EXTRA_MODE, MODE_CORE) }
+        fun persistentIntent(context: Context, script: RadioScript, receiver: ResultReceiver, requestId: Long = NO_REQUEST_ID): Intent =
+            linesIntent(context, script.lines, receiver, requestId).apply { putExtra(EXTRA_PERSISTENT, true) }
 
-        // Encaixe: coreFile e o WAV "seco" ja sintetizado por coreIntent, introLine/closerLine
-        // sao as 2 falas com contexto real (radio/faixa) recem-decoradas (ver
-        // RadioScript.withLastPlayedIntro/withPhilosophicalCloser).
-        fun spliceIntent(
-            context: Context,
-            coreFile: File,
-            introLine: RadioScriptLine,
-            closerLine: RadioScriptLine,
-            receiver: ResultReceiver,
-        ): Intent =
-            linesIntent(context, listOf(introLine, closerLine), receiver).apply {
-                putExtra(EXTRA_MODE, MODE_SPLICE)
-                putExtra(EXTRA_CORE_FILE_PATH, coreFile.absolutePath)
+        fun cancelIntent(context: Context, requestId: Long): Intent =
+            Intent(context, RadioVoiceSynthesisService::class.java).apply {
+                action = ACTION_CANCEL
+                putExtra(EXTRA_REQUEST_ID, requestId)
             }
 
-        private fun linesIntent(context: Context, lines: List<RadioScriptLine>, receiver: ResultReceiver): Intent =
+        private fun linesIntent(context: Context, lines: List<RadioScriptLine>, receiver: ResultReceiver, requestId: Long): Intent =
             Intent(context, RadioVoiceSynthesisService::class.java).apply {
                 putExtra(EXTRA_RECEIVER, receiver)
+                putExtra(EXTRA_REQUEST_ID, requestId)
                 putStringArrayListExtra(EXTRA_TEXTS, ArrayList(lines.map { it.text }))
                 putExtra(
                     EXTRA_SPEAKERS,

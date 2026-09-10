@@ -89,6 +89,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.Build
@@ -106,6 +107,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
@@ -123,6 +125,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -134,6 +137,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
@@ -161,6 +165,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -170,6 +175,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.input.pointer.pointerInput
@@ -197,7 +203,9 @@ import androidx.media3.common.Player
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
+import com.pailer.localtune.data.BulletinTtsProvider
 import com.pailer.localtune.data.DuplicateArtistGroup
+import com.pailer.localtune.data.GeminiTtsModel
 import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
@@ -255,6 +263,7 @@ private enum class SettingsPage {
     TagWriter,
     Artists,
     RadioBulletins,
+    GeminiApiKeys,
     AlbumArtwork,
     Backup,
 }
@@ -401,6 +410,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var pendingDeleteSong by remember { mutableStateOf<LocalSong?>(null) }
     var pendingDeleteAlbum by remember { mutableStateOf<LocalAlbum?>(null) }
     var pendingDeleteArtist by remember { mutableStateOf<LocalArtist?>(null) }
+    // Alvo do popover de acoes (abrir/favoritar/ocultar/excluir) aberto ao segurar num artista
+    // ou album na grade - ver LibraryItemActionsSheet. Excluir reusa pendingDeleteAlbum/
+    // pendingDeleteArtist acima (o popover so abre o dialogo de confirmacao existente).
+    var albumActionsTarget by remember { mutableStateOf<LocalAlbum?>(null) }
+    var artistActionsTarget by remember { mutableStateOf<LocalArtist?>(null) }
     val scope = rememberCoroutineScope()
     val tagWriteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
@@ -794,7 +808,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     selectedTab == LibraryTab.Artists -> ArtistsScreen(
                         artists = artists,
                         onOpenArtist = { selectedArtist = it },
-                        onDeleteArtist = { pendingDeleteArtist = it },
+                        onLongPressArtist = { artistActionsTarget = it },
                         favoriteArtistKeys = library.favoriteArtistKeys,
                         photoUriFor = viewModel::artistPhotoUri,
                         scrollState = artistsScrollState,
@@ -802,7 +816,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     selectedTab == LibraryTab.Albums -> AlbumsScreen(
                         albums = albums,
                         onOpenAlbum = { selectedAlbum = it },
-                        onDeleteAlbum = { pendingDeleteAlbum = it },
+                        onLongPressAlbum = { albumActionsTarget = it },
                         favoriteAlbumKeys = library.favoriteAlbumKeys,
                         scrollState = albumsScrollState,
                     )
@@ -872,12 +886,13 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onApplyArtwork = requestApplyArtwork,
             onSetRadioBulletinPreferLocalWriter = viewModel::setRadioBulletinPreferLocalWriter,
             onSetRadioBulletinCloudWriterEnabled = viewModel::setRadioBulletinCloudWriterEnabled,
+            onSetRadioBulletinTtsProvider = viewModel::setRadioBulletinTtsProvider,
+            onSetRadioBulletinTtsModel = viewModel::setRadioBulletinTtsModel,
+            onTestGeminiFlashTtsVoices = viewModel::testGeminiFlashTtsVoices,
             onImportRadioWriterPackage = { writerPackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioWriterPackage = viewModel::clearRadioWriterPackage,
             onSaveGeminiApiKey = viewModel::saveGeminiApiKey,
             onClearGeminiApiKey = viewModel::clearGeminiApiKey,
-            onSaveOpenRouterApiKey = viewModel::saveOpenRouterApiKey,
-            onClearOpenRouterApiKey = viewModel::clearOpenRouterApiKey,
             onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
             onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
@@ -891,6 +906,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onPlayReadyBulletin = viewModel::playReadyBufferedBulletin,
             hasHiddenRadios = viewModel.hasHiddenRadios(),
             onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
+            hasHiddenLibraryItems = viewModel.hasHiddenArtistsOrAlbums(),
+            onRestoreHiddenLibraryItems = viewModel::restoreHiddenArtistsAndAlbums,
             backup = viewModel.backupState.value,
             onChooseBackupDestination = { backupCreateLauncher.launch("pailer_fm_backup.json") },
             onBackupNow = viewModel::performBackupNow,
@@ -932,6 +949,49 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     requestDelete(artist.songs)
                 },
                 onDismiss = { pendingDeleteArtist = null },
+            )
+        }
+
+        albumActionsTarget?.let { album ->
+            LibraryItemActionsSheet(
+                title = album.title,
+                subtitle = album.artist,
+                isFavorite = viewModel.isAlbumFavorite(album),
+                onOpen = {
+                    albumActionsTarget = null
+                    selectedAlbum = album
+                },
+                onToggleFavorite = { viewModel.toggleAlbumFavorite(album) },
+                onHide = {
+                    albumActionsTarget = null
+                    viewModel.hideAlbum(album)
+                },
+                onDelete = {
+                    albumActionsTarget = null
+                    pendingDeleteAlbum = album
+                },
+                onDismiss = { albumActionsTarget = null },
+            )
+        }
+        artistActionsTarget?.let { artist ->
+            LibraryItemActionsSheet(
+                title = artist.name,
+                subtitle = "${artist.songs.size} faixas",
+                isFavorite = viewModel.isArtistFavorite(artist),
+                onOpen = {
+                    artistActionsTarget = null
+                    selectedArtist = artist
+                },
+                onToggleFavorite = { viewModel.toggleArtistFavorite(artist) },
+                onHide = {
+                    artistActionsTarget = null
+                    viewModel.hideArtist(artist)
+                },
+                onDelete = {
+                    artistActionsTarget = null
+                    pendingDeleteArtist = artist
+                },
+                onDismiss = { artistActionsTarget = null },
             )
         }
 
@@ -1083,12 +1143,13 @@ private fun SettingsDrawer(
     onApplyArtwork: (LocalAlbum) -> Unit,
     onSetRadioBulletinPreferLocalWriter: (Boolean) -> Unit,
     onSetRadioBulletinCloudWriterEnabled: (Boolean) -> Unit,
+    onSetRadioBulletinTtsProvider: (BulletinTtsProvider) -> Unit,
+    onSetRadioBulletinTtsModel: (GeminiTtsModel) -> Unit,
+    onTestGeminiFlashTtsVoices: () -> Unit,
     onImportRadioWriterPackage: () -> Unit,
     onClearRadioWriterPackage: () -> Unit,
-    onSaveGeminiApiKey: (String) -> Unit,
-    onClearGeminiApiKey: () -> Unit,
-    onSaveOpenRouterApiKey: (String) -> Unit,
-    onClearOpenRouterApiKey: () -> Unit,
+    onSaveGeminiApiKey: (Int, String) -> Unit,
+    onClearGeminiApiKey: (Int) -> Unit,
     onImportRadioVoicePackage: () -> Unit,
     onClearRadioVoicePackage: () -> Unit,
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
@@ -1102,6 +1163,8 @@ private fun SettingsDrawer(
     onPlayReadyBulletin: (Int) -> Unit,
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
+    hasHiddenLibraryItems: Boolean = false,
+    onRestoreHiddenLibraryItems: () -> Unit = {},
     backup: BackupUiState = BackupUiState(),
     onChooseBackupDestination: () -> Unit = {},
     onBackupNow: () -> Unit = {},
@@ -1170,6 +1233,8 @@ private fun SettingsDrawer(
                             onOpenBackup = { onPageChange(SettingsPage.Backup) },
                             hasHiddenRadios = hasHiddenRadios,
                             onRestoreHiddenRadios = onRestoreHiddenRadios,
+                            hasHiddenLibraryItems = hasHiddenLibraryItems,
+                            onRestoreHiddenLibraryItems = onRestoreHiddenLibraryItems,
                         )
                         SettingsPage.Metadata -> MetadataSettingsPanel(
                             metadata = metadata,
@@ -1202,12 +1267,12 @@ private fun SettingsDrawer(
                             onBack = { onPageChange(SettingsPage.Main) },
                             onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
                             onSetCloudWriterEnabled = onSetRadioBulletinCloudWriterEnabled,
+                            onSetTtsProvider = onSetRadioBulletinTtsProvider,
+                            onSetTtsModel = onSetRadioBulletinTtsModel,
+                            onTestGeminiVoice = onTestGeminiFlashTtsVoices,
                             onImportWriterPackage = onImportRadioWriterPackage,
                             onClearWriterPackage = onClearRadioWriterPackage,
-                            onSaveGeminiApiKey = onSaveGeminiApiKey,
-                            onClearGeminiApiKey = onClearGeminiApiKey,
-                            onSaveOpenRouterApiKey = onSaveOpenRouterApiKey,
-                            onClearOpenRouterApiKey = onClearOpenRouterApiKey,
+                            onOpenGeminiApiKeys = { onPageChange(SettingsPage.GeminiApiKeys) },
                             onImportVoicePackage = onImportRadioVoicePackage,
                             onClearVoicePackage = onClearRadioVoicePackage,
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
@@ -1219,6 +1284,12 @@ private fun SettingsDrawer(
                             onResetBulletinBuffer = onResetBulletinBuffer,
                             onFixFallbackBulletins = onFixFallbackBulletins,
                             onPlayReadyBulletin = onPlayReadyBulletin,
+                        )
+                        SettingsPage.GeminiApiKeys -> GeminiApiKeysSettingsPanel(
+                            slotsFilled = radioBulletins.geminiApiKeySlotsFilled,
+                            onBack = { onPageChange(SettingsPage.RadioBulletins) },
+                            onSaveKey = onSaveGeminiApiKey,
+                            onClearKey = onClearGeminiApiKey,
                         )
                         SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
                             state = albumArtwork,
@@ -1262,6 +1333,8 @@ private fun SettingsMainPanel(
     onOpenBackup: () -> Unit = {},
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
+    hasHiddenLibraryItems: Boolean = false,
+    onRestoreHiddenLibraryItems: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -1356,6 +1429,15 @@ private fun SettingsMainPanel(
                 onClick = onRestoreHiddenRadios,
             )
         }
+        if (hasHiddenLibraryItems) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Restaurar artistas/albuns ocultos",
+                subtitle = "Traz de volta o que voce ocultou (nao apaga nada do aparelho)",
+                icon = Icons.Filled.VisibilityOff,
+                onClick = onRestoreHiddenLibraryItems,
+            )
+        }
     }
 }
 
@@ -1367,12 +1449,12 @@ private fun RadioBulletinSettingsPanel(
     onBack: () -> Unit,
     onSetPreferLocalWriter: (Boolean) -> Unit,
     onSetCloudWriterEnabled: (Boolean) -> Unit,
+    onSetTtsProvider: (BulletinTtsProvider) -> Unit,
+    onSetTtsModel: (GeminiTtsModel) -> Unit,
+    onTestGeminiVoice: () -> Unit,
     onImportWriterPackage: () -> Unit,
     onClearWriterPackage: () -> Unit,
-    onSaveGeminiApiKey: (String) -> Unit,
-    onClearGeminiApiKey: () -> Unit,
-    onSaveOpenRouterApiKey: (String) -> Unit,
-    onClearOpenRouterApiKey: () -> Unit,
+    onOpenGeminiApiKeys: () -> Unit,
     onImportVoicePackage: () -> Unit,
     onClearVoicePackage: () -> Unit,
     onSetVoiceEnabled: (Boolean) -> Unit,
@@ -1483,8 +1565,8 @@ private fun RadioBulletinSettingsPanel(
         Spacer(Modifier.height(20.dp))
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         Spacer(Modifier.height(16.dp))
-        // Chave geral Gemini+OpenRouter (06/09/2026, pedido do usuario): desligada, o app ignora
-        // as chaves salvas e so o redator local escreve - liga/desliga sem precisar apagar chave
+        // Chave geral do Gemini (06/09/2026, pedido do usuario): desligada, o app ignora as
+        // chaves salvas e so o redator local escreve - liga/desliga sem precisar apagar chave
         // nenhuma. Ver RadioBulletinSettings.cloudWriterEnabled/RadioBulletinRepository.
         // enhanceScript.
         Surface(
@@ -1505,7 +1587,7 @@ private fun RadioBulletinSettingsPanel(
                     )
                     Text(
                         text = if (radioBulletins.settings.cloudWriterEnabled) {
-                            "Ligado: Gemini/OpenRouter escrevem primeiro (mais rapido), redator local so entra se os dois falharem."
+                            "Ligado: o Gemini escreve primeiro (mais rapido), redator local so entra se ele falhar."
                         } else {
                             "Desligado: so o redator local escreve, mesmo com chave salva. As chaves continuam guardadas."
                         },
@@ -1525,84 +1607,118 @@ private fun RadioBulletinSettingsPanel(
             Spacer(Modifier.height(20.dp))
             HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
             Spacer(Modifier.height(16.dp))
-            Text("Redator via Gemini (nuvem)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-            Text(
-                text = if (radioBulletins.geminiConfigured) {
-                    "Chave salva: o Gemini escreve o boletim primeiro (mais rapido), e o redator local so entra se ele falhar."
-                } else {
-                    "Opcional: cole sua chave de API gratuita do Gemini pra escrever o boletim na nuvem em vez do redator local. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
-                },
-                modifier = Modifier.padding(top = 8.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Spacer(Modifier.height(10.dp))
-            if (radioBulletins.geminiConfigured) {
-                TextButton(onClick = onClearGeminiApiKey) {
-                    Text("Remover chave do Gemini", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            } else {
-                var geminiKeyInput by remember { mutableStateOf("") }
-                MetadataTextField(
-                    value = geminiKeyInput,
-                    onValueChange = { geminiKeyInput = it },
-                    label = "Chave de API do Gemini",
-                    placeholder = "AIza...",
-                )
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        onSaveGeminiApiKey(geminiKeyInput)
-                        geminiKeyInput = ""
-                    },
-                    enabled = geminiKeyInput.isNotBlank(),
+            // Campo de chave movido pra pagina propria (pedido do usuario 10/09/2026: "o campo de
+            // chaves... tem que ser uma página a parte") - suporta ate GeminiApiKeySettings.
+            // MAX_KEYS (5) chaves testadas em cadeia, ver GeminiApiKeysSettingsPanel. Mesmo pool
+            // usado pelo redator (aqui) e pelo Gemini Flash TTS experimental (secao abaixo).
+            val filledKeyCount = radioBulletins.geminiApiKeySlotsFilled.count { it }
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = PailerSurface.copy(alpha = 0.9f),
+                shape = RoundedCornerShape(8.dp),
+                onClick = onOpenGeminiApiKeys,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
                 ) {
-                    Text("Salvar chave")
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Chaves do Gemini",
+                            color = MaterialTheme.colorScheme.onBackground,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = if (radioBulletins.geminiConfigured) {
+                                "$filledKeyCount de ${radioBulletins.geminiApiKeySlotsFilled.size} salvas - escreve o boletim e (se ligado) sintetiza a voz. Se uma falhar, tenta a próxima em ordem."
+                            } else {
+                                "Opcional: cole até ${radioBulletins.geminiApiKeySlotsFilled.size} chaves de API gratuitas do Gemini. Sem chave, usa o redator local direto."
+                            },
+                            modifier = Modifier.padding(top = 3.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowForward,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
+        }
 
-            Spacer(Modifier.height(20.dp))
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-            Spacer(Modifier.height(16.dp))
-            // Segunda opcao de nuvem, INDEPENDENTE do Gemini (provedor/infra diferente) - pedido do
-            // usuario (05/09/2026), motivado por um pico de demanda real do Gemini (503 em sequencia)
-            // que so o redator local (lento) sobrava pra cobrir. So entra se o Gemini falhar (ver
-            // RadioBulletinRepository.enhanceScript) - mesma ordem de prioridade "nuvem antes de
-            // local" de sempre, com uma 2a chance de nuvem antes de desistir de vez.
-            Text("Redator via OpenRouter (nuvem, 2ª opção)", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(16.dp))
+        // Motor de SINTESE DE VOZ do boletim (Fran/Nico) - diferente das secoes acima, que sao
+        // sobre quem ESCREVE o roteiro. Experimental (10/09/2026, pedido do usuario): coexiste
+        // com o motor local de sempre, nunca o substitui - qualquer falha do Gemini cai pro
+        // sistema atual sozinha (ver LocalTuneViewModel.trySynthesizeWithGeminiFlash).
+        Text("Voz dos boletins", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        RadioBulletinChoiceRow(
+            title = "Sistema atual",
+            subtitle = "Motor local de sempre (Supertonic) - nada muda.",
+            selected = settings.ttsProvider == BulletinTtsProvider.CURRENT,
+            onClick = { onSetTtsProvider(BulletinTtsProvider.CURRENT) },
+        )
+        RadioBulletinChoiceRow(
+            title = "Gemini Flash TTS · Experimental",
+            subtitle = "Sintetiza Fran e Nico na nuvem via Gemini pra avaliar a qualidade. " +
+                "Se falhar, o boletim cai pro sistema atual sozinho.",
+            selected = settings.ttsProvider == BulletinTtsProvider.GEMINI_FLASH,
+            onClick = { onSetTtsProvider(BulletinTtsProvider.GEMINI_FLASH) },
+        )
+        if (settings.ttsProvider == BulletinTtsProvider.GEMINI_FLASH) {
+            Spacer(Modifier.height(6.dp))
             Text(
-                text = if (radioBulletins.openRouterConfigured) {
-                    "Chave salva: se o Gemini falhar, o OpenRouter tenta escrever antes de cair pro redator local."
-                } else {
-                    "Opcional: cole sua chave de API gratuita do OpenRouter (openrouter.ai) como reserva do Gemini. Precisa de internet; a sintetizacao de voz continua sempre no aparelho."
-                },
-                modifier = Modifier.padding(top = 8.dp),
+                "Modelo",
+                modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
             )
-            Spacer(Modifier.height(10.dp))
-            if (radioBulletins.openRouterConfigured) {
-                TextButton(onClick = onClearOpenRouterApiKey) {
-                    Text("Remover chave do OpenRouter", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            } else {
-                var openRouterKeyInput by remember { mutableStateOf("") }
-                MetadataTextField(
-                    value = openRouterKeyInput,
-                    onValueChange = { openRouterKeyInput = it },
-                    label = "Chave de API do OpenRouter",
-                    placeholder = "sk-or-v1-...",
+            GeminiTtsModel.entries.forEach { model ->
+                RadioBulletinChoiceRow(
+                    title = model.label,
+                    subtitle = model.modelId,
+                    selected = settings.ttsModel == model,
+                    onClick = { onSetTtsModel(model) },
                 )
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        onSaveOpenRouterApiKey(openRouterKeyInput)
-                        openRouterKeyInput = ""
-                    },
-                    enabled = openRouterKeyInput.isNotBlank(),
-                ) {
-                    Text("Salvar chave")
+            }
+            if (!radioBulletins.geminiConfigured) {
+                Text(
+                    text = "Precisa de pelo menos 1 chave de API do Gemini salva (seção \"Chaves do Gemini\" acima) pra funcionar. Sem ela, o boletim usa o sistema atual direto.",
+                    modifier = Modifier.padding(top = 4.dp),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            radioBulletins.geminiVoiceTestMessage?.let { message ->
+                Text(
+                    text = message,
+                    modifier = Modifier.padding(top = 8.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onTestGeminiVoice,
+                enabled = !radioBulletins.isTestingGeminiVoice,
+            ) {
+                if (radioBulletins.isTestingGeminiVoice) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
                 }
+                Text(if (radioBulletins.isTestingGeminiVoice) "Testando..." else "Testar vozes")
             }
         }
 
@@ -1732,6 +1848,89 @@ private fun RadioBulletinSettingsPanel(
     }
 }
 
+// Pagina propria pras chaves de API do Gemini (pedido do usuario 10/09/2026: "o campo de
+// chaves... tem que ser uma página a parte, clicar e ir pra página de chaves") - ate
+// GeminiApiKeySettings.MAX_KEYS (5) chaves, testadas em cadeia por generateWithRetry (RadioBulletin.kt)
+// e GeminiFlashTtsEngine.generateLineWithRetry: se a 1a salva falhar, tenta a proxima em ordem.
+// UM pool so pro redator e pro Gemini Flash TTS experimental (mesma secao "Voz dos boletins" na
+// tela anterior). Nunca mostra a chave de volta depois de salva (mesmo padrao ja usado pro campo
+// unico antigo) - so "salva"/"remover" por slot.
+@Composable
+private fun GeminiApiKeysSettingsPanel(
+    slotsFilled: List<Boolean>,
+    onBack: () -> Unit,
+    onSaveKey: (Int, String) -> Unit,
+    onClearKey: (Int) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Chaves do Gemini",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Usada pra escrever o roteiro do boletim e, se ligado, pra sintetizar a voz (Gemini " +
+                "Flash TTS). Se a 1ª chave falhar (ex.: cota esgotada), a próxima salva é " +
+                "tentada automaticamente, na ordem abaixo.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(20.dp))
+        slotsFilled.forEachIndexed { index, filled ->
+            if (index > 0) {
+                Spacer(Modifier.height(14.dp))
+                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+                Spacer(Modifier.height(14.dp))
+            }
+            Text("Chave ${index + 1}", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            if (filled) {
+                Text(
+                    "Salva.",
+                    modifier = Modifier.padding(bottom = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = { onClearKey(index) }) {
+                    Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                var keyInput by remember { mutableStateOf("") }
+                MetadataTextField(
+                    value = keyInput,
+                    onValueChange = { keyInput = it },
+                    label = "Chave de API do Gemini",
+                    placeholder = "AIza...",
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        onSaveKey(index, keyInput)
+                        keyInput = ""
+                    },
+                    enabled = keyInput.isNotBlank(),
+                ) {
+                    Text("Salvar chave")
+                }
+            }
+        }
+    }
+}
+
 // Status do buffer de boletins prontos (ADR-019) em tempo real - pedido do usuario
 // (03/09/2026): acompanhar quantos boletins ja estao prontos/sendo escritos, alem de poder
 // pausar (cancela o preparo e nao deixa comecar outro) e resetar (apaga o que tem e comeca de
@@ -1750,6 +1949,11 @@ private fun RadioBulletinBufferStatusCard(
     // syncBulletinBufferState) em vez do bate-bola de verdade escrito por LLM. Pedido do usuario
     // (05/09/2026): "deixamos a bolinha na cor amarela" pra identificar de relance.
     val fallbackColor = Color(0xFFFFC107)
+    // Verde pra bolinha pronta / vermelho piscando pra bolinha em preparo (pedido do usuario
+    // 10/09/2026) - antes as duas usavam a mesma cor primary (vermelho do tema), so a pulsacao
+    // de alpha distinguia uma da outra; agora a cor sozinha ja diz "pronto" vs "escrevendo agora"
+    // de relance, sem precisar reparar se esta piscando.
+    val readyColor = Color(0xFF4CAF50)
     // Pulso lento (1400ms, mais devagar que o "radioLivePulse"/"playerLivePulse" de 820ms usados
     // em "ao vivo" pela UI) na bolinha que esta sendo escrita agora - pedido do usuario
     // (03/09/2026): quer ver visualmente qual boletim esta em andamento, piscando devagar.
@@ -1824,7 +2028,7 @@ private fun RadioBulletinBufferStatusCard(
                             .background(
                                 when {
                                     isFallback -> fallbackColor
-                                    filled -> MaterialTheme.colorScheme.primary
+                                    filled -> readyColor
                                     preparing -> MaterialTheme.colorScheme.primary
                                     else -> Color.White.copy(alpha = 0.14f)
                                 },
@@ -3288,6 +3492,48 @@ private fun HomeNewsDrawer(
                 }
                 .then(dragModifier),
         )
+        // Alca visual da gaveta de noticias - sem ela o usuario nao tem como saber que aquela
+        // faixa fina na borda esquerda arrasta pra abrir (pedido do usuario 10/09/2026). E so
+        // indicacao visual (nao tem pointerInput proprio), entao o toque atravessa pra Box de
+        // deteccao de arrasto logo acima; ela mesma some assim que o painel comeca a cobri-la.
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(bottom = 24.dp)
+                .alpha((1f - progress * 4f).coerceIn(0f, 1f))
+                .width(16.dp)
+                .height(64.dp)
+                .clip(RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp))
+                .background(PailerRed),
+            contentAlignment = Alignment.Center,
+        ) {
+            // rotate() sozinho nao basta: o Box pai mede o Text ANTES de rotacionar, entao com
+            // maxWidth=16dp a palavra ficava truncada em "NE". O Modifier.layout mede o texto sem
+            // limite de largura (na horizontal, como se nao fosse rotacionar) e devolve pro pai um
+            // tamanho com largura/altura invertidas - o que a rotacao de 90 graus realmente ocupa.
+            Text(
+                "NEWS",
+                modifier = Modifier
+                    .layout { measurable, constraints ->
+                        val placeable = measurable.measure(constraints.copy(minWidth = 0, maxWidth = Constraints.Infinity))
+                        layout(placeable.height, placeable.width) {
+                            placeable.place(
+                                x = -(placeable.width - placeable.height) / 2,
+                                y = -(placeable.height - placeable.width) / 2,
+                            )
+                        }
+                    }
+                    .rotate(-90f),
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = 9.sp,
+                    letterSpacing = 1.5.sp,
+                    fontWeight = FontWeight.Bold,
+                ),
+                maxLines = 1,
+                softWrap = false,
+            )
+        }
         if (progress > 0f) {
             Box(
                 modifier = Modifier
@@ -3450,7 +3696,7 @@ private fun ArtistNewsCardView(
 private fun ArtistsScreen(
     artists: List<LocalArtist>,
     onOpenArtist: (LocalArtist) -> Unit,
-    onDeleteArtist: (LocalArtist) -> Unit = {},
+    onLongPressArtist: (LocalArtist) -> Unit = {},
     favoriteArtistKeys: Set<String> = emptySet(),
     photoUriFor: (LocalArtist) -> Uri? = { null },
     scrollState: ScrollState = rememberScrollState(),
@@ -3471,7 +3717,7 @@ private fun ArtistsScreen(
             ArtistGridCard(
                 artist = artist,
                 onClick = { onOpenArtist(artist) },
-                onLongClick = { onDeleteArtist(artist) },
+                onLongClick = { onLongPressArtist(artist) },
                 photoUri = photoUriFor(artist),
             )
         }
@@ -4374,7 +4620,7 @@ private fun GenreTagField(
 private fun AlbumsScreen(
     albums: List<LocalAlbum>,
     onOpenAlbum: (LocalAlbum) -> Unit,
-    onDeleteAlbum: (LocalAlbum) -> Unit = {},
+    onLongPressAlbum: (LocalAlbum) -> Unit = {},
     favoriteAlbumKeys: Set<String> = emptySet(),
     scrollState: ScrollState = rememberScrollState(),
 ) {
@@ -4393,7 +4639,7 @@ private fun AlbumsScreen(
             AlbumGridCard(
                 album = album,
                 onClick = { onOpenAlbum(album) },
-                onLongClick = { onDeleteAlbum(album) },
+                onLongClick = { onLongPressAlbum(album) },
             )
         }
     }
@@ -5693,6 +5939,102 @@ private fun DeleteConfirmDialog(
             }
         },
     )
+}
+
+// Popover de acoes ao segurar num artista ou album na grade (ver ArtistsScreen/AlbumsScreen) -
+// pedido do usuario (09/09/2026): antes o long-press ia direto pro dialogo de excluir; agora
+// abre isso primeiro com abrir/favoritar/ocultar/excluir. Reaproveitado pelos dois tipos (artista
+// e album) - so troca titulo/subtitulo/callbacks. Ocultar nao apaga nada do aparelho, so tira da
+// biblioteca (ver MusicLibraryRepository.hideArtist/hideAlbum) - pensado pra faixas que nao sao
+// musica de verdade (audio de WhatsApp, gravacoes soltas etc.) sem precisar apagar o arquivo.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LibraryItemActionsSheet(
+    title: String,
+    subtitle: String,
+    isFavorite: Boolean,
+    onOpen: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    onHide: () -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = PailerSurface,
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            ActionSheetRow(
+                icon = Icons.Filled.OpenInNew,
+                label = "Abrir",
+                onClick = onOpen,
+            )
+            ActionSheetRow(
+                icon = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                label = if (isFavorite) "Desfavoritar" else "Favoritar",
+                tint = if (isFavorite) PailerRed else null,
+                onClick = onToggleFavorite,
+            )
+            ActionSheetRow(
+                icon = Icons.Filled.VisibilityOff,
+                label = "Ocultar",
+                onClick = onHide,
+            )
+            ActionSheetRow(
+                icon = Icons.Filled.Delete,
+                label = "Excluir",
+                tint = MaterialTheme.colorScheme.error,
+                onClick = onDelete,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+@Composable
+private fun ActionSheetRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    tint: Color? = null,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = tint ?: MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.width(20.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = tint ?: MaterialTheme.colorScheme.onSurface,
+        )
+    }
 }
 
 // Picker de artista/album pra adicionar como fonte extra numa radio personalizada (botao "+" em

@@ -423,7 +423,16 @@ Java_com_pailer_localtune_data_LocalLlamaTextGenerator_generateCachedNative(
         return error_result(env, "Não consegui preparar o pedido.");
     }
 
-    const int32_t predict = std::max(16, std::min(static_cast<int32_t>(max_tokens), 420));
+    // Teto subido de 420 pra 600 (09/09/2026, pedido do usuario: falas 5/6 - a reflexao do
+    // Nico e o fechamento da Fran - ficavam sem orcamento sobrando e caiam pro banco fixo de
+    // reflexoes genericas, ver NICO_REFLECTIONS_LIGHT/DEEP em RadioBulletin.kt). O prompt
+    // (system+few-shot) mede ~1150-1190 tokens (ver comentario em
+    // LocalLlamaTextGenerator.generate) - mesmo no pior caso (n_prompt~1190 + predict=600+32),
+    // ctx fica em ~1822, ainda abaixo do teto de 2048 logo abaixo, entao ha folga real de
+    // sobra. Ver RadioWriterPackageRepository.kt (coerceIn(32,600), mesmo teto) e
+    // LOCAL_WRITER_NATIVE_TIMEOUT_MS/LOCAL_WRITER_TIMEOUT_MS (subidos junto pra dar tempo real
+    // de decodificar os tokens extras, ~2 tok/s medido neste aparelho).
+    const int32_t predict = std::max(16, std::min(static_cast<int32_t>(max_tokens), 600));
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(std::min(n_prompt + predict + 32, 2048));
     ctx_params.n_batch = static_cast<uint32_t>(std::min(n_prompt, 2048));

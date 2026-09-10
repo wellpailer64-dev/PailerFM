@@ -6,11 +6,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
 // Paleta Pailer FM: cinza escuro, prateado, vermelho e bege claro.
-val PailerCharcoal = Color(0xFF1C1E23)
-val PailerSurface = Color(0xFF24262C)
-val PailerSurfaceHigh = Color(0xFF2C2F36)
-val PailerSurfaceHighest = Color(0xFF343740)
-val PailerGunmetal = Color(0xFF474A50)
+// Cinzas escurecidos um pouco (pedido do usuario 09/09/2026) - mesma escala relativa entre os
+// 5 tons, so ~7-9 pontos mais escuro por canal.
+val PailerCharcoal = Color(0xFF15161A)
+val PailerSurface = Color(0xFF1C1E23)
+val PailerSurfaceHigh = Color(0xFF23252B)
+val PailerSurfaceHighest = Color(0xFF2A2C33)
+val PailerGunmetal = Color(0xFF3A3D43)
 val PailerSilver = Color(0xFFBFC0C2)
 val PailerIvory = Color(0xFFF0E1CF)
 val PailerRed = Color(0xFFB53A2E)
