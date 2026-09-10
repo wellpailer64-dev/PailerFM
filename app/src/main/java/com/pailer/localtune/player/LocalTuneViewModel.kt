@@ -2727,7 +2727,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // quem tocaria primeiro continua na frente da fila depois de restaurado.
     private fun saveCoreBufferManifest() {
         runCatching {
-            val allItems = bulletinBuffer.map { it.sourceCore ?: PreparedNewsCore(it.script, it.file) } + coreBuffer
+            val allItems = bulletinBuffer.map {
+                it.sourceCore ?: PreparedNewsCore(
+                    it.script, it.file,
+                    scriptFromGemini = it.scriptFromGemini,
+                    voiceFromGemini = it.voiceFromGemini,
+                )
+            } + coreBuffer
             val array = JSONArray()
             allItems.forEach { item ->
                 array.put(
@@ -2751,6 +2757,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             },
                         )
                         put("coreFile", item.coreFile?.name)
+                        // Sem isso, todo restart de processo (comum no Android - app em segundo
+                        // plano morto pelo sistema) perdia essa info e a bolinha verde/azul
+                        // (RadioBulletinBufferStatusCard) voltava sempre azul pra qualquer item
+                        // recarregado do manifest, mesmo tendo sido 100% Gemini de verdade
+                        // (achado ao vivo 10/09/2026, logo apos reinstalar com essa feature nova).
+                        put("scriptFromGemini", item.scriptFromGemini)
+                        put("voiceFromGemini", item.voiceFromGemini)
                     },
                 )
             }
@@ -2795,7 +2808,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     val coreFile = json.optString("coreFile").takeIf { it.isNotBlank() }
                         ?.let { coreBufferDir.resolve(it) }
                         ?.takeIf { it.exists() }
-                    PreparedNewsCore(script, coreFile)
+                    // optBoolean(_, false): manifest gravado ANTES desses 2 campos existirem volta
+                    // sem eles - default false/"nao sei" e proposital, ver PreparedNewsCore.
+                    PreparedNewsCore(
+                        script, coreFile,
+                        scriptFromGemini = json.optBoolean("scriptFromGemini", false),
+                        voiceFromGemini = json.optBoolean("voiceFromGemini", false),
+                    )
                 }.getOrNull()
             }
             coreBuffer.clear()
