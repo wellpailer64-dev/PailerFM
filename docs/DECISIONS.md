@@ -1039,3 +1039,102 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   `RadioScriptSource.LocalLlm` pros dois). `usedGemini` guarda o resultado do callback e
   vira a condição extra (`&& !usedGemini`) no `if` que entra no laço de espera do
   cooldown.
+
+## ADR-022 — Gemini Flash TTS experimental, multi-chave do Gemini, e correções reais no buffer de boletins/sincronização de biblioteca
+
+- **Contexto:** sessão longa (10/09/2026) com vários pedidos do usuário, do maior
+  (experimentar um motor de voz na nuvem) a bugs reais achados testando ao vivo no
+  aparelho (buffer de boletins desperdiçando trabalho pronto, sincronizar biblioteca não
+  pegando álbum novo).
+- **Decisão — Gemini Flash TTS (experimental):** novo motor de síntese de voz pra Fran/
+  Nico via `generateContent` do Gemini (`responseModalities: ["AUDIO"]`,
+  `speechConfig.voiceConfig.prebuiltVoiceConfig`), coexistindo com o motor local
+  (Supertonic, ADR-018) sem substituí-lo — liga/desliga em Configurações > Boletins >
+  "Voz dos boletins" (`RadioBulletinSettings.ttsProvider`, `BulletinTtsProvider` em
+  `RadioBulletinTts.kt`). Implementado como motor novo e isolado
+  (`GeminiFlashTtsEngine.kt`), não dentro do `RadioVoiceSynthesisService`/processo
+  `:radio_voice` — é chamada de rede, não código nativo instável, cancelamento
+  cooperativo padrão do Kotlin já basta, sem precisar do aparato de isolamento de
+  processo do motor local. Contrato de saída idêntico ao `LocalRadioVoiceEngine.
+  synthesize()/synthesizeCore()` (mesmo `File?` de `.wav`, mesmas pastas cacheDir/
+  filesDir) — o resto do pipeline (buffer, manifest, limpeza de órfãos) não sabe nem
+  precisa saber qual motor gerou o áudio. Qualquer falha (sem chave, timeout, HTTP
+  4xx/5xx, resposta sem áudio) cai pro motor local automaticamente, boletim nunca fica
+  sem áudio por causa do experimento.
+  - **Achados testando ao vivo (não só lidos na doc):** 20s de timeout por fala não
+    bastava — os 2 modelos "preview" (`gemini-3.1-flash-tts-preview`,
+    `gemini-2.5-flash-preview-tts`) às vezes demoram mais que isso pra responder, mesmo
+    padrão já visto em `RemoteGeminiRadioScriptWriter.GEMINI_TIMEOUT_MS` (120s, ADR-020)
+    pra escrita. Subido pra 60s (`GEMINI_TTS_TIMEOUT_MS`). `withTimeoutOrNull` embrulhando
+    uma chamada bloqueante (`HttpURLConnection`, sem suspend point no meio) não cancela
+    ela de verdade — só descarta o resultado se ele voltar depois do prazo — por isso o
+    timeout precisa cobrir o pior caso real. Cota gratuita esgota rápido com chamada por
+    fala (HTTP 429 visto em campo dentro de minutos de teste) — motivou a decisão
+    seguinte.
+  - **Voz do Nico:** trocada de Puck (tom "upbeat", não combinava) pra Algenib — voz
+    masculina documentada com textura "gravelly"/grave entre as pré-prontas do Gemini
+    TTS, mais perto do cético/durão que o personagem já tem (ADR-014/021). Instruções de
+    estilo dos dois locutores (`GeminiTtsVoices` em `RadioBulletinTts.kt`) também
+    suavizadas — pedido do usuário depois de ouvir o teste: a interpretação padrão
+    soava "forçada" na entonação.
+- **Decisão — multi-chave do Gemini (até 5, em cadeia):** motivado pelo HTTP 429 visto
+  acima. `GeminiApiKeySettings` (renomeada de `GeminiWriterSettings`,
+  `RadioBulletin.kt`) guarda até `MAX_KEYS = 5` chaves indexadas, com migração automática
+  da chave única salva antes dessa mudança (slot 0, `init` da classe). Tanto
+  `RemoteGeminiRadioScriptWriter.generateWithRetry` (escrita) quanto
+  `GeminiFlashTtsEngine.generateLineWithRetry` (voz) testam as chaves configuradas EM
+  ORDEM, 1 tentativa por chave — a rotação de chave é o retry agora, a MESMA chave não é
+  tentada 2x seguidas (um 429 de cota não se resolve batendo de novo na mesma chave). Só
+  desiste de vez (cai pro redator/motor local) depois de esgotar todas as chaves
+  configuradas. Campo de chave saiu do formulário inline dentro da tela de Boletins e
+  virou página própria ("Chaves do Gemini", `GeminiApiKeysSettingsPanel` em
+  `LocalTuneApp.kt`) — pedido explícito do usuário, um slot por chave com salvar/remover
+  independentes, nunca mostra a chave de volta depois de salva.
+- **Decisão — remoção do OpenRouter:** pedido explícito do usuário ("pode tirar a do
+  openrouter, nem vamos usar") — `OpenRouterWriterSettings`/
+  `RemoteOpenRouterRadioScriptWriter` (ADR-021, 05/09/2026) removidos inteiros de
+  `RadioBulletin.kt`, junto da UI/callbacks correspondentes. O cenário original que
+  motivou o OpenRouter (Gemini sobrecarregado, 503 em sequência) agora é coberto pela
+  rotação de chaves acima, sem precisar de um segundo provedor.
+- **Decisão — buffer de boletins não desperdiça mais trabalho pronto:** bug real achado
+  testando ao vivo: sair/trocar de rádio antes do 1º boletim tocar parecia "devolver" o
+  núcleo pro buffer genérico (`clearBulletinBuffer`, ADR-020), mas a ordem das operações
+  estava errada — apagava `item.file` **antes** de devolver o núcleo, deixando o núcleo
+  devolvido com um caminho pra um arquivo que a própria função acabara de apagar. O
+  roteiro "sobrevivia" (dava a impressão de estar funcionando) mas o áudio sintetizado —
+  a parte cara de verdade — sempre sumia, forçando resíntese do zero na próxima vez que
+  esse núcleo fosse usado. Corrigido: nada é apagado, todo boletim pronto (com ou sem
+  núcleo de origem) volta pro buffer genérico intacto. Dois bugs secundários corrigidos
+  junto: (1) `refillBulletinBuffer()` só promovia 1 núcleo pronto de volta pro buffer da
+  rádio por chamada (throttle de 06/09/2026 que fazia sentido quando devolver ainda
+  desperdiçava — deixou de fazer sentido depois do fix acima) — agora esvazia o estoque
+  pronto de uma vez, só o caminho "gerar do zero" (caro, sem núcleo disponível) continua
+  limitado a 1 por chamada; (2) o loop que devolve vários núcleos em lote usava
+  `coreBuffer.addFirst` varrendo do mais antigo pro mais novo, o que invertia a ordem
+  relativa entre eles — corrigido varrendo `.asReversed()`, garantindo que o buffer
+  sempre toca do boletim mais antigo pro mais recente. `saveCoreBufferManifest()`
+  também passou a persistir o buffer da rádio ativa (Nível 2), não só o genérico (Nível
+  1) — antes, matar o processo (reinstalar o app, Android liberando memória) perdia
+  qualquer boletim já promovido pro buffer da rádio, mesmo com o núcleo genérico
+  sobrevivendo normalmente.
+- **Decisão — sincronizar biblioteca pega álbum novo sem reiniciar o aparelho:**
+  `MusicLibraryRepository.loadSongs()` só consultava o índice que o MediaStore já tinha
+  — copiar arquivo por fora do app (USB, gerenciador de arquivos) nunca disparava o
+  scanner sozinho no Android 11+. Confirmado testando via `adb` antes de mexer no código:
+  `scan_volume` (mesmo método que o boot usa, alcançado passando a string crua pro
+  `ContentResolver.call()` público — o campo `MediaStore.SCAN_VOLUME_CALL` é `@hide`) só
+  insere uma linha "esqueleto" por arquivo novo, com `DURATION`/`IS_MUSIC` nulos
+  indefinidamente — não extrai metadado sozinho. `MediaScannerConnection.scanFile()` por
+  caminho é quem faz a extração de verdade. `loadSongs()` agora dispara `scan_volume`
+  primeiro (garante que todo arquivo novo vira linha, mesmo um nunca visto), depois
+  `scanFile()` em cada linha ainda pendente antes de consultar a biblioteca de verdade.
+- **Também nessa sessão (menores):** alça "NEWS" da Home ganhou texto vertical legível
+  (o `rotate()` sozinho cortava a palavra porque o layout media o texto antes de
+  rotacionar) e desceu pra perto da navbar inferior; bolinhas do card de boletins
+  passaram a usar verde (pronto) / vermelho piscando (escrevendo agora) em vez da mesma
+  cor pras duas; aba de Categorias parou de esconder gênero com poucas faixas
+  (`dynamicGenreRadios` tinha um mínimo de 8 músicas por categoria, pensado pra "rádio"
+  de verdade, que vazava pra Categorias sem necessidade — `allGenreRadios` agora chama
+  com `minSize = 1`); `LocalAlbum.key` parou de incluir o resumo de artistas agregados
+  (instável — mudava sozinho em álbuns tipo "WhatsApp Audio" toda vez que chegava
+  mensagem de um remetente novo, fazendo favoritar/ocultar "esquecer" silenciosamente).

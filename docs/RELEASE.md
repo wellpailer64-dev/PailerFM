@@ -77,6 +77,21 @@ POSIX (`/sdcard/...` vira `C:/Program Files/Git/sdcard/...`). Prefixar o comando
 aparelho); `adb pull`/`adb push` com destino **local** ainda precisam de path estilo
 Windows (`C:\Users\...`), não POSIX.
 
+## Cópia de distribuição (dist/PailerFM.apk)
+
+`dist/PailerFM.apk` é a cópia "pronta pra compartilhar" do app, fora do fluxo de teste
+via ADB — mesmo binário de `app/build/outputs/apk/release/app-release.apk`, só copiado
+pra um nome/lugar estável (o `build/` é apagado a cada `gradle clean` ou build limpa).
+Fica fora do git (`.gitignore`, mesmo motivo dos zips grandes em `voice-models/`) —
+binário grande, sem sentido versionar.
+
+Não é atualizada automaticamente pelo build — depois de gerar um `app-release.apk` novo
+que valeu a pena distribuir, copiar por cima:
+
+```powershell
+copy app\build\outputs\apk\release\app-release.apk dist\PailerFM.apk
+```
+
 ## keystore.properties
 
 Existe mas fica fora do git (`.gitignore`) e não é usado pela build release hoje (ver
