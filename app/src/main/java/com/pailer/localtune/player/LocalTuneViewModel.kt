@@ -267,6 +267,15 @@ data class RadioBulletinBufferUiState(
     // fixFallbackBulletins()/scheduleFallbackAutoFix().
     val fallbackSlots: Set<Int> = emptySet(),
     val hasFallback: Boolean = false,
+    // Posicoes cujo roteiro E voz vieram 100% do Gemini (scriptFromGemini && voiceFromGemini em
+    // PreparedBulletin/PreparedNewsCore) - pintadas de verde; qualquer outro caso pronto
+    // (fallback a parte) fica azul, INCLUSIVE quando nenhum recurso Gemini esta ligado (pedido do
+    // usuario 10/09/2026: "bolinha verde pra 100% Gemini, azul pra parcial com voz local" tomado
+    // ao pe da letra - azul e o estado padrao/normal agora, verde e a excecao que so acende
+    // quando os dois pedacos vieram da nuvem). fallbackSlots sempre vence sobre isso na UI
+    // (RadioBulletinBufferStatusCard) - um boletim so entra em fallback quando Gemini E redator
+    // local falharam os dois, entao fallback e sempre pior que "so nao usou Gemini".
+    val fullGeminiSlots: Set<Int> = emptySet(),
 )
 
 data class RadioVoiceUiState(
@@ -300,10 +309,17 @@ private data class LocalVoiceSynthesisResult(
 // nucleo pro coreBuffer em vez de descartar, quando o boletim nunca chegou a tocar (usuario saiu
 // da radio ou trocou antes) - o boletim so e "gasto" de verdade quando toca (removido via
 // speakNextNewsBreak), nunca so por sair da tela/trocar de radio.
+// scriptFromGemini/voiceFromGemini (10/09/2026, pedido do usuario: "bolinha verde pra 100%
+// Gemini, azul pra parcial com voz local") - alimentam o calculo de qualidade em
+// syncBulletinBufferState/RadioBulletinBufferStatusCard. Default false (nao true) e proposital:
+// um manifest antigo (salvo antes desses campos existirem, ver loadCoreBufferManifest) volta sem
+// essa informacao, e "nao sei" deve cair pra azul/pior, nunca fingir verde sem ter certeza.
 private data class PreparedBulletin(
     val script: RadioScript,
     val file: File?,
     val sourceCore: PreparedNewsCore? = null,
+    val scriptFromGemini: Boolean = false,
+    val voiceFromGemini: Boolean = false,
 )
 
 // Um "nucleo" pre-aquecido (ver coreBuffer/prewarmCoreBuffer, pedido do usuario 03/09/2026:
@@ -316,7 +332,20 @@ private data class PreparedBulletin(
 private data class PreparedNewsCore(
     val script: RadioScript,
     val coreFile: File?,
+    val scriptFromGemini: Boolean = false,
+    val voiceFromGemini: Boolean = false,
+    // Marca que ja tentamos promover esse nucleo de azul (voz local) pra verde (voz Gemini) uma
+    // vez (ver tryUpgradeCoreVoiceToGemini) - nunca reatentar depois disso, sucesso ou falha,
+    // senao cada refillBulletinBuffer/prewarmCoreBuffer bateria na API de novo pro MESMO item
+    // parado no buffer, gastando cota do dia a toa (pedido do usuario: "se falhar tudo bem,
+    // mantem o azul" - implica UMA tentativa, nao insistir).
+    val voiceUpgradeAttempted: Boolean = false,
 )
+
+// Retorno de synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely - o `File?` sozinho ja existia,
+// so nao dizia QUAL motor produziu o audio (Gemini Flash TTS vs motor local), informacao que
+// PreparedBulletin/PreparedNewsCore precisam guardar pra bolinha verde/azul da UI.
+private data class VoiceSynthesisOutcome(val file: File?, val fromGemini: Boolean)
 
 class LocalTuneViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = MusicLibraryRepository(application)
@@ -955,7 +984,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 ?: BulletinTtsProvider.CURRENT,
             ttsModel = radioPrefs.getString(KEY_RADIO_BULLETIN_TTS_MODEL, null)
                 ?.let { saved -> runCatching { GeminiTtsModel.valueOf(saved) }.getOrNull() }
-                ?: GeminiTtsModel.GEMINI_3_1_FLASH,
+                ?: GeminiTtsModel.GEMINI_2_5_FLASH,
         )
         val status = bulletinRepository.localWriterStatus()
         val geminiKeySettings = bulletinRepository.geminiSettings()
@@ -2386,10 +2415,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         val core = coreBuffer.removeFirstOrNull()
                         val script: RadioScript
                         val file: File?
+                        val scriptFromGemini: Boolean
+                        val voiceFromGemini: Boolean
                         if (core != null) {
                             Log.d(TAG_RADIO_VOICE, "boletim: usando nucleo pre-aquecido (restam ${coreBuffer.size} no nucleo)")
                             script = core.script
                             file = core.coreFile
+                            scriptFromGemini = core.scriptFromGemini
+                            voiceFromGemini = core.voiceFromGemini
                             // Regrava o manifest agora que o item saiu do coreBuffer (ainda
                             // protegido de limpeza via sourceCore, ver saveCoreBufferManifest).
                             saveCoreBufferManifest()
@@ -2405,6 +2438,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                                 TAG_RADIO_VOICE,
                                 "boletim: preparando do zero (nucleo vazio) index=$index posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
                             )
+                            var usedCloudWriter = false
                             val enhanced = llmGenerationMutex.withLock {
                                 bulletinRepository.enhanceScript(
                                     baseScript, settings, radioName,
@@ -2412,10 +2446,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                                     onProgressPercent = { percent ->
                                         syncBulletinBufferState(statusMessage = radioBulletinBufferState.value.statusMessage, progressPercent = percent)
                                     },
+                                    onWriterUsed = { usedCloudWriter = it },
                                 )
                             }
                             script = enhanced.withPhilosophicalCloser()
-                            file = if (radioVoiceState.value.isEnabled) {
+                            scriptFromGemini = usedCloudWriter
+                            val voiceOutcome = if (radioVoiceState.value.isEnabled) {
                                 syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
                                 voiceSynthesisMutex.withLock {
                                     synthesizeLocalVoiceSafely(
@@ -2427,6 +2463,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             } else {
                                 null
                             }
+                            file = voiceOutcome?.file
+                            voiceFromGemini = voiceOutcome?.fromGemini ?: false
                         }
                         if (!radioNewsEnabled || activeRadioName != radioName) {
                             file?.delete()
@@ -2435,7 +2473,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         if (file == null) {
                             Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio; buffer guarda so o roteiro")
                         }
-                        bulletinBuffer.addLast(PreparedBulletin(script, file, sourceCore = core))
+                        bulletinBuffer.addLast(
+                            PreparedBulletin(script, file, sourceCore = core, scriptFromGemini = scriptFromGemini, voiceFromGemini = voiceFromGemini),
+                        )
                         // Persiste AGORA que o item esta de verdade no bulletinBuffer (Nivel 2) -
                         // sem isso, um item promovido pra ca so sobrevivia a um kill de processo
                         // se ainda estivesse em coreBuffer no ultimo save (ver saveCoreBufferManifest,
@@ -2558,7 +2598,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         // musica incluso - refillBulletinBuffer nao precisa mais de nenhum
                         // encaixe/geracao extra por radio.
                         val closed = enhanced.withPhilosophicalCloser()
-                        val coreFile = if (radioVoiceState.value.isEnabled) {
+                        val coreVoiceOutcome = if (radioVoiceState.value.isEnabled) {
                             syncCoreBufferStatus("Sintetizando núcleo do boletim...")
                             voiceSynthesisMutex.withLock {
                                 synthesizeCoreVoiceSafely(
@@ -2570,7 +2610,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         } else {
                             null
                         }
-                        coreBuffer.addLast(PreparedNewsCore(closed, coreFile))
+                        val coreFile = coreVoiceOutcome?.file
+                        coreBuffer.addLast(
+                            PreparedNewsCore(
+                                closed, coreFile,
+                                scriptFromGemini = usedCloudWriter,
+                                voiceFromGemini = coreVoiceOutcome?.fromGemini ?: false,
+                            ),
+                        )
                         saveCoreBufferManifest()
                         if (closed.source == RadioScriptSource.Fallback) scheduleFallbackAutoFix()
                         Log.d(TAG_RADIO_VOICE, "nucleo: buffer agora com ${coreBuffer.size}/$BULLETIN_BUFFER_TARGET (core=${coreFile != null}, falas=${closed.lines.size})")
@@ -2772,6 +2819,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         } else {
             coreBuffer.map { it.script.source }
         }
+        // Mesma lista/ordem de activeSources acima (Nivel 2 se tiver algo, senao Nivel 1) - os
+        // indices precisam bater com fallbackSlots pra RadioBulletinBufferStatusCard decidir a
+        // cor certa por bolinha (fallback vence sobre isso, ver fullGeminiSlots).
+        val activeFullGemini = if (bulletinBuffer.isNotEmpty()) {
+            bulletinBuffer.map { it.scriptFromGemini && it.voiceFromGemini }
+        } else {
+            coreBuffer.map { it.scriptFromGemini && it.voiceFromGemini }
+        }
         radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
             // Sem radio tocando o Nivel 2 (bulletinBuffer) nunca enche - cai pro Nivel 1
             // (coreBuffer) pras bolinhas refletirem o preparo automatico de verdade, em vez de
@@ -2790,6 +2845,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             fallbackSlots = activeSources.withIndex().filter { (_, source) -> source == RadioScriptSource.Fallback }
                 .map { (index, _) -> index }.toSet(),
             hasFallback = activeSources.any { it == RadioScriptSource.Fallback },
+            fullGeminiSlots = activeFullGemini.withIndex().filter { (_, isFullGemini) -> isFullGemini }
+                .map { (index, _) -> index }.toSet(),
         )
     }
 
@@ -3255,8 +3312,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         if (settings.ttsProvider != BulletinTtsProvider.GEMINI_FLASH) return null
         return runCatching {
             withTimeoutOrNull(timeoutMs) {
+                // index/total nao e mais progresso POR FALA (10/09/2026: virou 1 chamada
+                // multi-speaker pro boletim inteiro, ver GeminiFlashTtsEngine.synthesize) - so
+                // dispara com (0, total) antes de mandar a requisicao e (total, total) quando ela
+                // volta, entao a mensagem fica generica em vez de "fala X de Y".
                 geminiFlashTtsEngine.synthesize(script, settings.ttsModel, persistent) { index, total ->
-                    onProgress("Sintetizando vozes (Gemini): fala $index de $total...")
+                    val message = if (index >= total) "Sintetizando vozes (Gemini): finalizando..." else "Sintetizando vozes (Gemini): gerando áudio do boletim..."
+                    onProgress(message)
                     if (total > 0) onProgressPercent(index * 100 / total)
                 }
             }
@@ -3270,9 +3332,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         timeoutMs: Long = LOCAL_VOICE_TIMEOUT_MS,
         onProgress: (String) -> Unit = {},
         onProgressPercent: (Int) -> Unit = {},
-    ): File? {
-        trySynthesizeWithGeminiFlash(script, persistent = false, timeoutMs, onProgress, onProgressPercent)?.let { return it }
-        return requestLocalVoiceSynthesis(script, timeoutMs, onProgress, onProgressPercent)?.file
+    ): VoiceSynthesisOutcome {
+        trySynthesizeWithGeminiFlash(script, persistent = false, timeoutMs, onProgress, onProgressPercent)
+            ?.let { return VoiceSynthesisOutcome(it, fromGemini = true) }
+        val file = requestLocalVoiceSynthesis(script, timeoutMs, onProgress, onProgressPercent)?.file
+        return VoiceSynthesisOutcome(file, fromGemini = false)
     }
 
     private suspend fun requestLocalVoiceSynthesis(
@@ -3293,11 +3357,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         timeoutMs: Long = LOCAL_VOICE_TIMEOUT_MS,
         onProgress: (String) -> Unit = {},
         onProgressPercent: (Int) -> Unit = {},
-    ): File? {
-        trySynthesizeWithGeminiFlash(script, persistent = true, timeoutMs, onProgress, onProgressPercent)?.let { return it }
-        return requestVoiceSynthesis(timeoutMs, "core lines=${script.lines.size}", onProgress, onProgressPercent) { context, receiver, requestId ->
+    ): VoiceSynthesisOutcome {
+        trySynthesizeWithGeminiFlash(script, persistent = true, timeoutMs, onProgress, onProgressPercent)
+            ?.let { return VoiceSynthesisOutcome(it, fromGemini = true) }
+        val file = requestVoiceSynthesis(timeoutMs, "core lines=${script.lines.size}", onProgress, onProgressPercent) { context, receiver, requestId ->
             RadioVoiceSynthesisService.persistentIntent(context, script, receiver, requestId)
         }?.file
+        return VoiceSynthesisOutcome(file, fromGemini = false)
     }
 
     // Base compartilhada por synthesizeLocalVoiceSafely - so muda o Intent que dispara o
@@ -3648,9 +3714,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val NEWS_BREAK_LEAD_MS = 5_000L
         const val NEWS_BREAK_FADE_MS = 2_500L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
-        // 2 falas curtas x ate 2 tentativas x GEMINI_TTS_TIMEOUT_MS (60s, GeminiFlashTtsEngine) -
-        // folga generosa pro pior caso (2min por fala), sem travar o botao de teste indefinidamente.
-        const val GEMINI_TTS_TEST_TIMEOUT_MS = 300_000L
+        // 1 chamada multi-speaker (10/09/2026: nao e mais por fala, ver
+        // GeminiFlashTtsEngine.synthesize) x ate GeminiApiKeySettings.MAX_KEYS (5) tentativas x
+        // GEMINI_TTS_TIMEOUT_MS (120s, GeminiFlashTtsEngine) - folga generosa pro pior caso (todas
+        // as 5 chaves demorando o maximo antes de falhar), sem travar o botao de teste indefinidamente.
+        const val GEMINI_TTS_TEST_TIMEOUT_MS = 600_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"

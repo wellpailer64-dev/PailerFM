@@ -143,21 +143,32 @@ class NewsBulletinRepository(private val context: Context) {
     private companion object {
         const val NETWORK_TIMEOUT_MS = 4500
         const val ITEMS_PER_FEED = 4
-        // 2 por feed (8 feeds abaixo) - subiu de 8 pra 16 junto da diversificacao de feeds
-        // (pedido do usuario 04/09/2026: quer fatos historicos/bizarros/cientificos/curiosidades
-        // de mundo e Brasil, nao so noticia do dia) pra cada categoria nova garantir espaco no
-        // round-robin de interleave() em vez de ser cortada por take() antes da 2a rodada. Ver
-        // ADR-021.
-        const val NEWS_LIMIT = 16
+        // 2 por feed - sobe junto com o numero de FEEDS abaixo (11 feeds x 2 = 22) pra cada
+        // categoria continuar garantindo espaco nas 2 primeiras rodadas do round-robin de
+        // interleave() em vez de so as primeiras da lista conseguirem uma 2a materia (pedido do
+        // usuario 04/09/2026, historico; reafirmado 10/09/2026 ao pedir mais variedade - ver
+        // ADR-021).
+        const val NEWS_LIMIT = 22
         const val SUMMARY_MAX_CHARS = 220
 
-        // 8 feeds cobrindo os temas pedidos (04/09/2026): historia/bizarro/cientifico/mundo/
-        // Brasil, alem do que ja existia (mundo, ciencia-saude, tecnologia). Generico
-        // "super.abril.com.br/feed/" (todas as editorias misturadas) foi trocado pelas 2
-        // editorias especificas de Super abaixo - historia e mundo-estranho, mais precisas que o
-        // feed geral e verificadas manualmente (URL retorna RSS valido com itens reais, nao pagina
-        // de erro/SPA). "g1/planeta-bizarro" e "g1/brasil" tambem verificados manualmente -
-        // "g1/curiosidades" existe mas devolve canal vazio (0 itens), por isso nao entrou.
+        // 11 feeds (10/09/2026, pedido do usuario: "pelo menos 10 variedades... tirando futebol,
+        // mas curiosidades, games, tecnologia, historia, geopolitica, musica"). Os 8 originais
+        // (04/09/2026: historia/bizarro/cientifico/mundo/Brasil/tecnologia) ganharam 3 categorias
+        // novas - games, geopolitica, musica - todas testadas manualmente via curl antes de
+        // entrar (mesmo criterio ja usado nos feeds antigos: HTTP 200 + <item>/<entry> reais no
+        // corpo, nao pagina de erro/SPA vazia):
+        // - Games: Canaltech Games (canaltech.com.br/rss/games/) - 50 itens reais confirmados.
+        //   Olhar Digital ja e tecnologia geral, Canaltech cobre o angulo de jogos que faltava.
+        // - Geopolitica: Veja Mundo (veja.abril.com.br/mundo/feed/) - 20 itens reais confirmados,
+        //   cobertura internacional/geopolitica solida. Testado tambem DW Brasil (erro 500),
+        //   CNN Brasil /mundo/feed (404) e Poder360 /mundo/feed (canal vazio, 0 itens) - nenhum
+        //   dos 3 entrou.
+        // - Musica: Rolling Stone Brasil (rollingstone.com.br/feed/) - 10 itens reais confirmados,
+        //   editorial 100% musica/cultura pop (nao mistura com tecnologia como o feed de musica
+        //   do Canaltech, que tambem existe e funciona mas foi preterido por redundancia).
+        // NENHUM feed de futebol/esportes entrou de proposito (pedido explicito do usuario) - "g1
+        // Brasil" e noticia geral, nao esportiva (G1 mantem esporte/futebol num site separado,
+        // ge.globo.com, fora desta lista).
         val FEEDS = listOf(
             NewsFeed("g1 Mundo", "https://g1.globo.com/rss/g1/mundo"),
             NewsFeed("g1 Ciencia e saude", "https://g1.globo.com/rss/g1/ciencia-e-saude"),
@@ -167,6 +178,9 @@ class NewsBulletinRepository(private val context: Context) {
             NewsFeed("Super Mundo Estranho", "https://super.abril.com.br/mundo-estranho/feed/"),
             NewsFeed("Olhar Digital", "https://olhardigital.com.br/feed/"),
             NewsFeed("BBC Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml"),
+            NewsFeed("Canaltech Games", "https://canaltech.com.br/rss/games/"),
+            NewsFeed("Veja Mundo", "https://veja.abril.com.br/mundo/feed/"),
+            NewsFeed("Rolling Stone Brasil", "https://rollingstone.com.br/feed/"),
         )
     }
 }

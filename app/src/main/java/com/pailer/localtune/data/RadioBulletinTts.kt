@@ -12,8 +12,10 @@ enum class BulletinTtsProvider {
     GEMINI_FLASH,
 }
 
-// gemini-3.1-flash-tts-preview e o padrao pra quem liga essa opcao agora (pedido do usuario);
-// gemini-2.5-flash-preview-tts fica como alternativa pra teste/fallback entre modelos Gemini.
+// gemini-2.5-flash-preview-tts e o padrao pra quem liga essa opcao agora (pedido do usuario
+// 10/09/2026: "nao quero usar o 3.1 porque ele e pesado... o 2.5 esta de bom tamanho", validado
+// ao vivo via multi-speaker TTS - ver GeminiFlashTtsEngine); gemini-3.1-flash-tts-preview fica
+// como alternativa selecionavel pra quem quiser testar.
 enum class GeminiTtsModel(val modelId: String, val label: String) {
     GEMINI_3_1_FLASH("gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash TTS"),
     GEMINI_2_5_FLASH("gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash TTS"),

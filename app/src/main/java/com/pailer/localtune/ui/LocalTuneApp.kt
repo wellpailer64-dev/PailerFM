@@ -1949,11 +1949,16 @@ private fun RadioBulletinBufferStatusCard(
     // syncBulletinBufferState) em vez do bate-bola de verdade escrito por LLM. Pedido do usuario
     // (05/09/2026): "deixamos a bolinha na cor amarela" pra identificar de relance.
     val fallbackColor = Color(0xFFFFC107)
-    // Verde pra bolinha pronta / vermelho piscando pra bolinha em preparo (pedido do usuario
-    // 10/09/2026) - antes as duas usavam a mesma cor primary (vermelho do tema), so a pulsacao
-    // de alpha distinguia uma da outra; agora a cor sozinha ja diz "pronto" vs "escrevendo agora"
-    // de relance, sem precisar reparar se esta piscando.
-    val readyColor = Color(0xFF4CAF50)
+    // Verde SO quando script E voz vieram 100% do Gemini (fullGeminiSlots, ver
+    // LocalTuneViewModel.syncBulletinBufferState) - pedido do usuario 10/09/2026: "bolinha verde
+    // pra 100% Gemini, azul pra parcial com voz local". Distingue tambem de vermelho piscando
+    // (bolinha em preparo) - antes as duas usavam a mesma cor primary, so a pulsacao de alpha
+    // diferenciava; agora a cor sozinha ja diz "pronto" vs "escrevendo agora" de relance.
+    val geminiColor = Color(0xFF4CAF50)
+    // Azul e o estado NORMAL de "pronto" agora (fallback a parte) - cobre desde quem nunca ligou
+    // nenhum recurso Gemini ate quem so conseguiu parte (script OU voz, nao os dois) na nuvem.
+    // So fica verde quando os dois pedacos vieram do Gemini (ver geminiColor acima).
+    val partialColor = Color(0xFF2196F3)
     // Pulso lento (1400ms, mais devagar que o "radioLivePulse"/"playerLivePulse" de 820ms usados
     // em "ao vivo" pela UI) na bolinha que esta sendo escrita agora - pedido do usuario
     // (03/09/2026): quer ver visualmente qual boletim esta em andamento, piscando devagar.
@@ -2019,6 +2024,7 @@ private fun RadioBulletinBufferStatusCard(
                     val preparing = !filled && slot == bulletinBuffer.readyCount && bulletinBuffer.isPreparing
                     val clickable = filled && !bulletinBuffer.isPlayingPreview
                     val isFallback = filled && slot in bulletinBuffer.fallbackSlots
+                    val isFullGemini = filled && slot in bulletinBuffer.fullGeminiSlots
                     Box(
                         modifier = Modifier
                             .size(14.dp)
@@ -2028,7 +2034,8 @@ private fun RadioBulletinBufferStatusCard(
                             .background(
                                 when {
                                     isFallback -> fallbackColor
-                                    filled -> readyColor
+                                    isFullGemini -> geminiColor
+                                    filled -> partialColor
                                     preparing -> MaterialTheme.colorScheme.primary
                                     else -> Color.White.copy(alpha = 0.14f)
                                 },

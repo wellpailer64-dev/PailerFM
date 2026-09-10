@@ -38,7 +38,10 @@ data class RadioBulletinSettings(
     // pedido do usuario), ver BulletinTtsProvider/GeminiTtsModel em RadioBulletinTts.kt. Default
     // CURRENT preserva o comportamento de sempre pra quem ja tem o app instalado.
     val ttsProvider: BulletinTtsProvider = BulletinTtsProvider.CURRENT,
-    val ttsModel: GeminiTtsModel = GeminiTtsModel.GEMINI_3_1_FLASH,
+    // Default GEMINI_2_5_FLASH (nao o 3.1) - pedido do usuario 10/09/2026: "nao quero usar o 3.1
+    // porque ele e pesado", validado ao vivo com o botao "Testar vozes" (1 chamada multi-speaker,
+    // sem retry, ~5s pra 2 falas).
+    val ttsModel: GeminiTtsModel = GeminiTtsModel.GEMINI_2_5_FLASH,
 )
 
 data class NewsStory(

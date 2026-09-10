@@ -5,7 +5,6 @@ import android.util.Base64
 import android.util.Log
 import com.pailer.localtune.data.GeminiApiKeySettings
 import com.pailer.localtune.data.GeminiTtsModel
-import com.pailer.localtune.data.GeminiTtsVoiceConfig
 import com.pailer.localtune.data.GeminiTtsVoices
 import com.pailer.localtune.data.RadioScript
 import com.pailer.localtune.data.RadioSpeaker
@@ -15,12 +14,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import kotlin.math.roundToInt
 
 // Motor de sintese EXPERIMENTAL do boletim via Gemini Flash TTS (pedido do usuario 10/09/2026) -
 // coexiste com LocalRadioVoiceEngine (motor de sempre), nunca o substitui. So e chamado quando
@@ -41,9 +38,12 @@ import kotlin.math.roundToInt
 class GeminiFlashTtsEngine(private val context: Context) {
     private val geminiSettings = GeminiApiKeySettings(context)
 
-    // onLineDone(index 1-based, total) - mesmo formato de callback que LocalRadioVoiceEngine usa,
-    // pra LocalTuneViewModel poder reaproveitar a mesma mensagem de progresso "fala X de Y" ja
-    // mostrada na UI (ver RadioBulletinBufferStatusCard).
+    // onLineDone(index, total) - chamado com (0, total) antes de disparar a chamada e (total,
+    // total) quando ela termina (10/09/2026: reduzido de 1 chamada POR FALA pra 1 chamada pro
+    // boletim INTEIRO via multi-speaker TTS, pedido do usuario - "6 chamadas e chamada demais,
+    // deve gastar rapido a cota"). Nao ha mais progresso granular por fala real (so 1 requisicao
+    // de rede), mas o callback continua com essa forma pra LocalTuneViewModel reaproveitar a
+    // mesma barra de progresso 0-100% ja existente (ver trySynthesizeWithGeminiFlash).
     suspend fun synthesize(
         script: RadioScript,
         model: GeminiTtsModel,
@@ -55,27 +55,42 @@ class GeminiFlashTtsEngine(private val context: Context) {
             Log.w(TAG, "GeminiTTS: sem chave de API configurada, pulando")
             return@withContext null
         }
-        Log.d(TAG, "GeminiTTS: model=${model.modelId}")
-        val total = script.lines.size
-        var sampleRate = DEFAULT_SAMPLE_RATE
-        val chunks = script.lines.mapIndexed { index, line ->
-            val speakerLabel = if (line.speaker == RadioSpeaker.Female) "Fran" else "Nico"
-            val voiceConfig = if (line.speaker == RadioSpeaker.Female) GeminiTtsVoices.FRAN else GeminiTtsVoices.NICO
-            Log.d(TAG, "GeminiTTS: generating $speakerLabel segment ${index + 1}")
-            val (pcm, rate) = generateLineWithRetry(apiKeys, model, voiceConfig, line.text)
-            sampleRate = rate
-            onLineDone(index + 1, total)
-            pcm
+        if (script.lines.isEmpty()) {
+            Log.w(TAG, "GeminiTTS: roteiro sem falas, pulando")
+            return@withContext null
         }
-        if (chunks.isEmpty() || chunks.all { it.isEmpty() }) {
+        Log.d(TAG, "GeminiTTS: model=${model.modelId} lines=${script.lines.size} (1 chamada multi-speaker)")
+        val total = script.lines.size
+        onLineDone(0, total)
+        val transcript = buildTranscript(script)
+        val (pcm, sampleRate) = generateScriptWithRetry(apiKeys, model, transcript)
+        onLineDone(total, total)
+        if (pcm.isEmpty()) {
             Log.w(TAG, "GeminiTTS: nenhum audio gerado")
             return@withContext null
         }
-        val merged = mergeWithGaps(chunks, sampleRate)
         val outFile = outputFile(persistent)
-        writeWav(outFile, merged, sampleRate)
+        writeWav(outFile, pcm, sampleRate)
         Log.d(TAG, "GeminiTTS: generation completed bytes=${outFile.length()} sampleRate=$sampleRate")
         outFile
+    }
+
+    // Um unico texto com as duas falas intercaladas, rotuladas "Fran:"/"Nico:" (formato exigido
+    // pela API pra multi-speaker TTS: o rotulo de cada linha do roteiro precisa bater com o
+    // "speaker" declarado em speakerVoiceConfigs, ver callGeminiTts). As instrucoes de
+    // interpretacao vao UMA vez cada no topo (nao mais repetidas por linha como no motor por-fala
+    // antigo) - "Roteiro:" separa claramente instrucao de fala real, pra o modelo nao tentar ler
+    // a propria instrucao em voz alta.
+    private fun buildTranscript(script: RadioScript): String = buildString {
+        appendLine("TTS da conversa de radio brasileira a seguir entre os apresentadores Fran e Nico.")
+        appendLine("Instrucoes de interpretacao de Fran: ${GeminiTtsVoices.FRAN.stylePrompt}")
+        appendLine("Instrucoes de interpretacao de Nico: ${GeminiTtsVoices.NICO.stylePrompt}")
+        appendLine()
+        appendLine("Roteiro:")
+        script.lines.forEach { line ->
+            val speakerLabel = if (line.speaker == RadioSpeaker.Female) "Fran" else "Nico"
+            appendLine("$speakerLabel: ${line.text}")
+        }
     }
 
     private fun outputFile(persistent: Boolean): File =
@@ -89,20 +104,18 @@ class GeminiFlashTtsEngine(private val context: Context) {
     // Testa cada chave configurada EM ORDEM, 1 tentativa por chave (pedido do usuario 10/09/2026:
     // ate 5 chaves, "se a primeira falhar ele testa a segunda... e assim vai") - mesma politica
     // de RemoteGeminiRadioScriptWriter.generateWithRetry (RadioBulletin.kt), mesmo motivo: um
-    // HTTP 429 de cota (confirmado em campo) nao se resolve batendo de novo na MESMA chave.
-    // Qualquer fala que esgote todas as chaves derruba o synthesize() inteiro (excecao sobe, ver
-    // acima) - nao mistura motores dentro do MESMO boletim, o fallback e sempre pro boletim
-    // inteiro no motor local.
-    private suspend fun generateLineWithRetry(
+    // HTTP 429 de cota (confirmado em campo) nao se resolve batendo de novo na MESMA chave. Agora
+    // e 1 chamada por chave pro BOLETIM INTEIRO (nao mais por fala) - esgotar todas as chaves
+    // derruba o synthesize() inteiro (excecao sobe, ver acima) e cai pro motor local, como antes.
+    private suspend fun generateScriptWithRetry(
         apiKeys: List<String>,
         model: GeminiTtsModel,
-        voiceConfig: GeminiTtsVoiceConfig,
-        text: String,
+        transcript: String,
     ): Pair<ByteArray, Int> {
         var lastError: Throwable? = null
         apiKeys.forEachIndexed { index, apiKey ->
             val result = runCatching {
-                withTimeoutOrNull(GEMINI_TTS_TIMEOUT_MS) { callGeminiTts(apiKey, model, voiceConfig, text) }
+                withTimeoutOrNull(GEMINI_TTS_TIMEOUT_MS) { callGeminiTts(apiKey, model, transcript) }
                     ?: error("Gemini TTS demorou demais pra responder")
             }
             result.onSuccess { return it }
@@ -115,16 +128,21 @@ class GeminiFlashTtsEngine(private val context: Context) {
     }
 
     // HttpURLConnection puro, mesmo estilo de RemoteGeminiRadioScriptWriter.callGemini
-    // (RadioBulletin.kt) - sem OkHttp/Retrofit no projeto. Formato da API verificado na doc
-    // oficial (ai.google.dev/gemini-api/docs/generate-content/speech-generation): estilo/
-    // interpretacao vai embutido como prefixo do proprio texto (nao ha campo separado pra isso),
-    // resposta traz audio PCM16 mono cru (sem header WAV) em candidates[0].content.parts[0].
-    // inlineData, base64, com o sample rate declarado em mimeType (ex.: "audio/L16;rate=24000").
+    // (RadioBulletin.kt) - sem OkHttp/Retrofit no projeto. speechConfig.multiSpeakerVoiceConfig
+    // (10/09/2026, ate 2 falantes - documentado em ai.google.dev/gemini-api/docs/speech-generation
+    // na secao "Multi-speaker text-to-speech") troca as 1 chamada/fala por 1 chamada pro boletim
+    // inteiro: cada "speaker" em speakerVoiceConfigs precisa bater com o rotulo usado no texto
+    // (buildTranscript usa exatamente "Fran"/"Nico"). NAO CONFIRMADO ainda em teste real neste
+    // device/conta pra gemini-3.1-flash-tts-preview (so o modo single-speaker foi validado ao vivo
+    // ate agora) - se vier 400 "invalid argument", e sinal de campo renomeado entre versoes do
+    // modelo (mesmo caso ja visto com thinkingConfig no redator, RadioBulletin.kt); a mensagem
+    // completa da API fica no erro pra diagnostico, nao so um generico. Resposta traz audio PCM16
+    // mono cru (sem header WAV) em candidates[0].content.parts[0].inlineData, base64, sample rate
+    // declarado em mimeType (ex.: "audio/L16;rate=24000") - mesmo formato do modo single-speaker.
     private fun callGeminiTts(
         apiKey: String,
         model: GeminiTtsModel,
-        voiceConfig: GeminiTtsVoiceConfig,
-        text: String,
+        transcript: String,
     ): Pair<ByteArray, Int> {
         val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/${model.modelId}:generateContent?key=$apiKey"
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -134,11 +152,10 @@ class GeminiFlashTtsEngine(private val context: Context) {
             readTimeout = GEMINI_TTS_TIMEOUT_MS.toInt()
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
         }
-        val styledText = "${voiceConfig.stylePrompt}: $text"
         val body = JSONObject().apply {
             put(
                 "contents",
-                JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", styledText)))),
+                JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", transcript)))),
             )
             put(
                 "generationConfig",
@@ -147,10 +164,12 @@ class GeminiFlashTtsEngine(private val context: Context) {
                     put(
                         "speechConfig",
                         JSONObject().put(
-                            "voiceConfig",
+                            "multiSpeakerVoiceConfig",
                             JSONObject().put(
-                                "prebuiltVoiceConfig",
-                                JSONObject().put("voiceName", voiceConfig.voiceName),
+                                "speakerVoiceConfigs",
+                                JSONArray()
+                                    .put(speakerVoiceConfig("Fran", GeminiTtsVoices.FRAN.voiceName))
+                                    .put(speakerVoiceConfig("Nico", GeminiTtsVoices.NICO.voiceName)),
                             ),
                         ),
                     )
@@ -183,17 +202,11 @@ class GeminiFlashTtsEngine(private val context: Context) {
         return pcm to sampleRate
     }
 
-    // Mesmo espirito do gap de 0,18s entre falas de personagens diferentes em LocalRadioVoiceEngine.
-    // synthesizeLinesToSamples - silencio puro (zeros), 16-bit mono, mesmo sampleRate do audio.
-    private fun mergeWithGaps(chunks: List<ByteArray>, sampleRate: Int): ByteArray {
-        val gapBytes = ByteArray((sampleRate * LINE_GAP_S).roundToInt() * 2)
-        val output = ByteArrayOutputStream()
-        chunks.forEachIndexed { index, chunk ->
-            output.write(chunk)
-            if (index != chunks.lastIndex) output.write(gapBytes)
-        }
-        return output.toByteArray()
-    }
+    // speaker precisa bater com o rotulo usado em buildTranscript ("Fran:"/"Nico:").
+    private fun speakerVoiceConfig(speaker: String, voiceName: String): JSONObject =
+        JSONObject()
+            .put("speaker", speaker)
+            .put("voiceConfig", JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", voiceName)))
 
     // Mesmo formato de header (RIFF/fmt/data, PCM16 mono) que LocalRadioVoiceEngine.writeWav()
     // escreve - so recebe bytes PCM ja prontos em vez de FloatArray (o Gemini ja devolve 16-bit),
@@ -236,15 +249,19 @@ class GeminiFlashTtsEngine(private val context: Context) {
     private companion object {
         const val TAG = LocalRadioVoiceEngine.TAG
         const val DEFAULT_SAMPLE_RATE = 24000
-        const val LINE_GAP_S = 0.18f
-        // 10/09/2026: 20s nao bastava, testado ao vivo - os 2 attempts estouraram o timeout
-        // (log "GeminiTTS: generation failed: timeout" duas vezes seguidas) antes da API
-        // responder. Mesmo motivo ja documentado em RemoteGeminiRadioScriptWriter.GEMINI_TIMEOUT_MS
-        // (RadioBulletin.kt, 120s): modelo "preview" as vezes demora mais que o esperado. withTimeoutOrNull
+        // 10/09/2026: 20s nao bastava pra 1 fala, testado ao vivo - os 2 attempts estouraram o
+        // timeout (log "GeminiTTS: generation failed: timeout" duas vezes seguidas) antes da API
+        // responder; subiu pra 60s. Dobrado de novo pra 120s ao trocar pra 1 chamada multi-speaker
+        // pro boletim INTEIRO (mais falas = mais audio gerado no mesmo request, ver
+        // generateScriptWithRetry) - ainda NAO confirmado ao vivo se 120s basta pro pior caso
+        // multi-speaker, so extrapolado do mesmo motivo ja documentado em
+        // RemoteGeminiRadioScriptWriter.GEMINI_TIMEOUT_MS (RadioBulletin.kt, tambem 120s: modelo
+        // "preview" as vezes demora mais que o esperado). Se voltar a dar falso "timeout" em
+        // boletim real, subir de novo (mesmo padrao ja visto 2x nesse arquivo). withTimeoutOrNull
         // aqui embrulha uma chamada BLOQUEANTE (HttpURLConnection, sem suspend point no meio) -
         // nao cancela ela no meio, so descarta o resultado se ele voltar depois do prazo; por isso
         // o timeout precisa cobrir o pior caso real, nao só uma estimativa.
-        const val GEMINI_TTS_TIMEOUT_MS = 60_000L
+        const val GEMINI_TTS_TIMEOUT_MS = 120_000L
         const val GEMINI_TTS_RETRY_DELAY_MS = 1_500L
         val SAMPLE_RATE_REGEX = Regex("rate=(\\d+)")
     }
