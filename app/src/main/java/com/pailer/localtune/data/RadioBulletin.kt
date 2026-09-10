@@ -375,7 +375,8 @@ class GeminiApiKeySettings(context: Context) {
     private fun slotKey(index: Int) = "$KEY_API_KEY_PREFIX$index"
 
     companion object {
-        const val MAX_KEYS = 5
+        // 5 -> 8 (pedido do usuario 10/09/2026: "pode deixar 8 slots pra receber chave de api").
+        const val MAX_KEYS = 8
         private const val PREFS_NAME = "gemini_writer"
         private const val KEY_API_KEY_PREFIX = "api_key_"
         // Nome antigo (chave unica, antes da mudanca pra multi-chave) - so lido pela migracao no

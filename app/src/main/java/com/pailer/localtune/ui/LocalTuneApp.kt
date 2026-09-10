@@ -1609,7 +1609,7 @@ private fun RadioBulletinSettingsPanel(
             Spacer(Modifier.height(16.dp))
             // Campo de chave movido pra pagina propria (pedido do usuario 10/09/2026: "o campo de
             // chaves... tem que ser uma página a parte") - suporta ate GeminiApiKeySettings.
-            // MAX_KEYS (5) chaves testadas em cadeia, ver GeminiApiKeysSettingsPanel. Mesmo pool
+            // MAX_KEYS (8) chaves testadas em cadeia, ver GeminiApiKeysSettingsPanel. Mesmo pool
             // usado pelo redator (aqui) e pelo Gemini Flash TTS experimental (secao abaixo).
             val filledKeyCount = radioBulletins.geminiApiKeySlotsFilled.count { it }
             Surface(
@@ -1850,7 +1850,7 @@ private fun RadioBulletinSettingsPanel(
 
 // Pagina propria pras chaves de API do Gemini (pedido do usuario 10/09/2026: "o campo de
 // chaves... tem que ser uma página a parte, clicar e ir pra página de chaves") - ate
-// GeminiApiKeySettings.MAX_KEYS (5) chaves, testadas em cadeia por generateWithRetry (RadioBulletin.kt)
+// GeminiApiKeySettings.MAX_KEYS (8) chaves, testadas em cadeia por generateWithRetry (RadioBulletin.kt)
 // e GeminiFlashTtsEngine.generateLineWithRetry: se a 1a salva falhar, tenta a proxima em ordem.
 // UM pool so pro redator e pro Gemini Flash TTS experimental (mesma secao "Voz dos boletins" na
 // tela anterior). Nunca mostra a chave de volta depois de salva (mesmo padrao ja usado pro campo

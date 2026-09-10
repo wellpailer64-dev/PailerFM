@@ -219,7 +219,7 @@ data class RadioBulletinUiState(
     // true quando ha pelo menos 1 chave de API do Gemini salva localmente (GeminiApiKeySettings) -
     // pedido do usuario (03/09/2026): escrever o boletim via Gemini (nuvem, rapido) em vez do
     // redator local (Qwen3 4B no aparelho, ver ADR-020) - tambem usada pelo Gemini Flash TTS
-    // experimental. Multi-chave (10/09/2026): ate GeminiApiKeySettings.MAX_KEYS (5), testadas em
+    // experimental. Multi-chave (10/09/2026): ate GeminiApiKeySettings.MAX_KEYS (8), testadas em
     // cadeia - geminiApiKeySlotsFilled[i] diz se o slot i tem chave salva, pra pagina dedicada
     // "Chaves do Gemini" (GeminiApiKeysSettingsPanel) saber quais mostrar como "salva" vs vazias.
     val geminiConfigured: Boolean = false,
@@ -3734,10 +3734,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val NEWS_BREAK_FADE_MS = 2_500L
         const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
         // 1 chamada multi-speaker (10/09/2026: nao e mais por fala, ver
-        // GeminiFlashTtsEngine.synthesize) x ate GeminiApiKeySettings.MAX_KEYS (5) tentativas x
-        // GEMINI_TTS_TIMEOUT_MS (120s, GeminiFlashTtsEngine) - folga generosa pro pior caso (todas
-        // as 5 chaves demorando o maximo antes de falhar), sem travar o botao de teste indefinidamente.
-        const val GEMINI_TTS_TEST_TIMEOUT_MS = 600_000L
+        // GeminiFlashTtsEngine.synthesize) x ate GeminiApiKeySettings.MAX_KEYS (8, subiu de 5 no
+        // mesmo dia - pedido do usuario) tentativas x GEMINI_TTS_TIMEOUT_MS (120s,
+        // GeminiFlashTtsEngine) - sem folga extra, cobre exatamente o pior caso (todas as 8
+        // chaves demorando o maximo antes de falhar), sem travar o botao de teste indefinidamente.
+        const val GEMINI_TTS_TEST_TIMEOUT_MS = 960_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
