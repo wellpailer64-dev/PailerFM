@@ -437,6 +437,26 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val bulletinBuffer = ArrayDeque<PreparedBulletin>()
     private val llmGenerationMutex = Mutex()
     private val voiceSynthesisMutex = Mutex()
+    // Achado 11/09/2026 (terceira rodada, ao vivo - usuario: "porque o audio fica morto? é um
+    // gemini verde, não podemos matar ele prematuramente"): a limpeza de .wav orfaos em
+    // saveCoreBufferManifest() so usava um TIMER (ORPHAN_CLEANUP_GRACE_MS, 5min) pra decidir se um
+    // arquivo nao-referenciado ja pode ser lixo de verdade - um CHUTE baseado no pior caso ja visto
+    // (~90s), nao uma garantia. Com a cota do Gemini estourada, generateScriptWithRetry caminha por
+    // ate 5 chaves mortas a 120s cada (GEMINI_TTS_TIMEOUT_MS) + delays entre tentativas - pior caso
+    // passa de 10 MINUTOS, o dobro da margem. O .wav so e escrito no disco (outputFile/writeWav) no
+    // fim desse caminho inteiro, e so entao a corrotina volta pro Main e registra o item no
+    // bulletinBuffer (addLast+saveCoreBufferManifest, ver refillBulletinBuffer) - ate esse
+    // registro acontecer, o arquivo existe no disco mas NAO esta em `referenced`, e qualquer OUTRA
+    // chamada concorrente a saveCoreBufferManifest() (speakNextNewsBreak consumindo outro item,
+    // fixFallbackBulletins, o polling do init{}) podia varrer a pasta e apagar um arquivo que so
+    // "parecia" orfao por ainda nao ter tido tempo de ser registrado - nunca por ser lixo de
+    // verdade. Corrigido na raiz (nao so com timer maior, que so empurra o problema pra frente):
+    // este flag fica true do INICIO ao FIM de qualquer sintese pro buffer persistente (guarda
+    // exatamente a janela sensivel), e o sweep inteiro em saveCoreBufferManifest() e pulado
+    // enquanto ele estiver true - nao importa se a sintese leva 10s ou 20min, o arquivo em
+    // producao nunca corre risco, sem depender de nenhum numero de timeout adivinhado.
+    @Volatile
+    private var coreSynthesisInFlight = false
     // Job da correcao automatica de fallback (ver scheduleFallbackAutoFix/fixFallbackBulletins) -
     // guarda contra agendar mais de uma correcao sobreposta; roda com um pequeno delay pra dar
     // tempo de uma falha transitoria (rede, Gemini fora do ar) se resolver antes de tentar de
@@ -579,6 +599,32 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 controller?.let {
                     updatePlayerState(it)
                     checkForEarlyNewsBreak(it)
+                }
+                // Achado 11/09/2026 ao vivo: um item pode ficar "pronto" no buffer sem chance real
+                // de tocar com voz - seja porque a sintese nunca gerou arquivo (file == null,
+                // restaurado assim do manifest.json de uma sessao anterior, sem nenhum evento NESTA
+                // sessao que dispare scheduleFallbackAutoFix sozinho) ou porque o arquivo existia e
+                // sumiu depois (corrida com o sweep de orfaos em saveCoreBufferManifest). Os dois
+                // casos so eram descobertos na hora de tocar (speakNextNewsBreak), tarde demais.
+                // Este polling ja roda a cada 1.5-3s pra outras coisas; aproveita pra notar cedo.
+                //
+                // Achado 11/09/2026 (segunda rodada, ao vivo - usuario reportou "bolinhas verdes"
+                // mas TTS Android tocando mesmo assim): o caso "arquivo sumiu depois" NAO PODE
+                // esperar o FALLBACK_AUTO_FIX_DELAY_MS (45s) de scheduleFallbackAutoFix - essa folga
+                // existe pra nao martelar Gemini/local quando os dois estao de fato falhando na
+                // ESCRITA/SINTESE (throttle certo ali), mas remover uma referencia de arquivo que
+                // ja nao existe mais e so leitura de disco local, sem custo nenhum de esperar. Sem
+                // separar isso, um item "verdinho" (fullGeminiSlots) podia ficar ate 45s na frente
+                // da fila com o audio ja sumido - se o boletim seguinte da radio caisse dentro dessa
+                // janela, tocava TTS Android cru com a bolinha ainda mostrando verde na tela (ver
+                // tambem hasPlayableAudio/fullGeminiSlots em syncBulletinBufferState, que agora
+                // conferem it.file?.exists() de verdade em vez de confiar em flag congelada).
+                // purgeVanishedBulletinAudio() roda TODO ciclo (sem guard de job, e barato) pra
+                // fechar essa janela; scheduleFallbackAutoFix (throttled) fica so pro que realmente
+                // precisa tentar sintetizar de novo (file == null ou roteiro em Fallback).
+                purgeVanishedBulletinAudio()
+                if (bulletinBuffer.any { it.file == null || it.script.source == RadioScriptSource.Fallback }) {
+                    scheduleFallbackAutoFix()
                 }
                 delay(if ((controller?.mediaItemCount ?: 0) > 0) 1_500 else 3_000)
             }
@@ -2570,22 +2616,31 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                         val script = enhanced.withPhilosophicalCloser()
                         val scriptFromGemini = usedCloudWriter
-                        val voiceOutcome = if (radioVoiceState.value.isEnabled) {
-                            syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
-                            // synthesizeCoreVoiceSafely (nao synthesizeLocalVoiceSafely) de
-                            // proposito: o buffer unico e persistido em disco (saveCoreBufferManifest/
-                            // loadCoreBufferManifest, filesDir) - o audio PRECISA ir pro mesmo
-                            // filesDir persistente, senao sobrevive na memoria mas some do disco
-                            // (cacheDir efemero) no primeiro restart do processo.
-                            voiceSynthesisMutex.withLock {
-                                synthesizeCoreVoiceSafely(
-                                    script, BULLETIN_PREP_TIMEOUT_MS,
-                                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
-                                    onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
-                                )
+                        // coreSynthesisInFlight cobre TODA a janela sensivel (ver comentario na
+                        // declaracao do campo) - do inicio da sintese ate o item estar de verdade
+                        // registrado em bulletinBuffer logo abaixo. try/finally garante que ele
+                        // volta pra false mesmo se a corrotina for cancelada no meio.
+                        coreSynthesisInFlight = true
+                        val voiceOutcome = try {
+                            if (radioVoiceState.value.isEnabled) {
+                                syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
+                                // synthesizeCoreVoiceSafely (nao synthesizeLocalVoiceSafely) de
+                                // proposito: o buffer unico e persistido em disco (saveCoreBufferManifest/
+                                // loadCoreBufferManifest, filesDir) - o audio PRECISA ir pro mesmo
+                                // filesDir persistente, senao sobrevive na memoria mas some do disco
+                                // (cacheDir efemero) no primeiro restart do processo.
+                                voiceSynthesisMutex.withLock {
+                                    synthesizeCoreVoiceSafely(
+                                        script, BULLETIN_PREP_TIMEOUT_MS,
+                                        onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                        onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                    )
+                                }
+                            } else {
+                                null
                             }
-                        } else {
-                            null
+                        } finally {
+                            coreSynthesisInFlight = false
                         }
                         val file = voiceOutcome?.file
                         val voiceFromGemini = voiceOutcome?.fromGemini ?: false
@@ -2598,7 +2653,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         // perdia boletins prontos que ainda nao tinham sido salvos em disco.
                         saveCoreBufferManifest()
                         Log.d(TAG_RADIO_VOICE, "boletim: buffer agora com ${bulletinBuffer.size}/$BULLETIN_BUFFER_TARGET (audio=${file != null})")
-                        if (script.source == RadioScriptSource.Fallback) scheduleFallbackAutoFix()
+                        // file == null tambem agenda a correcao (11/09/2026) - roteiro OK mas a
+                        // sintese de voz falhou pra essa materia; sem isso esse item ficava
+                        // "pronto" no buffer pra sempre e só virava TTS Android na hora de tocar,
+                        // ver fixFallbackBulletins().
+                        if (script.source == RadioScriptSource.Fallback || file == null) scheduleFallbackAutoFix()
                         syncBulletinBufferState(isPreparing = false, statusMessage = null)
                         // Cooldown termico entre boletins consecutivos (pedido do usuario
                         // 03/09/2026, junto de subir threads pro maximo do aparelho/8): sessoes
@@ -2715,24 +2774,30 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE).writeText(array.toString())
-            val referenced = bulletinBuffer.mapNotNull { it.file?.name }.toSet()
-            // Margem de seguranca (achado ao vivo 10/09/2026): refillBulletinBuffer() escreve o
-            // .wav em disco (dentro do withContext(IO) de GeminiFlashTtsEngine/LocalRadioVoiceEngine)
-            // ANTES de voltar pra Main e so entao dar bulletinBuffer.addLast()+saveCoreBufferManifest()
-            // - enquanto isso (sintese Gemini as vezes leva 60-90s com a cota no talo, ver
-            // GeminiFlashTtsEngine.GEMINI_TTS_RETRY_DELAY_MS), QUALQUER outra chamada concorrente
-            // a este metodo varria a pasta, via o arquivo ja escrito mas ainda nao registrado no
-            // buffer, e apagava como "orfao" - o item entrava na fila com script pronto mas
-            // arquivo fantasma (nao existe mais no disco), so descoberto na hora de tocar
-            // (speakNextNewsBreak: prepared.file?.takeIf { it.exists() } vinha null -> caia pro TTS
-            // do Android mesmo pra um boletim "100% Gemini" que a bolinha mostrava pronto). So
-            // apagar arquivo com alguns minutos de idade garante tempo de sobra pra qualquer sintese
-            // em andamento terminar e se registrar antes de ser considerado lixo de verdade.
-            val now = System.currentTimeMillis()
-            coreBufferDir.listFiles { file ->
-                file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced &&
-                    (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
-            }?.forEach { it.delete() }
+            // Achado 11/09/2026 (terceira rodada, ao vivo - usuario: "é um gemini verde, não
+            // podemos matar ele prematuramente"): antes disso, o sweep abaixo so se protegia com um
+            // TIMER (ORPHAN_CLEANUP_GRACE_MS) - um chute de "tempo de sobra" baseado no pior caso ja
+            // visto, nao uma garantia. O .wav so aparece no disco no FIM da sintese (writeWav) e so
+            // entao a corrotina registra o item em bulletinBuffer (ver refillBulletinBuffer) - com a
+            // cota do Gemini estourada, esse caminho pode passar de 10 minutos (5 chaves mortas a
+            // GEMINI_TTS_TIMEOUT_MS=120s cada), o DOBRO do timer antigo de 5min. Qualquer chamada
+            // concorrente a este metodo nesse meio tempo (speakNextNewsBreak consumindo outro item,
+            // fixFallbackBulletins, o polling do init{}) varria a pasta e podia apagar um arquivo
+            // que so "parecia" orfao por ainda nao ter tido chance de ser registrado - nunca lixo de
+            // verdade. Corrigido pulando o sweep INTEIRO enquanto coreSynthesisInFlight (ver
+            // declaracao do campo) estiver true - garantia real, nao depende de nenhum numero de
+            // timeout adivinhado; o timer velho (ORPHAN_CLEANUP_GRACE_MS) fica como reforco extra
+            // pra limpar orfaos de verdade deixados por um processo morto no meio da sintese (nesse
+            // caso o flag reseta pra false no proximo processo, entao o timer ainda cobre esse
+            // cenario raro).
+            if (!coreSynthesisInFlight) {
+                val referenced = bulletinBuffer.mapNotNull { it.file?.name }.toSet()
+                val now = System.currentTimeMillis()
+                coreBufferDir.listFiles { file ->
+                    file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced &&
+                        (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
+                }?.forEach { it.delete() }
+            }
         }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao salvar manifest do buffer em disco", it) }
     }
 
@@ -2797,14 +2862,19 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         progressPercent: Int? = if (statusMessage == null) null else radioBulletinBufferState.value.progressPercent,
     ) {
         val activeSources = bulletinBuffer.map { it.script.source }
-        val activeFullGemini = bulletinBuffer.map { it.scriptFromGemini && it.voiceFromGemini }
+        // Achado 11/09/2026 (segunda rodada): confere it.file?.exists() == true de verdade, nao so
+        // "file != null"/flag congelada de quando o item foi sintetizado - um arquivo pode ter
+        // sumido depois (corrida do sweep de orfaos, ver purgeVanishedBulletinAudio) e sem essa
+        // checagem a bolinha ficava verde mentindo que da pra tocar audio de verdade, exatamente o
+        // sintoma que o usuario reportou ("todas as bolinhas verdes" mas toca TTS Android na hora).
+        val activeFullGemini = bulletinBuffer.map { (it.scriptFromGemini && it.voiceFromGemini) && it.file?.exists() == true }
         radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
             readyCount = bulletinBuffer.size,
             isPreparing = isPreparing,
             isPaused = bulletinPrepPaused,
             statusMessage = statusMessage,
             progressPercent = progressPercent,
-            hasPlayableAudio = bulletinBuffer.any { it.file != null },
+            hasPlayableAudio = bulletinBuffer.any { it.file?.exists() == true },
             fallbackSlots = activeSources.withIndex().filter { (_, source) -> source == RadioScriptSource.Fallback }
                 .map { (index, _) -> index }.toSet(),
             hasFallback = activeSources.any { it == RadioScriptSource.Fallback },
@@ -2841,32 +2911,69 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         if (!bulletinPrepPaused) refillBulletinBuffer()
     }
 
-    // Botao manual "Corrigir fallback" (pedido do usuario 05/09/2026): descarta so os itens que
-    // cairam no roteiro generico (RadioScriptSource.Fallback - Gemini E redator local falharam
-    // os dois, ou nenhum dos dois estava disponivel) e deixa o preparo normal
-    // (refillBulletinBuffer) repor essas vagas do zero - o que tenta Gemini primeiro de novo, com
-    // a mesma prioridade/retry de qualquer boletim novo. Nao mexe nos itens que ja saíram com
-    // roteiro de LLM (Gemini ou redator local), so remove o que precisa mesmo ser reescrito.
-    // Mesma funcao roda sozinha via scheduleFallbackAutoFix() assim que um fallback novo entra no
-    // buffer, sem precisar o usuario apertar nada.
-    fun fixFallbackBulletins() {
-        val fallbackBulletins = bulletinBuffer.filter { it.script.source == RadioScriptSource.Fallback }
-        if (fallbackBulletins.isEmpty()) return
-        fallbackBulletins.forEach { it.file?.delete() }
-        bulletinBuffer.removeAll(fallbackBulletins)
+    // Achado 11/09/2026 (segunda rodada, ao vivo): separado de fixFallbackBulletins porque esse
+    // caso NAO precisa do throttle de 45s (FALLBACK_AUTO_FIX_DELAY_MS) - remover uma referencia de
+    // arquivo que ja sumiu do disco (corrida com o sweep de orfaos em saveCoreBufferManifest, ver
+    // ORPHAN_CLEANUP_GRACE_MS) e so leitura local, nao gasta cota nem risco de martelar Gemini/
+    // local. Rodar isso a cada poll (init{}) em vez de esperar o job throttled fecha a janela em
+    // que um item "verdinho" (fullGeminiSlots, 100% Gemini) fica na frente da fila com o audio ja
+    // sumido mas a bolinha ainda mostrando verde - se um boletim novo caisse dentro dos 45s de
+    // espera do throttle antigo, tocava TTS Android cru mesmo com tudo "verde" na tela.
+    // So mexe em item cujo `file` NAO E NULO mas nao existe mais (tinha audio, sumiu depois) -
+    // item com `file == null` desde o começo (sintese nunca rolou) fica pro fixFallbackBulletins
+    // throttled, que e quem de fato tenta gerar audio de novo (chamada de rede/servico).
+    private fun purgeVanishedBulletinAudio() {
+        val vanished = bulletinBuffer.filter { it.file != null && !it.file.exists() }
+        if (vanished.isEmpty()) return
+        bulletinBuffer.removeAll(vanished)
         saveCoreBufferManifest()
-        Log.d(TAG_RADIO_VOICE, "boletim: corrigindo fallback - removidos ${fallbackBulletins.size} do buffer pra regenerar")
+        Log.w(TAG_RADIO_VOICE, "boletim: removidos ${vanished.size} item(ns) com audio sumido do disco (arquivo nao existe mais) - refill vai repor")
         syncBulletinBufferState()
         if (!bulletinPrepPaused) refillBulletinBuffer()
     }
 
-    // Dispara fixFallbackBulletins() sozinho assim que o sistema percebe um item de fallback
-    // novo no buffer (ver bulletinBuffer.addLast em refillBulletinBuffer) - pedido do usuario
-    // (05/09/2026): "que ele mesmo comece a rodar a correcao" sem precisar apertar o botao manual
-    // toda vez. FALLBACK_AUTO_FIX_DELAY_MS de respiro antes de tentar, e o guard de job ativo
-    // evita agendar em cima de uma correcao que ja esta rodando - se a causa raiz (sem internet,
-    // Gemini fora do ar, chave invalida) ainda nao se resolveu, a proxima geracao tambem vai cair
-    // em fallback e agendar de novo sozinha, criando um retry periodico (nao um loop apertado).
+    // Botao manual "Corrigir fallback" (pedido do usuario 05/09/2026, estendido 11/09/2026):
+    // descarta os itens SEM CHANCE de tocar com voz de verdade e deixa o preparo normal
+    // (refillBulletinBuffer) repor essas vagas do zero - o que tenta Gemini primeiro de novo, com
+    // a mesma prioridade/retry de qualquer boletim novo. Dois motivos pegam um item aqui:
+    // (1) roteiro generico (RadioScriptSource.Fallback - Gemini E redator local falharam os dois
+    // na ESCRITA), ou (2) audio ausente (it.file == null - a sintese de voz falhou pra esse
+    // roteiro especifico). O caso "tinha arquivo e sumiu depois" agora e tratado sem throttle por
+    // purgeVanishedBulletinAudio() (chamado a cada poll do init{}) - mas o `!it.file.exists()`
+    // continua aqui tambem, de defesa, caso essa funcao rode antes do proximo poll.
+    // Achado 11/09/2026 ao vivo: sem o motivo (2), um item ficava "pronto" pra sempre no buffer
+    // (contando em readyCount, podendo ate ser fullGeminiSlots) mas SEM audio - speakNextNewsBreak
+    // so descobre isso na hora de tocar (readyFile = prepared.file?.takeIf { it.exists() } null) e
+    // cai pro TTS cru do Android, sem nunca tentar resintetizar esse item.
+    // IMPORTANTE - protege os boletins 100% Gemini (fullGeminiSlots, os "verdinhos"): so remove
+    // por (2) quando o arquivo comprovadamente NAO EXISTE MAIS (it.file == null ou
+    // exists() == false) - nunca um item cujo audio ainda esta la, seja ele Gemini, local ou
+    // misto. Um verdinho com arquivo intacto nunca cai nesse filtro.
+    // Nao mexe nos itens que ja saíram com roteiro de LLM E audio de verdade, so remove o que
+    // precisa mesmo ser reescrito/resintetizado. Mesma funcao roda sozinha via
+    // scheduleFallbackAutoFix() assim que um item quebrado (por (1) ou (2)) entra no buffer, sem
+    // precisar o usuario apertar nada.
+    fun fixFallbackBulletins() {
+        val broken = bulletinBuffer.filter {
+            it.script.source == RadioScriptSource.Fallback || it.file == null || !it.file.exists()
+        }
+        if (broken.isEmpty()) return
+        broken.forEach { it.file?.delete() }
+        bulletinBuffer.removeAll(broken)
+        saveCoreBufferManifest()
+        Log.d(TAG_RADIO_VOICE, "boletim: corrigindo fallback - removidos ${broken.size} do buffer pra regenerar")
+        syncBulletinBufferState()
+        if (!bulletinPrepPaused) refillBulletinBuffer()
+    }
+
+    // Dispara fixFallbackBulletins() sozinho assim que o sistema percebe um item quebrado (roteiro
+    // em fallback OU sem audio, ver fixFallbackBulletins) novo no buffer (ver bulletinBuffer.addLast
+    // em refillBulletinBuffer) - pedido do usuario (05/09/2026): "que ele mesmo comece a rodar a
+    // correcao" sem precisar apertar o botao manual toda vez. FALLBACK_AUTO_FIX_DELAY_MS de
+    // respiro antes de tentar, e o guard de job ativo evita agendar em cima de uma correcao que ja
+    // esta rodando - se a causa raiz (sem internet, Gemini fora do ar, chave invalida, voz local
+    // desligada) ainda nao se resolveu, a proxima geracao tambem vai cair quebrada e agendar de
+    // novo sozinha, criando um retry periodico (nao um loop apertado).
     private fun scheduleFallbackAutoFix() {
         if (fallbackAutoFixJob?.isActive == true) return
         fallbackAutoFixJob = viewModelScope.launch {

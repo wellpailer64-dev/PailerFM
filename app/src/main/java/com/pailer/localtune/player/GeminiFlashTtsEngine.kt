@@ -112,20 +112,46 @@ class GeminiFlashTtsEngine(private val context: Context) {
         model: GeminiTtsModel,
         transcript: String,
     ): Pair<ByteArray, Int> {
+        val now = System.currentTimeMillis()
+        val (skip, usable) = apiKeys.partition { key ->
+            exhaustedKeys[key]?.let { exhaustedAt -> now - exhaustedAt < KEY_EXHAUSTED_COOLDOWN_MS } == true
+        }
+        // Se TODAS estao no cache de exaurida, tenta mesmo assim so a que exauriu ha mais tempo -
+        // e a com mais chance de ja ter resetado, e melhor que desistir sem nem tentar ou martelar
+        // as N de novo (ver comentario do cache acima).
+        val orderedKeys = usable.ifEmpty {
+            Log.w(TAG, "GeminiTTS: todas as ${apiKeys.size} chave(s) no cache de exaurida; tentando mesmo assim a que exauriu ha mais tempo")
+            skip.minByOrNull { exhaustedKeys[it] ?: 0L }?.let { listOf(it) } ?: apiKeys
+        }
+        if (skip.isNotEmpty() && usable.isNotEmpty()) {
+            Log.d(TAG, "GeminiTTS: pulando ${skip.size}/${apiKeys.size} chave(s) no cache de exaurida (cooldown ${KEY_EXHAUSTED_COOLDOWN_MS / 60_000}min)")
+        }
         var lastError: Throwable? = null
-        apiKeys.forEachIndexed { index, apiKey ->
+        orderedKeys.forEachIndexed { index, apiKey ->
             val result = runCatching {
                 withTimeoutOrNull(GEMINI_TTS_TIMEOUT_MS) { callGeminiTts(apiKey, model, transcript) }
                     ?: error("Gemini TTS demorou demais pra responder")
             }
-            result.onSuccess { return it }
+            result.onSuccess {
+                exhaustedKeys.remove(apiKey)
+                return it
+            }
             lastError = result.exceptionOrNull()
-            val isLastKey = index == apiKeys.lastIndex
-            Log.w(TAG, "GeminiTTS: generation failed (chave ${index + 1}/${apiKeys.size}): ${lastError?.message ?: lastError?.javaClass?.simpleName}")
+            if (lastError is GeminiQuotaExceededException) {
+                exhaustedKeys[apiKey] = System.currentTimeMillis()
+            }
+            val isLastKey = index == orderedKeys.lastIndex
+            Log.w(TAG, "GeminiTTS: generation failed (chave ${index + 1}/${orderedKeys.size}): ${lastError?.message ?: lastError?.javaClass?.simpleName}")
             if (!isLastKey) delay(GEMINI_TTS_RETRY_DELAY_MS)
         }
         throw lastError ?: IllegalStateException("GeminiTTS: falha desconhecida")
     }
+
+    // Marca HTTP 429 (cota) separado de qualquer outro erro - so esse motivo alimenta o cache de
+    // exhaustedKeys acima; erro de rede/timeout/400 etc nao devem fazer a chave ser pulada depois,
+    // ja que podem ser transitorios e nao dizem nada sobre cota.
+    private class GeminiQuotaExceededException(apiMessage: String?) :
+        Exception("HTTP 429${apiMessage?.let { ": $it" } ?: ""}")
 
     // HttpURLConnection puro, mesmo estilo de RemoteGeminiRadioScriptWriter.callGemini
     // (RadioBulletin.kt) - sem OkHttp/Retrofit no projeto. speechConfig.multiSpeakerVoiceConfig
@@ -187,6 +213,7 @@ class GeminiFlashTtsEngine(private val context: Context) {
             val apiMessage = runCatching {
                 JSONObject(responseText).optJSONObject("error")?.optString("message")
             }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (responseCode == 429) throw GeminiQuotaExceededException(apiMessage)
             error("HTTP $responseCode${apiMessage?.let { ": $it" } ?: ""}")
         }
 
@@ -249,6 +276,21 @@ class GeminiFlashTtsEngine(private val context: Context) {
     private companion object {
         const val TAG = LocalRadioVoiceEngine.TAG
         const val DEFAULT_SAMPLE_RATE = 24000
+        // Achado 10/09/2026 a noite, deixado sem resolver ate agora (ver memoria do projeto): cada
+        // synthesize() novo caminhava a lista INTEIRA de chaves do zero, mesmo quando ja se sabia
+        // (do boletim anterior, segundos antes) que 5 de 6 chaves estavam com cota estourada -
+        // cada tentativa morta ainda gasta o round-trip HTTP completo (so falha depois que o 429
+        // volta) + GEMINI_TTS_RETRY_DELAY_MS, entao esgotar a lista toda repetidas vezes empurrava
+        // o boletim pra 60-90s so pra descobrir o que ja era sabido, atrasando o refill do buffer
+        // o bastante pra ele secar e cair no boletim "ao vivo" (sempre TTS Android, sem chance de
+        // audio pronto - ver speakNextNewsBreak). Cache em memoria (companion = sobrevive a troca
+        // de instancia do engine, nao a reinicio do processo - aceitavel, e so uma otimizacao de
+        // latencia, nao afeta corretude) marca a chave com o horario do ultimo 429 e pula ela nas
+        // proximas tentativas por KEY_EXHAUSTED_COOLDOWN_MS. Nao sabemos o horario exato do reset
+        // diario de cota da API, entao o cooldown fica bem abaixo de 24h (nao trava o dia inteiro
+        // se o reset for antes) - so evita bater na MESMA chave morta de novo por um tempo.
+        val exhaustedKeys = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        const val KEY_EXHAUSTED_COOLDOWN_MS = 30 * 60_000L
         // 10/09/2026: 20s nao bastava pra 1 fala, testado ao vivo - os 2 attempts estouraram o
         // timeout (log "GeminiTTS: generation failed: timeout" duas vezes seguidas) antes da API
         // responder; subiu pra 60s. Dobrado de novo pra 120s ao trocar pra 1 chamada multi-speaker
