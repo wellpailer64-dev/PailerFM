@@ -20,6 +20,8 @@ val keystoreProperties = Properties().apply {
 android {
     namespace = "com.pailer.localtune"
     compileSdk = 34
+    // Fixado pra CI e maquina local usarem o mesmo NDK (ver CLAUDE.md / .github/workflows/build-apk.yml).
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.pailer.localtune"
