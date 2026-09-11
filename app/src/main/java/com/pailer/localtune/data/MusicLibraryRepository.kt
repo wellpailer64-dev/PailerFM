@@ -1603,6 +1603,12 @@ class MusicLibraryRepository(private val context: Context) {
         val metadataTokens: List<String> = emptyList(),
         val excludedMetadataTokens: List<String> = emptyList(),
         val requireMetadataTokenMatch: Boolean = false,
+        // So o perfil Grunge usa (pedido do usuario 11/09/2026, ver ADR) - alem de bater na
+        // lista curada de artistas (requireMetadataTokenMatch), a TAG de genero da faixa
+        // tambem precisa conter algum genreTokens (aqui, "grunge"). Um artista so entrar na
+        // lista curada nao basta mais - se a tag do arquivo nao disser "grunge" de verdade
+        // (ex.: Dinosaur Jr tageado como "Alternative"), a faixa fica de fora.
+        val requireGenreTokenMatch: Boolean = false,
         // So usado por perfis de decada (ex.: "Anos 2000") - quando presente, o ano da musica
         // (MediaStore YEAR) precisa estar no intervalo. Perfil sem genreTokens/metadataTokens
         // e com yearRange vira um perfil "so por ano" (ver matches()).
@@ -1610,17 +1616,25 @@ class MusicLibraryRepository(private val context: Context) {
     ) {
         // Tokens sao constantes por perfil; normalizar uma vez (lazy) em vez de a cada
         // musica evita milhares de chamadas repetidas a Normalizer.normalize durante radiosFrom().
-        private val normalizedGenreTokens by lazy { genreTokens.map(::normalize) }
-        private val normalizedMetadataTokens by lazy { metadataTokens.map(::normalize) }
-        private val normalizedExcludedTokens by lazy { excludedMetadataTokens.map(::normalize) }
+        // Cada token/genero/metadado normalizado ganha um espaco em volta (pad()) - contains()
+        // aplicado nesse formato so bate em PALAVRA/FRASE INTEIRA cercada de espaco (ou pontuacao
+        // ja virou espaco em normalize()), nunca em pedaco solto no meio de outra palavra. Achado
+        // ao vivo 11/09/2026: token "tad" (banda TAD) casava com "Furtado" (fur-TAD-o) porque o
+        // contains() antigo comparava substring crua, sem respeitar borda de palavra.
+        private val normalizedGenreTokens by lazy { genreTokens.map { pad(normalize(it)) } }
+        private val normalizedMetadataTokens by lazy { metadataTokens.map { pad(normalize(it)) } }
+        private val normalizedExcludedTokens by lazy { excludedMetadataTokens.map { pad(normalize(it)) } }
 
         fun matches(song: LocalSong): Boolean {
-            val genre = normalize(song.genre)
-            val metadata = normalize("${song.artist} ${song.album}")
+            val genre = pad(normalize(song.genre))
+            val metadata = pad(normalize("${song.artist} ${song.album}"))
             if (normalizedExcludedTokens.any { metadata.contains(it) }) return false
             if (yearRange != null && song.year !in yearRange) return false
             val metadataMatch = normalizedMetadataTokens.any { metadata.contains(it) }
-            if (requireMetadataTokenMatch) return metadataMatch
+            if (requireMetadataTokenMatch) {
+                if (!metadataMatch) return false
+                return !requireGenreTokenMatch || normalizedGenreTokens.any { genre.contains(it) }
+            }
             if (normalizedGenreTokens.isEmpty() && normalizedMetadataTokens.isEmpty()) {
                 // Perfil so por ano: ja passou pelo filtro de yearRange acima.
                 return yearRange != null
@@ -1628,6 +1642,8 @@ class MusicLibraryRepository(private val context: Context) {
             return normalizedGenreTokens.any { token -> genre.contains(token) || metadata.contains(token) } ||
                 metadataMatch
         }
+
+        private fun pad(value: String): String = " $value "
 
         private fun normalize(value: String): String =
             Normalizer.normalize(value.lowercase(), Normalizer.Form.NFD)
@@ -1784,6 +1800,7 @@ class MusicLibraryRepository(private val context: Context) {
                     "rogério skylab", "sepultura",
                 ),
                 requireMetadataTokenMatch = true,
+                requireGenreTokenMatch = true,
             ),
             RadioProfile(
                 name = "Alternative",
