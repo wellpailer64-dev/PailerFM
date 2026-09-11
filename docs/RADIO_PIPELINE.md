@@ -62,11 +62,14 @@ Usuário toca numa Rádio
 playRadioSession()                          [LocalTuneViewModel]
   ├─ radioSessionFrom() → fila anti-repetição
   ├─ startRadioNewsMode(radioName)
-  │    ├─ zera contadores/flags do boletim, esvazia bulletinBuffer
+  │    ├─ zera contadores/flags do boletim (bulletinBuffer NAO e tocado - unico, 100%
+  │    │  radio-agnostico, sobrevive a troca de radio, ver ADR-024)
   │    ├─ setupTextToSpeech()               (fallback; ver TTS.md)
   │    └─ carrega boletins em background:
   │         RadioBulletinRepository.loadScripts() → refillBulletinBuffer()
-  │         (enche o buffer pra BULLETIN_BUFFER_TARGET=3 itens prontos, ver ADR-019)
+  │         (no-op se ja estiver cheio - o buffer roda desde a abertura do app,
+  │         independente de radio ativa; enche pra BULLETIN_BUFFER_TARGET=10 itens
+  │         prontos, ver ADR-024)
   ├─ controller.setMediaItems + prepare      (autoPlay=false se vai tocar vinheta)
   └─ playRadioVinhetas(radioName)            (só quando startIndex == 0, entrada nova)
         ├─ playVinhetaResource(R.raw.radio_intro)
@@ -178,14 +181,17 @@ contexto de reprodução, porque os roteiros-base são carregados quando a rádi
 música anterior só é conhecida no intervalo.
 
 Para não travar a entrada da rádio, `loadScripts()` continua carregando roteiros-base via
-fallback determinístico. O redator local entra em `refillBulletinBuffer()` (ADR-019),
-preparando **até 3 boletins com antecedência** em segundo plano (um de cada vez, nunca
-mais de um motor de voz carregado ao mesmo tempo) em vez de só o próximo. Cada versão
-gerada fica cacheada como texto e, se a voz local estiver ligada, também como áudio, num
-buffer (`bulletinBuffer`) reposto assim que um item é consumido. Assim o app evita gerar
-oito notícias de uma vez, mas também não fica refém de "só 1 música de antecedência" -
-qualquer soluço pontual de síntese tem folga de até 3 boletins pra se resolver antes de
-faltar áudio pronto.
+fallback determinístico. O redator local entra em `refillBulletinBuffer()` (ADR-019,
+unificado em ADR-024), preparando **até `BULLETIN_BUFFER_TARGET` (10) boletins com
+antecedência** em segundo plano (um de cada vez, nunca mais de um motor de voz carregado
+ao mesmo tempo). Cada versão gerada fica cacheada como texto e, se a voz estiver ligada,
+também como áudio, num buffer único (`bulletinBuffer`) reposto assim que um item é
+consumido. Esse buffer roda **desde a abertura do app**, independente de rádio ativa ou
+não, e **sobrevive a troca/saída de rádio** (ADR-024) - boletim é 100% radio-agnostico,
+então trocar de rádio nunca cancela um preparo em andamento nem descarta o que já está
+pronto. Assim o app evita gerar dez notícias de uma vez (o buffer já vem pronto de fundo)
+mas também não fica refém de "só 1 música de antecedência" - qualquer soluço pontual de
+síntese tem folga de até 10 boletins pra se resolver antes de faltar áudio pronto.
 
 Regra de segurança em produção: depois que a música pausa, o app não chama mais o redator
 local nem tenta sintetizar voz local pesada se o WAV não estava pronto. Se o roteiro/áudio

@@ -1179,3 +1179,77 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   (ADR-020: ler/escrever Compose `State` fora da Main na construção do VM derruba o app).
   Se um dia a letra for gravável na tag, é ação manual explícita com confirmação
   (ADR-008), reusando o fluxo de `MediaStore.createWriteRequest` que o tag writer já tem.
+
+## ADR-024 — Buffer de boletins unificado (fim dos "2 níveis")
+
+- **Contexto:** usuário reportou ao vivo, na mesma sessão, dois sintomas do buffer de
+  boletins: (1) saiu de uma rádio e entrou em outra, o contador caiu de ~20 prontos pra
+  6 e o app "começou a gerar mais" — parecia perda de trabalho; (2) minutos depois, o
+  contador mostrou **"19/10 prontos"** — mais boletins prontos que o próprio alvo
+  declarado na tela, com a cota gratuita do Gemini TTS (429, `generativelanguage.
+  googleapis.com/generate_content_free_tier_requests`, limite 10/chave) se esgotando
+  bem mais rápido do que deveria.
+- **Causa raiz (achada lendo o código, confirmada em log real no aparelho):** o buffer
+  era **dois buffers separados** desde ADR-019/022 — `coreBuffer` ("Nível 1", agnóstico
+  de rádio, roda desde a abertura do app) e `bulletinBuffer` ("Nível 2", específico da
+  rádio ativa, promovido a partir do Nível 1 e limpo a cada `startRadioNewsMode`). Os
+  dois guardavam literalmente o mesmo tipo de item (roteiro + áudio 100% prontos pra
+  tocar — o boletim é radio-agnóstico desde 09/09/2026, nunca cita música/rádio), mas
+  precisavam ficar sincronizados via promoção/devolução a cada troca de rádio. Essa
+  duplicação causava os dois sintomas:
+  1. **Perda aparente:** o contador da tela é só o Nível 2, que sempre reinicia do zero
+     ao entrar numa rádio (mesmo devolvendo os itens pro Nível 1 intacto por baixo) — a
+     UI "piscava" pra um número menor mesmo sem nada ter sido descartado de verdade.
+     Pior ainda: havia um caminho real de perda — se a troca de rádio acontecesse
+     **enquanto** um item estava sendo gerado (não ainda no buffer), o código antigo
+     apagava o áudio recém-sintetizado (`file?.delete()`) em vez de devolvê-lo, porque
+     na hora em que a geração terminava a rádio ativa já não batia mais com a que
+     disparou o pedido.
+  2. **Estoque duplicado ("19/10"):** `prewarmCoreBuffer()` (Nível 1) só conferia o
+     próprio tamanho contra `BULLETIN_BUFFER_TARGET`, sem saber quanto o Nível 2 já
+     tinha — cada promoção do Nível 1 pro Nível 2 abria uma vaga que o Nível 1 reenchia
+     do zero, mesmo com o Nível 2 já cheio. Os dois níveis enchiam até o alvo **cada um
+     por conta própria**, dando um estoque real de até 20 em vez de 10, gastando cota do
+     Gemini em dobro do necessário.
+- **Decisão — buffer único:** eliminados `coreBuffer`, `PreparedNewsCore`, `corePrepJob`,
+  `prewarmCoreBuffer()`, `clearCoreBuffer()`, `syncCoreBufferStatus()`. Só resta
+  `bulletinBuffer: ArrayDeque<PreparedBulletin>` (roteiro + áudio já prontos,
+  `scriptFromGemini`/`voiceFromGemini` pra bolinha verde/azul), preenchido por um único
+  `refillBulletinBuffer()` que:
+  1. Roda **desde a abertura do app**, independente de rádio ativa ou não (era só o
+     Nível 1 que fazia isso antes).
+  2. **Nunca é tocado por troca/saída de rádio** — `startRadioNewsMode()`/
+     `stopRadioNewsMode()` pararam de chamar `clearBulletinBuffer()`. O buffer é 100%
+     independente de qual rádio está ativa; entrar/sair/trocar de rádio não cancela o
+     job em andamento nem descarta nada já pronto.
+  3. Quando o job termina de gerar um item e descobre que a rádio mudou nesse meio
+     tempo, o item entra no buffer normalmente (antes: comparava com a rádio que disparou
+     o pedido e apagava se não batesse) — o boletim nunca teve nada de específico da
+     rádio pra começo de conversa.
+  4. `clearBulletinBuffer()` continua existindo, mas só apaga de verdade — usada
+     exclusivamente pelo botão manual "Resetar" (`resetBulletinBuffer()`). Trocar de
+     rádio não é mais motivo pra apagar nada.
+  - **Cap único:** `refillBulletinBuffer()` só produz enquanto `bulletinBuffer.size <
+    BULLETIN_BUFFER_TARGET` — 10 é o estoque real agora, não 10 por nível.
+  - **Persistência:** `saveCoreBufferManifest()`/`loadCoreBufferManifest()` (nomes
+    mantidos de propósito — só a pasta/chave JSON em disco, `coreBufferDir`/
+    `"coreFile"`, pra não perder o manifest já salvo por versões antigas) agora
+    serializam o buffer único direto, sem união de dois formatos.
+  - **Achado ao vivo migrando:** a sintetização dentro do `refillBulletinBuffer()`
+    unificado estava chamando o motor **efêmero** (`synthesizeLocalVoiceSafely`,
+    grava em `cacheDir`) em vez do **persistente** (`synthesizeCoreVoiceSafely`, grava
+    em `filesDir`) que o Nível 1 sempre usou — como agora TODO item do buffer precisa
+    sobreviver a reinício de processo (mesmo manifest/pasta), trocado pro persistente;
+    senão o áudio sumiria do disco no primeiro kill do processo mesmo aparecendo pronto
+    na tela.
+- **Verificado no aparelho:** manifesto salvo pela versão antiga (com o estoque
+  duplicado, 19 itens) restaurou os 19 íntegros após o update — nenhum boletim já pago
+  (LLM + voz) foi descartado na migração; o buffer simplesmente parou de crescer acima
+  de 10 e vai drenar sozinho tocando normalmente até estabilizar.
+- **Motivo:** pedido explícito do usuário depois de entender a causa raiz - "não tem
+  motivo pra esses 2 níveis existirem, já que decidimos que o boletim é montado 100% no
+  buffer antes de tocar". Simplificação, não feature nova: menos estado pra sincronizar
+  é menos classe de bug pra essa mesma dupla (Nível 1 x Nível 2) continuar gerando.
+- **Não mudar sem:** se algum dia o boletim deixar de ser 100% radio-agnóstico (citar
+  música/rádio de novo na fala), esse "buffer único, independente de rádio" deixa de
+  fazer sentido e a separação por rádio ativa (o antigo Nível 2) precisaria voltar.

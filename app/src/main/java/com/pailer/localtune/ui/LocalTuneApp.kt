@@ -2255,16 +2255,7 @@ private fun RadioBulletinBufferStatusCard(
                     Icon(Icons.Filled.GraphicEq, contentDescription = null, modifier = Modifier.size(18.dp))
                 }
                 Spacer(Modifier.width(6.dp))
-                Text(
-                    when {
-                        bulletinBuffer.isPlayingPreview -> "Tocando..."
-                        // Nivel 2 (bulletinBuffer) vazio mas Nivel 1 (nucleo) tem algo pronto -
-                        // deixa claro que e so previa do miolo, sem abertura/fechamento (que
-                        // dependem de radio real tocando - ver playReadyBufferedBulletin).
-                        bulletinBuffer.hasCorePreview -> "Reproduzir prévia (só o miolo)"
-                        else -> "Reproduzir boletim pronto"
-                    },
-                )
+                Text(if (bulletinBuffer.isPlayingPreview) "Tocando..." else "Reproduzir boletim pronto")
             }
         }
     }
