@@ -36,6 +36,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.MutatePriority
@@ -185,6 +186,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.SubcomposeLayout
@@ -528,6 +531,10 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val library = viewModel.libraryState.value
     val content = viewModel.libraryContentState.value
     val player = viewModel.playerState.value
+    val lyrics = viewModel.lyricsState.value
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
+    val landscapeRailWidth = 64.dp
     val metadata = viewModel.metadataState.value
     val albumArtwork = viewModel.albumArtworkState.value
     LaunchedEffect(albumArtwork.appliedVersion) {
@@ -556,6 +563,24 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val favoriteAlbums = content.favoriteAlbums
     val continueSong = content.continueSong
     val artistNews = viewModel.artistNewsState.value
+    LaunchedEffect(player.songId, songs.size) {
+        viewModel.loadLyricsFor(player.songId)
+    }
+    val homeBackdropSong = remember(player.songId, player.activeRadioName, player.hasMedia, continueSong?.id, songs) {
+        if (player.hasMedia && player.activeRadioName.isBlank()) {
+            player.songId?.let { id -> songs.firstOrNull { it.id == id } }
+        } else {
+            continueSong
+        }
+    }
+    val homeBackdropUri = when {
+        player.hasMedia && player.activeRadioName.isBlank() -> player.artworkUri ?: homeBackdropSong?.artworkUri
+        else -> continueSong?.artworkUri
+    }
+    val homeBackdropSourceUri = when {
+        player.hasMedia && player.activeRadioName.isBlank() -> player.artworkSourceUri ?: homeBackdropSong?.contentUri
+        else -> continueSong?.contentUri
+    }
     val favoriteArtists = remember(artists, library.favoriteArtistKeys) {
         artists.filter { it.key in library.favoriteArtistKeys }
     }
@@ -609,10 +634,32 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             .fillMaxSize()
             .background(appBackgroundBrush())
     ) {
+        BackgroundGrainOverlay()
+        val showHomeBackdrop = selectedTab == MainTab.Home &&
+            selectedAlbum == null &&
+            selectedArtist == null &&
+            selectedRadio == null &&
+            selectedGenre == null
+        if (showHomeBackdrop) {
+            AlbumArtBackdrop(uri = homeBackdropUri, embeddedSourceUri = homeBackdropSourceUri)
+        }
+        val selectMainTab: (MainTab) -> Unit = { tab ->
+            selectedAlbum = null
+            selectedArtist = null
+            // radioSession NAO e limpa aqui de proposito - trocar de aba so fecha a tela de
+            // detalhe, a radio pode continuar tocando em segundo plano e o usuario pode voltar
+            // pra ela clicando no card "ao vivo" (ver openActiveRadio).
+            selectedRadio = null
+            selectedGenre = null
+            isGeneratingRadio = false
+            selectedTab = tab
+        }
         Scaffold(
             containerColor = Color.Transparent,
             bottomBar = {
-                Column {
+                Column(
+                    modifier = Modifier.padding(end = if (isLandscape) landscapeRailWidth else 0.dp),
+                ) {
                     if (player.hasMedia) {
                         MiniPlayer(
                             player = player,
@@ -641,74 +688,26 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             },
                         )
                     }
-                    NavigationBar(
-                        modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
-                        containerColor = PailerSurface.copy(alpha = 0.94f),
-                    ) {
-                        MainTab.entries.forEach { tab ->
-                            val isRadio = tab == MainTab.Radio
-                            NavigationBarItem(
-                                selected = selectedTab == tab,
-                                onClick = {
-                                    selectedAlbum = null
-                                    selectedArtist = null
-                                    // radioSession NAO e limpa aqui de proposito - trocar de
-                                    // aba so fecha a tela de detalhe, a radio pode continuar
-                                    // tocando em segundo plano e o usuario pode voltar pra ela
-                                    // clicando no card "ao vivo" (ver openActiveRadio).
-                                    selectedRadio = null
-                                    selectedGenre = null
-                                    isGeneratingRadio = false
-                                    selectedTab = tab
-                                },
-                                icon = {
-                                    if (isRadio) {
-                                        // Radio em destaque no meio da barra (pedido do usuario
-                                        // 10/09/2026: "a radio no meio em destaque como funcao
-                                        // principal do app") - selo circular na cor de destaque,
-                                        // sempre colorido (selecionado ou nao), maior que os
-                                        // outros icones pra chamar mais atencao.
-                                        Box(
-                                            modifier = Modifier
-                                                .size(46.dp)
-                                                .clip(CircleShape)
-                                                .background(
-                                                    if (selectedTab == tab) PailerRed else PailerRed.copy(alpha = 0.75f),
-                                                ),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            Icon(
-                                                Icons.Filled.Radio,
-                                                contentDescription = tab.label,
-                                                tint = Color.White,
-                                                modifier = Modifier.size(24.dp),
-                                            )
-                                        }
-                                    } else {
-                                        Icon(tab.icon(), contentDescription = tab.label)
-                                    }
-                                },
-                                label = {
-                                    Text(
-                                        tab.label,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        fontSize = 10.sp,
-                                        fontWeight = if (isRadio) FontWeight.Bold else FontWeight.Normal,
-                                    )
-                                },
-                            )
-                        }
+                    if (!isLandscape) {
+                        BottomMainNavigationBar(
+                            selectedTab = selectedTab,
+                            onSelectTab = selectMainTab,
+                        )
                     }
                 }
             },
         ) { padding ->
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(padding)
-                    .windowInsetsPadding(WindowInsets.statusBars),
+                    .padding(padding),
             ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(end = if (isLandscape) landscapeRailWidth else 0.dp)
+                        .windowInsetsPadding(WindowInsets.statusBars),
+                ) {
                 LibraryHeader(
                     query = library.query,
                     isLoading = library.isLoading,
@@ -794,6 +793,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     RadioDetailScreen(
                         radio = openedRadio,
                         player = player,
+                        lyrics = lyrics,
                         sessionSongs = radioSession,
                         songsBetweenBulletins = radioBulletins.settings.songsBetweenBulletins,
                         isGenerating = isGeneratingRadio,
@@ -880,6 +880,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             favoriteAlbums = favoriteAlbums,
                             radios = radios,
                             player = player,
+                            lyrics = lyrics,
                             onContinue = { viewModel.continuePlayback(songs) },
                             onOpenAlbum = { selectedAlbum = it },
                             onOpenRadio = {
@@ -894,6 +895,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     selectedTab == MainTab.Radio -> PlaylistsScreen(
                         radios = radios,
                         player = player,
+                        lyrics = lyrics,
                         onOpenRadio = {
                             radioSession = emptyList()
                             selectedRadio = it
@@ -933,6 +935,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             LibrarySection.Genres -> PlaylistsScreen(
                                 radios = genreRadios,
                                 player = player,
+                                lyrics = lyrics,
                                 onOpenRadio = {
                                     radioSession = emptyList()
                                     selectedGenre = it
@@ -943,6 +946,16 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             )
                         }
                     }
+                }
+                }
+                if (isLandscape) {
+                    LandscapeMainNavigationRail(
+                        selectedTab = selectedTab,
+                        onSelectTab = selectMainTab,
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .width(landscapeRailWidth),
+                    )
                 }
             }
         }
@@ -1099,10 +1112,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             val playingArtist = remember(player.artist, artists) {
                 artists.firstOrNull { it.key == player.artist.trim().lowercase() }
             }
-            val lyrics = viewModel.lyricsState.value
-            LaunchedEffect(player.songId, player.activeRadioName) {
-                if (player.activeRadioName.isBlank()) viewModel.loadLyricsFor(player.songId)
-            }
             FullPlayer(
                 player = player,
                 isFavorite = viewModel.isCurrentSongFavorite(),
@@ -1148,6 +1157,116 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
 }
 
 @Composable
+private fun BottomMainNavigationBar(
+    selectedTab: MainTab,
+    onSelectTab: (MainTab) -> Unit,
+) {
+    NavigationBar(
+        modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
+        containerColor = PailerSurface.copy(alpha = 0.94f),
+    ) {
+        MainTab.entries.forEach { tab ->
+            val isRadio = tab == MainTab.Radio
+            NavigationBarItem(
+                selected = selectedTab == tab,
+                onClick = { onSelectTab(tab) },
+                icon = {
+                    if (isRadio) {
+                        RadioNavIcon(selected = selectedTab == tab, size = 40.dp, iconSize = 21.dp)
+                    } else {
+                        Icon(
+                            tab.icon(),
+                            contentDescription = tab.label,
+                            modifier = Modifier.size(21.dp),
+                        )
+                    }
+                },
+                label = {
+                    Text(
+                        tab.label,
+                        maxLines = 1,
+                        softWrap = false,
+                        fontSize = 9.sp,
+                        fontWeight = if (isRadio) FontWeight.Bold else FontWeight.Normal,
+                    )
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun LandscapeMainNavigationRail(
+    selectedTab: MainTab,
+    onSelectTab: (MainTab) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .background(PailerSurface.copy(alpha = 0.94f))
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .windowInsetsPadding(WindowInsets.navigationBars)
+            .padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly,
+    ) {
+        MainTab.entries.forEach { tab ->
+            val selected = selectedTab == tab
+            val isRadio = tab == MainTab.Radio
+            Box(
+                modifier = Modifier
+                    .width(54.dp)
+                    .height(58.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(
+                        if (selected && !isRadio) {
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                        } else {
+                            Color.Transparent
+                        },
+                    )
+                    .clickable { onSelectTab(tab) },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isRadio) {
+                    RadioNavIcon(selected = selected, size = 40.dp, iconSize = 21.dp)
+                } else {
+                    Icon(
+                        tab.icon(),
+                        contentDescription = tab.label,
+                        tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RadioNavIcon(
+    selected: Boolean,
+    size: Dp,
+    iconSize: Dp,
+) {
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(if (selected) PailerRed else PailerRed.copy(alpha = 0.75f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Filled.Radio,
+            contentDescription = MainTab.Radio.label,
+            tint = Color.White,
+            modifier = Modifier.size(iconSize),
+        )
+    }
+}
+
+@Composable
 private fun LibraryHeader(
     query: String,
     isLoading: Boolean,
@@ -1156,13 +1275,13 @@ private fun LibraryHeader(
     showSearch: Boolean = true,
 ) {
     // Sem busca (aba Início) a logo centraliza no lugar de ficar encostada a esquerda com um
-    // espaco vazio grande do lado - Box com align() em vez do Row de sempre, engrenagem continua
+    // espaco vazio grande do lado - Box com align() em vez do Row de sempre, menu continua
     // no canto direito (mesma posicao das outras abas, pedido do usuario 10/09/2026).
     if (!showSearch) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 8.dp),
+                .padding(horizontal = 18.dp, vertical = 2.dp),
         ) {
             HeaderLogo(modifier = Modifier.align(Alignment.Center))
             HeaderSettingsButton(
@@ -1176,7 +1295,7 @@ private fun LibraryHeader(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 8.dp),
+            .padding(horizontal = 18.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         HeaderLogo()
@@ -1184,8 +1303,8 @@ private fun LibraryHeader(
         Row(
             modifier = Modifier
                 .weight(1f)
-                .height(34.dp)
-                .clip(RoundedCornerShape(17.dp))
+                .height(30.dp)
+                .clip(RoundedCornerShape(15.dp))
                 .background(MaterialTheme.colorScheme.surface)
                 .padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1242,13 +1361,13 @@ private fun HeaderSettingsButton(onSettings: () -> Unit, isLoading: Boolean, mod
     IconButton(
         onClick = onSettings,
         enabled = !isLoading,
-        modifier = modifier.size(36.dp),
+        modifier = modifier.size(30.dp),
     ) {
         Icon(
-            Icons.Filled.Settings,
+            Icons.Filled.MoreVert,
             contentDescription = "Configuracoes",
-            tint = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.size(20.dp),
+            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.38f),
+            modifier = Modifier.size(18.dp),
         )
     }
 }
@@ -1262,11 +1381,13 @@ private fun LibrarySectionTabs(
     selected: LibrarySection,
     onSelect: (LibrarySection) -> Unit,
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 18.dp)
-            .padding(bottom = 10.dp),
+            .padding(bottom = if (isLandscape) 8.dp else 10.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         LibrarySection.entries.forEach { section ->
@@ -1279,11 +1400,11 @@ private fun LibrarySectionTabs(
             ) {
                 Text(
                     section.label,
-                    modifier = Modifier.padding(vertical = 8.dp),
+                    modifier = Modifier.padding(vertical = if (isLandscape) 6.dp else 8.dp),
                     textAlign = TextAlign.Center,
                     maxLines = 1,
                     softWrap = false,
-                    fontSize = 12.sp,
+                    fontSize = if (isLandscape) 11.sp else 12.sp,
                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                     color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -3515,6 +3636,7 @@ private fun HomeScreen(
     favoriteAlbums: List<LocalAlbum>,
     radios: List<LocalRadio>,
     player: PlayerUiState,
+    lyrics: LyricsUiState = LyricsUiState(),
     onContinue: () -> Unit,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onOpenRadio: (LocalRadio) -> Unit,
@@ -3538,6 +3660,7 @@ private fun HomeScreen(
     }
     val homePlaybackContent = when {
         player.hasMedia && !radioIsActive -> HomePlaybackCardContent(
+            songId = player.songId,
             title = player.title.ifBlank { currentPlayerSong?.title.orEmpty() },
             artist = player.artist.ifBlank { currentPlayerSong?.artist.orEmpty() },
             album = player.album.ifBlank { currentPlayerSong?.album.orEmpty() },
@@ -3548,6 +3671,7 @@ private fun HomeScreen(
             isCurrentMedia = true,
         )
         continueSong != null && !radioIsActive -> HomePlaybackCardContent(
+            songId = continueSong.id,
             title = continueSong.title,
             artist = continueSong.artist,
             album = continueSong.album,
@@ -3569,6 +3693,7 @@ private fun HomeScreen(
             item {
                 LiveNowRadioCard(
                     player = player,
+                    lyrics = lyrics,
                     onClick = onOpenPlayer,
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
                 )
@@ -3581,6 +3706,7 @@ private fun HomeScreen(
                 ContinueListeningCard(
                     content = homePlaybackContent,
                     isPlaying = player.hasMedia && player.isPlaying,
+                    lyrics = if (homePlaybackContent.isCurrentMedia) lyrics else LyricsUiState(),
                     onClick = if (homePlaybackContent.isCurrentMedia) onOpenCurrentPlayer else onContinue,
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
                 )
@@ -4006,6 +4132,8 @@ private fun ArtistsScreen(
     photoUriFor: (LocalArtist) -> Uri? = { null },
     scrollState: ScrollState = rememberScrollState(),
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     // Bento: favoritos ocupam bloco 2x2 de verdade, os demais fluem 1x1 ao redor - por isso
     // isso nao e mais LazyVerticalGrid (GridItemSpan so estica largura dentro da MESMA linha,
     // nao da pra reservar altura extra com vizinhos preenchendo do lado). Ver BentoGrid.
@@ -4013,17 +4141,23 @@ private fun ArtistsScreen(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
-            .padding(horizontal = 18.dp, vertical = 12.dp),
+            .padding(
+                horizontal = if (isLandscape) 14.dp else 18.dp,
+                vertical = if (isLandscape) 8.dp else 12.dp,
+            ),
     ) {
         BentoGrid(
             items = artists,
-            isFavorite = { it.key in favoriteArtistKeys },
+            isFavorite = { !isLandscape && it.key in favoriteArtistKeys },
+            columns = if (isLandscape) 4 else 3,
+            gap = if (isLandscape) 10.dp else 12.dp,
         ) { artist ->
             ArtistGridCard(
                 artist = artist,
                 onClick = { onOpenArtist(artist) },
                 onLongClick = { onLongPressArtist(artist) },
                 photoUri = photoUriFor(artist),
+                compact = isLandscape,
             )
         }
     }
@@ -4929,22 +5063,30 @@ private fun AlbumsScreen(
     favoriteAlbumKeys: Set<String> = emptySet(),
     scrollState: ScrollState = rememberScrollState(),
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     // Mesmo bento de ArtistsScreen (ver BentoGrid) - pedido do usuario (04/09/2026): favoritar
     // um album tambem deve dar capa maior, igual ja acontecia so pra artista.
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
-            .padding(horizontal = 18.dp, vertical = 12.dp),
+            .padding(
+                horizontal = if (isLandscape) 14.dp else 18.dp,
+                vertical = if (isLandscape) 8.dp else 12.dp,
+            ),
     ) {
         BentoGrid(
             items = albums,
-            isFavorite = { it.key in favoriteAlbumKeys },
+            isFavorite = { !isLandscape && it.key in favoriteAlbumKeys },
+            columns = if (isLandscape) 4 else 3,
+            gap = if (isLandscape) 10.dp else 12.dp,
         ) { album ->
             AlbumGridCard(
                 album = album,
                 onClick = { onOpenAlbum(album) },
                 onLongClick = { onLongPressAlbum(album) },
+                compact = isLandscape,
             )
         }
     }
@@ -5398,13 +5540,15 @@ private fun SongsScreen(
     onDeleteSong: (LocalSong) -> Unit = {},
     listState: LazyGridState = rememberLazyGridState(),
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
+        columns = GridCells.Fixed(if (isLandscape) 4 else 3),
         state = listState,
         flingBehavior = rememberSoftFlingBehavior(),
-        contentPadding = PaddingValues(18.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        contentPadding = PaddingValues(if (isLandscape) 14.dp else 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 18.dp),
     ) {
         gridItems(songs, key = { it.id }) { song ->
             SongGridCard(
@@ -5413,6 +5557,7 @@ private fun SongsScreen(
                 onClick = { onPlay(songs.indexOf(song)) },
                 onLongClick = { onDeleteSong(song) },
                 onToggleFavorite = { onToggleSongFavorite(song) },
+                compact = isLandscape,
             )
         }
     }
@@ -5422,26 +5567,29 @@ private fun SongsScreen(
 private fun PlaylistsScreen(
     radios: List<LocalRadio>,
     player: PlayerUiState,
+    lyrics: LyricsUiState = LyricsUiState(),
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenPlayer: () -> Unit,
     showGifBanner: Boolean = true,
     listState: LazyGridState = rememberLazyGridState(),
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Fixed(if (isLandscape) 4 else 2),
         state = listState,
         flingBehavior = rememberSoftFlingBehavior(),
-        contentPadding = PaddingValues(18.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        contentPadding = PaddingValues(if (isLandscape) 14.dp else 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 14.dp),
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 18.dp),
     ) {
         // O banner ambiente some quando ha radio tocando pra nao duplicar o gif junto do
         // LiveNowRadioCard, que ja tem seu proprio fundo animado.
         if (showGifBanner) {
             if (radioIsActive) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
-                    LiveNowRadioCard(player = player, onClick = onOpenPlayer)
+                    LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer)
                 }
             } else {
                 item(span = { GridItemSpan(maxLineSpan) }) {
@@ -5464,6 +5612,7 @@ private fun PlaylistsScreen(
 private fun RadioDetailScreen(
     radio: LocalRadio,
     player: PlayerUiState,
+    lyrics: LyricsUiState = LyricsUiState(),
     sessionSongs: List<LocalSong>,
     // Mesmo default de RadioBulletinSettings.songsBetweenBulletins (RadioBulletin.kt) - so usado
     // se algum chamador nao passar o valor real das configuracoes de boletim.
@@ -5506,7 +5655,7 @@ private fun RadioDetailScreen(
         val isInSession = player.activeRadioName == radio.name && player.hasMedia
         if (isInSession) {
             item {
-                LiveNowRadioCard(player = player, onClick = onOpenPlayer)
+                LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer)
             }
             // Ja mostrando a rádio ao vivo no card acima (nome, faixa atual, capa) - repetir
             // mosaico/nome/descricao aqui embaixo seria redundante. So o botao pra sair.
@@ -5930,7 +6079,12 @@ private fun RadioNewsBreakCard() {
 }
 
 @Composable
-private fun LiveNowRadioCard(player: PlayerUiState, onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun LiveNowRadioCard(
+    player: PlayerUiState,
+    lyrics: LyricsUiState = LyricsUiState(),
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -6007,6 +6161,13 @@ private fun LiveNowRadioCard(player: PlayerUiState, onClick: () -> Unit, modifie
                             )
                         }
                     }
+                    HomeLyricsSubtitle(
+                        lyrics = lyrics,
+                        songId = player.songId,
+                        positionMs = player.positionMs,
+                        isPlaying = player.isPlaying,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
                     Spacer(Modifier.height(5.dp))
                     LinearProgressIndicator(
                         progress = {
@@ -6081,7 +6242,13 @@ private fun AlbumRow(album: LocalAlbum, onClick: () -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick: (() -> Unit)? = null, photoUri: Uri? = null) {
+private fun ArtistGridCard(
+    artist: LocalArtist,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    photoUri: Uri? = null,
+    compact: Boolean = false,
+) {
     val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
     val displayUri = photoUri ?: artworkSong?.artworkUri
     val displayEmbeddedSource = if (photoUri != null) null else artworkSong?.contentUri
@@ -6096,31 +6263,38 @@ private fun ArtistGridCard(artist: LocalArtist, onClick: () -> Unit, onLongClick
             embeddedSourceUri = displayEmbeddedSource,
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(1f),
-            iconModifier = Modifier.size(38.dp),
+                .aspectRatio(if (compact) 16f / 9f else 1f),
+            iconModifier = Modifier.size(if (compact) 30.dp else 38.dp),
         )
-        Spacer(Modifier.height(7.dp))
+        Spacer(Modifier.height(if (compact) 4.dp else 7.dp))
         Text(
             artist.name,
-            maxLines = 2,
+            maxLines = if (compact) 1 else 2,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.Normal,
-            style = MaterialTheme.typography.bodySmall,
+            style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
         )
-        Text(
-            "${artist.albumCount} albuns",
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.labelSmall,
-        )
+        if (!compact) {
+            Text(
+                "${artist.albumCount} albuns",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AlbumGridCard(album: LocalAlbum, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+private fun AlbumGridCard(
+    album: LocalAlbum,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    compact: Boolean = false,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -6132,33 +6306,35 @@ private fun AlbumGridCard(album: LocalAlbum, onClick: () -> Unit, onLongClick: (
                 songs = album.songs,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(1f),
+                    .aspectRatio(if (compact) 16f / 9f else 1f),
             )
         } else {
             ArtworkBox(
                 uri = album.artworkUri,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(1f),
-                iconModifier = Modifier.size(38.dp),
+                    .aspectRatio(if (compact) 16f / 9f else 1f),
+                iconModifier = Modifier.size(if (compact) 30.dp else 38.dp),
             )
         }
-        Spacer(Modifier.height(7.dp))
+        Spacer(Modifier.height(if (compact) 4.dp else 7.dp))
         Text(
             album.title,
-            maxLines = 2,
+            maxLines = if (compact) 1 else 2,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.Normal,
-            style = MaterialTheme.typography.bodySmall,
+            style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
         )
-        Text(
-            album.artist,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.labelSmall,
-        )
+        if (!compact) {
+            Text(
+                album.artist,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }
 
@@ -6170,6 +6346,7 @@ private fun SongGridCard(
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
     onToggleFavorite: (() -> Unit)? = null,
+    compact: Boolean = false,
 ) {
     Column(
         modifier = Modifier
@@ -6183,8 +6360,8 @@ private fun SongGridCard(
                 embeddedSourceUri = song.contentUri,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(1f),
-                iconModifier = Modifier.size(38.dp),
+                    .aspectRatio(if (compact) 16f / 9f else 1f),
+                iconModifier = Modifier.size(if (compact) 30.dp else 38.dp),
             )
             if (onToggleFavorite != null) {
                 IconButton(
@@ -6202,22 +6379,24 @@ private fun SongGridCard(
                 }
             }
         }
-        Spacer(Modifier.height(7.dp))
+        Spacer(Modifier.height(if (compact) 4.dp else 7.dp))
         Text(
             song.title,
-            maxLines = 2,
+            maxLines = if (compact) 1 else 2,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.Normal,
-            style = MaterialTheme.typography.bodySmall,
+            style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
         )
-        Text(
-            song.artist,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.labelSmall,
-        )
+        if (!compact) {
+            Text(
+                song.artist,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }
 
@@ -6920,6 +7099,7 @@ private fun ActionTile(
 }
 
 private data class HomePlaybackCardContent(
+    val songId: Long?,
     val title: String,
     val artist: String,
     val album: String,
@@ -6934,64 +7114,35 @@ private data class HomePlaybackCardContent(
 private fun ContinueListeningCard(
     content: HomePlaybackCardContent,
     isPlaying: Boolean,
+    lyrics: LyricsUiState = LyricsUiState(),
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     Column(modifier = modifier.fillMaxWidth()) {
         SectionTitle(if (isPlaying) "Tocando agora" else "Continuar ouvindo")
+        if (isLandscape) {
+            ContinueListeningLandscapeCard(
+                content = content,
+                isPlaying = isPlaying,
+                lyrics = lyrics,
+                onClick = onClick,
+            )
+            return@Column
+        }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
                 .clickable(onClick = onClick),
         ) {
-            Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)) {
-                SpinningVinylArtwork(
-                    uri = content.artworkUri,
-                    embeddedSourceUri = content.artworkSourceUri,
-                    isPlaying = isPlaying,
-                    modifier = Modifier.fillMaxSize(),
-                )
-                if (!isPlaying) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .size(64.dp)
-                            .clip(CircleShape)
-                            .background(PailerCharcoal.copy(alpha = 0.75f)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            Icons.Filled.PlayArrow,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(36.dp),
-                        )
-                    }
-                }
-                // Barra de progresso tipo "linha do tempo" no rodape da capa, igual a marca de
-                // progresso das thumbnails do YouTube - pedido do usuario pra dar mais cara de
-                // player pro card de "continuar ouvindo".
-                val progress = if (content.durationMs > 0) {
-                    (content.positionMs.toFloat() / content.durationMs.toFloat()).coerceIn(0f, 1f)
-                } else {
-                    0f
-                }
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(4.dp)
-                        .background(Color.White.copy(alpha = 0.3f)),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .fillMaxWidth(progress)
-                            .background(MaterialTheme.colorScheme.primary),
-                    )
-                }
-            }
+            HomePlaybackArtwork(
+                content = content,
+                isPlaying = isPlaying,
+                lyrics = lyrics,
+                modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+            )
             Spacer(Modifier.height(10.dp))
             Text(
                 content.title,
@@ -7021,6 +7172,188 @@ private fun ContinueListeningCard(
             )
         }
     }
+}
+
+@Composable
+private fun ContinueListeningLandscapeCard(
+    content: HomePlaybackCardContent,
+    isPlaying: Boolean,
+    lyrics: LyricsUiState,
+    onClick: () -> Unit,
+) {
+    val configuration = LocalConfiguration.current
+    val compactLandscape = configuration.screenHeightDp < 420
+    val cardHeight = if (compactLandscape) 194.dp else 232.dp
+    val artworkSize = if (compactLandscape) 176.dp else 212.dp
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(cardHeight)
+            .clip(RoundedCornerShape(12.dp))
+            .background(PailerSurface.copy(alpha = 0.5f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(0.46f)
+                .fillMaxHeight(),
+            contentAlignment = Alignment.Center,
+        ) {
+            HomePlaybackArtwork(
+                content = content,
+                isPlaying = isPlaying,
+                lyrics = lyrics,
+                modifier = Modifier.size(artworkSize),
+            )
+        }
+        Spacer(Modifier.width(18.dp))
+        Column(
+            modifier = Modifier.weight(0.54f),
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                content.title,
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                listOf(content.artist, content.album).filter { it.isNotBlank() }.joinToString(" · "),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                if (isPlaying && content.durationMs > 0) {
+                    "${formatDuration(content.positionMs)} de ${formatDuration(content.durationMs)}"
+                } else if (isPlaying) {
+                    "Tocando agora"
+                } else {
+                    "Retomar em ${formatDuration(content.positionMs)}"
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+            if (content.durationMs > 0) {
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    progress = {
+                        (content.positionMs.toFloat() / content.durationMs.toFloat()).coerceIn(0f, 1f)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(CircleShape),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomePlaybackArtwork(
+    content: HomePlaybackCardContent,
+    isPlaying: Boolean,
+    lyrics: LyricsUiState,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier) {
+        SpinningVinylArtwork(
+            uri = content.artworkUri,
+            embeddedSourceUri = content.artworkSourceUri,
+            isPlaying = isPlaying,
+            modifier = Modifier.fillMaxSize(),
+        )
+        HomeLyricsSubtitle(
+            lyrics = lyrics,
+            songId = content.songId,
+            positionMs = content.positionMs,
+            isPlaying = isPlaying,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+        )
+        if (!isPlaying) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(64.dp)
+                    .clip(CircleShape)
+                    .background(PailerCharcoal.copy(alpha = 0.75f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Filled.PlayArrow,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(36.dp),
+                )
+            }
+        }
+        val progress = if (content.durationMs > 0) {
+            (content.positionMs.toFloat() / content.durationMs.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(4.dp)
+                .background(Color.White.copy(alpha = 0.3f)),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(progress)
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeLyricsSubtitle(
+    lyrics: LyricsUiState,
+    songId: Long?,
+    positionMs: Long,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (
+        !isPlaying ||
+        songId == null ||
+        lyrics.songId != songId ||
+        lyrics.lyrics.songId != songId ||
+        lyrics.isLoading ||
+        lyrics.isFetching ||
+        lyrics.lyrics.isEmpty ||
+        !lyrics.lyrics.synced
+    ) return
+    val lines = lyrics.lyrics.lines
+    val currentIndex = LrcParser.currentLineIndex(lines, positionMs)
+    val currentText = lines.getOrNull(currentIndex)?.text?.takeIf { it.isNotBlank() } ?: return
+
+    Text(
+        text = currentText,
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        color = Color.White,
+        style = MaterialTheme.typography.bodyMedium,
+        fontWeight = FontWeight.SemiBold,
+        textAlign = TextAlign.Center,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+    )
 }
 
 @Composable
@@ -7197,6 +7530,10 @@ private fun MiniPlayer(
     onExitRadio: () -> Unit,
     onDislike: () -> Unit,
 ) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
+    val iconButtonSize = if (isLandscape) 40.dp else 48.dp
+    val iconSize = if (isLandscape) 21.dp else 24.dp
     val isRadio = player.activeRadioName.isNotBlank()
     val statusLabel = when {
         isRadio -> player.playbackSource.ifBlank { "Rádio" }
@@ -7208,15 +7545,18 @@ private fun MiniPlayer(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable(onClick = onOpen)
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(
+                    horizontal = if (isLandscape) 12.dp else 14.dp,
+                    vertical = if (isLandscape) 5.dp else 10.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ArtworkBox(
                 uri = player.artworkUri,
                 embeddedSourceUri = player.artworkSourceUri,
-                modifier = Modifier.size(48.dp),
+                modifier = Modifier.size(if (isLandscape) 40.dp else 48.dp),
             )
-            Spacer(Modifier.width(12.dp))
+            Spacer(Modifier.width(if (isLandscape) 10.dp else 12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
                     statusLabel,
@@ -7244,59 +7584,66 @@ private fun MiniPlayer(
             // mesmo album e nunca mais entra no shuffle de nenhuma radio (ver
             // dislikeCurrentRadioSong). Fica a esquerda do coracaozinho.
             if (isRadio) {
-                IconButton(onClick = onDislike, enabled = player.songId != null) {
+                IconButton(onClick = onDislike, enabled = player.songId != null, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         Icons.Filled.ThumbDown,
                         contentDescription = "Nao curti essa faixa na radio",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
             }
-            IconButton(onClick = onToggleFavorite, enabled = player.songId != null) {
+            IconButton(onClick = onToggleFavorite, enabled = player.songId != null, modifier = Modifier.size(iconButtonSize)) {
                 Icon(
                     if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                     contentDescription = "Curtir faixa",
                     tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(iconSize),
                 )
             }
             // Modo radio: nao tem anterior/proxima (fila ao vivo nao suporta pular livremente,
             // ver ADR) e o play/pause vira mute (a radio "ao vivo" continua avancando, so
             // silencia - ver toggleRadioMute) + um botao pra sair de vez (power off).
             if (isRadio) {
-                IconButton(onClick = onToggleMute) {
+                IconButton(onClick = onToggleMute, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         if (player.isRadioMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
                         contentDescription = if (player.isRadioMuted) "Ativar som" else "Mutar",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
-                IconButton(onClick = onExitRadio) {
+                IconButton(onClick = onExitRadio, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         Icons.Filled.PowerSettingsNew,
                         contentDescription = "Sair da radio",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
             } else {
-                IconButton(onClick = onPrevious) {
+                IconButton(onClick = onPrevious, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         Icons.Filled.SkipPrevious,
                         contentDescription = "Anterior",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
-                IconButton(onClick = onToggle) {
+                IconButton(onClick = onToggle, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         if (player.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                         contentDescription = "Play/Pause",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
-                IconButton(onClick = onNext) {
+                IconButton(onClick = onNext, modifier = Modifier.size(iconButtonSize)) {
                     Icon(
                         Icons.Filled.SkipNext,
                         contentDescription = "Proxima",
                         tint = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.size(iconSize),
                     )
                 }
             }
@@ -7395,15 +7742,28 @@ private fun FullPlayer(
             }
             Spacer(Modifier.height(36.dp))
             if (isRadio) {
-                ArtworkBox(
-                    uri = player.artworkUri,
-                    embeddedSourceUri = player.artworkSourceUri,
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .aspectRatio(1f)
                         .clip(RoundedCornerShape(8.dp)),
-                    iconModifier = Modifier.size(84.dp),
-                )
+                ) {
+                    ArtworkBox(
+                        uri = player.artworkUri,
+                        embeddedSourceUri = player.artworkSourceUri,
+                        modifier = Modifier.fillMaxSize(),
+                        iconModifier = Modifier.size(84.dp),
+                    )
+                    HomeLyricsSubtitle(
+                        lyrics = lyrics,
+                        songId = player.songId,
+                        positionMs = player.positionMs,
+                        isPlaying = player.isPlaying,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 18.dp, vertical = 18.dp),
+                    )
+                }
             } else {
                 // Arrasta pro lado: pagina 0 = capa (chamada identica de ArtworkBox), pagina 1 = letra.
                 // Travado na MESMA caixa fillMaxWidth().aspectRatio(1f) que a capa ocupava, entao
@@ -8046,7 +8406,7 @@ private val artworkMemoryCache = LruCache<String, androidx.compose.ui.graphics.I
 // atras do conteudo. Decodifica num tamanho minusculo (BACKDROP_DECODE_TARGET_PX) de proposito -
 // o upscale ja produz um efeito suave por si so, e sobra pouco trabalho pra Modifier.blur() (que
 // so tem efeito real em API 31+; abaixo disso o proprio bitmap pequeno ja resolve visualmente).
-private val backdropArtworkCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(24)
+private val backdropArtworkCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(96)
 private const val BACKDROP_DECODE_TARGET_PX = 48
 
 private fun loadBackdropArtwork(context: android.content.Context, uri: Uri): androidx.compose.ui.graphics.ImageBitmap? =
@@ -8103,6 +8463,12 @@ private fun calculateBackdropSampleSize(width: Int, height: Int): Int {
     return sampleSize.coerceAtLeast(1)
 }
 
+private fun peekCachedBackdropArtwork(uri: Uri?, embeddedSourceUri: Uri?): androidx.compose.ui.graphics.ImageBitmap? {
+    embeddedSourceUri?.let { backdropArtworkCache.get("embedded:$it") }?.let { return it }
+    uri?.let { backdropArtworkCache.get(it.toString()) }?.let { return it }
+    return null
+}
+
 // Camada de fundo personalizada por album/artista: a capa em si, super reduzida, desfocada e com
 // baixa opacidade sobre a cor de fundo do tema - uma "marca dagua" leve que da identidade a tela
 // sem prejudicar a leitura do conteudo por cima. Colocar como primeiro filho do Box da tela (antes
@@ -8114,12 +8480,16 @@ private fun AlbumArtBackdrop(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    var image by remember(uri, embeddedSourceUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var image by remember(uri, embeddedSourceUri) {
+        mutableStateOf(peekCachedBackdropArtwork(uri, embeddedSourceUri))
+    }
 
     LaunchedEffect(uri, embeddedSourceUri) {
-        image = withContext(Dispatchers.IO) {
-            embeddedSourceUri?.let { loadEmbeddedBackdropArtwork(context, it) }
-                ?: uri?.let { loadBackdropArtwork(context, it) }
+        if (image == null) {
+            image = withContext(Dispatchers.IO) {
+                embeddedSourceUri?.let { loadEmbeddedBackdropArtwork(context, it) }
+                    ?: uri?.let { loadBackdropArtwork(context, it) }
+            }
         }
     }
 
@@ -8130,18 +8500,55 @@ private fun AlbumArtBackdrop(
                 bitmap = bitmap,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                alpha = 0.24f,
+                alpha = 0.32f,
                 modifier = Modifier
                     .fillMaxSize()
                     .then(
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Modifier.blur(24.dp) else Modifier,
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Modifier.blur(16.dp) else Modifier,
                     ),
             )
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(backgroundColor.copy(alpha = 0.55f)),
+                    .background(backgroundColor.copy(alpha = 0.42f)),
             )
+        }
+    }
+}
+
+@Composable
+private fun BackgroundGrainOverlay(
+    modifier: Modifier = Modifier,
+    alpha: Float = 0.018f,
+) {
+    val density = LocalDensity.current
+    val stepPx = with(density) { 7.dp.toPx() }
+    val dotPx = with(density) { 0.8.dp.toPx() }.coerceAtLeast(1f)
+    Canvas(modifier.fillMaxSize()) {
+        var y = 0f
+        var row = 0
+        while (y < size.height) {
+            var x = if (row % 2 == 0) 0f else stepPx * 0.5f
+            var column = 0
+            while (x < size.width) {
+                val seed = (row * 31 + column * 17) % 13
+                if (seed < 7) {
+                    val color = if (seed % 2 == 0) {
+                        Color.White.copy(alpha = alpha)
+                    } else {
+                        Color.Black.copy(alpha = alpha * 0.65f)
+                    }
+                    drawRect(
+                        color = color,
+                        topLeft = Offset(x, y),
+                        size = Size(dotPx, dotPx),
+                    )
+                }
+                x += stepPx
+                column++
+            }
+            y += stepPx
+            row++
         }
     }
 }
