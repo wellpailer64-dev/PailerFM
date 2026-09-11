@@ -131,6 +131,8 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -615,6 +617,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             onToggle = viewModel::togglePlayPause,
                             onPrevious = viewModel::skipPrevious,
                             onNext = viewModel::skipNext,
+                            onToggleMute = viewModel::toggleRadioMute,
+                            onExitRadio = viewModel::stopRadio,
                         )
                     }
                     NavigationBar(
@@ -6935,7 +6939,10 @@ private fun MiniPlayer(
     onToggle: () -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
+    onToggleMute: () -> Unit,
+    onExitRadio: () -> Unit,
 ) {
+    val isRadio = player.activeRadioName.isNotBlank()
     Surface(color = PailerSurface.copy(alpha = 0.94f)) {
         Row(
             modifier = Modifier
@@ -6981,9 +6988,25 @@ private fun MiniPlayer(
                     tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
                 )
             }
-            // Anterior/Proxima somem no modo radio, igual FullPlayer (fila ao vivo nao suporta
-            // pular pra tras/frente livremente) - só o play/pause e o coracaozinho continuam.
-            if (player.activeRadioName.isBlank()) {
+            // Modo radio (pedido do usuario 11/09/2026): nao tem anterior/proxima (fila ao vivo
+            // nao suporta pular livremente, ver ADR) e o play/pause vira mute (a radio "ao vivo"
+            // continua avancando, so silencia - ver toggleRadioMute) + um botao pra sair de vez.
+            if (isRadio) {
+                IconButton(onClick = onToggleMute) {
+                    Icon(
+                        if (player.isRadioMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                        contentDescription = if (player.isRadioMuted) "Ativar som" else "Mutar",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+                IconButton(onClick = onExitRadio) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = "Sair da radio",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+            } else {
                 IconButton(onClick = onPrevious) {
                     Icon(
                         Icons.Filled.SkipPrevious,
@@ -6991,15 +7014,13 @@ private fun MiniPlayer(
                         tint = MaterialTheme.colorScheme.onBackground,
                     )
                 }
-            }
-            IconButton(onClick = onToggle) {
-                Icon(
-                    if (player.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentDescription = "Play/Pause",
-                    tint = MaterialTheme.colorScheme.onBackground,
-                )
-            }
-            if (player.activeRadioName.isBlank()) {
+                IconButton(onClick = onToggle) {
+                    Icon(
+                        if (player.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = "Play/Pause",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
                 IconButton(onClick = onNext) {
                     Icon(
                         Icons.Filled.SkipNext,

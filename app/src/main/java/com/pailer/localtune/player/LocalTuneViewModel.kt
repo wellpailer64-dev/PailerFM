@@ -121,6 +121,7 @@ data class PlayerUiState(
     val currentNewsHeadline: String = "",
     val upcomingTracks: List<String> = emptyList(),
     val isPlaying: Boolean = false,
+    val isRadioMuted: Boolean = false,
     val hasMedia: Boolean = false,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
@@ -360,6 +361,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var lastRecordedMediaId: String? = null
     private var lastPositionPersistedAtMs: Long = 0L
     private var radioNewsEnabled = false
+    // Mute do mini player em modo radio (pedido do usuario 11/09/2026: "nao temos avancar,
+    // vamos ter mute no lugar de pausar" - radio "ao vivo" continua avancando, so silencia).
+    // Cobre os 2 canais de audio que a radio usa (controller = musica, announcementPlayer =
+    // vinheta/passagem/boletim) - ver radioVolume()/toggleRadioMute(). Reseta sozinho em
+    // startRadioNewsMode() (cada sessao nova comeca sem mute).
+    private var radioMuted = false
     private var completedRadioSongs = 0
     private var newsBulletins: List<RadioScript> = emptyList()
     private var bulletinReloadInFlight = false
@@ -2211,6 +2218,25 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Volume "alvo" pros 2 canais de audio da radio (controller = musica, announcementPlayer =
+    // vinheta/passagem/boletim) - 0 quando o usuario mutou pelo mini player, 1 normal. Os pontos
+    // que restauram volume depois de um fade (cancelEarlyNewsBreakIfPending/speakNextNewsBreak)
+    // usam isso em vez de 1f fixo, senao o boletim seguinte desmutava a radio sozinho.
+    private fun radioVolume(): Float = if (radioMuted) 0f else 1f
+
+    // Botao de mute do mini player em modo radio (substitui o play/pause ali - pedido do usuario
+    // 11/09/2026: radio "ao vivo" continua avancando/contando tempo, so silencia, nao pausa de
+    // verdade). Aplica nos 2 canais de audio na hora (musica + o que estiver tocando agora no
+    // announcementPlayer, seja vinheta/passagem/boletim).
+    fun toggleRadioMute() {
+        if (activeRadioName.isBlank()) return
+        radioMuted = !radioMuted
+        val target = radioVolume()
+        controller?.volume = target
+        announcementPlayer?.setVolume(target, target)
+        controller?.let { updatePlayerState(it) }
+    }
+
     // "Sair da radio" - ao contrario de so fechar a tela (que deixa a radio tocando em
     // segundo plano, ver openActiveRadio em LocalTuneApp.kt), isso para a reproducao de
     // verdade e esvazia a fila: mediaItemCount some, hasMedia fica false, mini player some.
@@ -2354,9 +2380,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         announcementPlayer = null
         textToSpeech?.stop()
         // Radio pode ser desligada no meio do fade de checkForEarlyNewsBreak (ver la) - restaura
-        // o volume senao a musica fica muda dependendo de onde o fade parou.
+        // o volume senao a musica fica muda dependendo de onde o fade parou. Sempre 1f (nao
+        // radioVolume()) e reseta o mute - cada sessao de radio nova comeca sem mute.
         newsBreakFadeInProgress = false
         newsBreakSkipsAheadOnResume = false
+        radioMuted = false
         controller?.volume = 1f
     }
 
@@ -2396,7 +2424,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             onFinished()
             return
         }
-        player.setVolume(volume, volume)
+        // Multiplica por radioVolume() (nao aplica o volume cru) - preserva a proporcao
+        // vinheta(1.0)/passagem(PASSAGEM_VOLUME) quando nao mutado, zera os dois quando o
+        // usuario mutou no mini player (ver toggleRadioMute).
+        val applied = volume * radioVolume()
+        player.setVolume(applied, applied)
         player.setOnCompletionListener {
             it.release()
             if (announcementPlayer === it) announcementPlayer = null
@@ -2830,7 +2862,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun cancelEarlyNewsBreakIfPending() {
         if (!newsBreakSkipsAheadOnResume) return
         newsBreakSkipsAheadOnResume = false
-        controller?.volume = 1f
+        controller?.volume = radioVolume()
     }
 
     private fun speakNextNewsBreak() {
@@ -2893,7 +2925,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // Volume pode ter ficado em 0 por causa do fade de checkForEarlyNewsBreak/
         // fadeOutRadioVolume - restaura aqui pra quando a musica (essa ou a proxima, ver
         // newsBreakSkipsAheadOnResume em finishNewsBreak) voltar a tocar depois do boletim.
-        player.volume = 1f
+        // radioVolume() (nao 1f fixo) - se o usuario mutou no mini player, o boletim seguinte
+        // nao pode desmutar a radio sozinho.
+        player.volume = radioVolume()
 
         // Ponte curta antes do boletim (musica > passagem > boletim) - alterna entre as duas
         // faixas, ver playPassagem(). Cobre os dois caminhos abaixo (audio pronto e fallback
@@ -3115,6 +3149,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         runCatching {
             MediaPlayer().apply {
                 setDataSource(file.absolutePath)
+                // Sem isso, o boletim ao vivo tocava no volume cheio (default do MediaPlayer)
+                // mesmo com o usuario tendo mutado a radio no mini player (ver toggleRadioMute).
+                setVolume(radioVolume(), radioVolume())
                 setOnCompletionListener {
                     Log.d(TAG_RADIO_VOICE, "announcement file completed bytes=${file.length()}")
                     it.release()
@@ -3365,6 +3402,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             currentNewsHeadline = currentNewsHeadline,
             upcomingTracks = cachedUpcomingTracks,
             isPlaying = player.isPlaying,
+            isRadioMuted = radioMuted,
             hasMedia = player.mediaItemCount > 0,
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = duration.coerceAtLeast(0L),
