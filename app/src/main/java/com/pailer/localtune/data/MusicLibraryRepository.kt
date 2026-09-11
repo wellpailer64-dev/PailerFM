@@ -1631,9 +1631,21 @@ class MusicLibraryRepository(private val context: Context) {
             if (normalizedExcludedTokens.any { metadata.contains(it) }) return false
             if (yearRange != null && song.year !in yearRange) return false
             val metadataMatch = normalizedMetadataTokens.any { metadata.contains(it) }
+            val genreMatch = normalizedGenreTokens.any { genre.contains(it) }
             if (requireMetadataTokenMatch) {
+                // Duas portas de entrada independentes (achado ao vivo 11/09/2026, pedido do
+                // usuario: "quase nao tem Creed/Failure/Superheaven" - os tres tem "Grunge" DE
+                // VERDADE na tag de genero, MediaStore confirma, mas nenhum estava na lista
+                // curada abaixo, entao ficavam de fora inteiros so por isso):
+                // (a) a TAG de genero da faixa ja diz "grunge" sozinha - vale pra QUALQUER
+                //     artista corretamente tageado, esteja ou nao na lista curada;
+                // (b) esta na lista curada E (quando requireGenreTokenMatch) a tag tambem
+                //     confirma - rede de seguranca so pra quem a tag deixa duvida (ex.: Dinosaur
+                //     Jr tageado "Alternative" - fica de fora por essa via, mas continuaria
+                //     entrando pela (a) se um dia a tag dele virasse "Grunge").
+                if (genreMatch) return true
                 if (!metadataMatch) return false
-                return !requireGenreTokenMatch || normalizedGenreTokens.any { genre.contains(it) }
+                return !requireGenreTokenMatch
             }
             if (normalizedGenreTokens.isEmpty() && normalizedMetadataTokens.isEmpty()) {
                 // Perfil so por ano: ja passou pelo filtro de yearRange acima.
