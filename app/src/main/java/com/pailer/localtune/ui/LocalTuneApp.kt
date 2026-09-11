@@ -690,6 +690,10 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         settingsPage = SettingsPage.Main
                         showSettings = true
                     },
+                    // Pedido do usuario (10/09/2026): busca só faz sentido em Biblioteca/Rádio -
+                    // a aba Início não tem lista pra filtrar, então a barra sumia sem função. Logo
+                    // centraliza sozinha quando a busca some (ver LibraryHeader).
+                    showSearch = selectedTab != MainTab.Home,
                 )
 
                 val openedAlbum = selectedAlbum
@@ -1121,76 +1125,101 @@ private fun LibraryHeader(
     onSettings: () -> Unit,
     showSearch: Boolean = true,
 ) {
+    // Sem busca (aba Início) a logo centraliza no lugar de ficar encostada a esquerda com um
+    // espaco vazio grande do lado - Box com align() em vez do Row de sempre, engrenagem continua
+    // no canto direito (mesma posicao das outras abas, pedido do usuario 10/09/2026).
+    if (!showSearch) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+        ) {
+            HeaderLogo(modifier = Modifier.align(Alignment.Center))
+            HeaderSettingsButton(
+                onSettings = onSettings,
+                isLoading = isLoading,
+                modifier = Modifier.align(Alignment.CenterEnd),
+            )
+        }
+        return
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 18.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            buildAnnotatedString {
-                withStyle(SpanStyle(fontFamily = FontFamily.Cursive)) { append("Pailer ") }
-                withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary)) { append("FM") }
-            },
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onBackground,
-            maxLines = 1,
-        )
-        if (showSearch) {
-            Spacer(Modifier.width(10.dp))
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(34.dp)
-                    .clip(RoundedCornerShape(17.dp))
-                    .background(MaterialTheme.colorScheme.surface)
-                    .padding(horizontal = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    Icons.Filled.Search,
-                    contentDescription = null,
-                    modifier = Modifier.size(15.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.width(6.dp))
-                Box(Modifier.weight(1f)) {
-                    if (query.isEmpty()) {
-                        Text(
-                            "Buscar",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    BasicTextField(
-                        value = query,
-                        onValueChange = onQueryChange,
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(
-                            color = MaterialTheme.colorScheme.onBackground,
-                        ),
-                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                    )
-                }
-            }
-        } else {
-            Spacer(Modifier.weight(1f))
-        }
-        Spacer(Modifier.width(4.dp))
-        IconButton(
-            onClick = onSettings,
-            enabled = !isLoading,
-            modifier = Modifier.size(36.dp),
+        HeaderLogo()
+        Spacer(Modifier.width(10.dp))
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .height(34.dp)
+                .clip(RoundedCornerShape(17.dp))
+                .background(MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                Icons.Filled.Settings,
-                contentDescription = "Configuracoes",
-                tint = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.size(20.dp),
+                Icons.Filled.Search,
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Spacer(Modifier.width(6.dp))
+            Box(Modifier.weight(1f)) {
+                if (query.isEmpty()) {
+                    Text(
+                        "Buscar",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                BasicTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        color = MaterialTheme.colorScheme.onBackground,
+                    ),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                )
+            }
         }
+        Spacer(Modifier.width(4.dp))
+        HeaderSettingsButton(onSettings = onSettings, isLoading = isLoading)
+    }
+}
+
+@Composable
+private fun HeaderLogo(modifier: Modifier = Modifier) {
+    Text(
+        buildAnnotatedString {
+            withStyle(SpanStyle(fontFamily = FontFamily.Cursive)) { append("Pailer ") }
+            withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary)) { append("FM") }
+        },
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.onBackground,
+        maxLines = 1,
+        modifier = modifier,
+    )
+}
+
+@Composable
+private fun HeaderSettingsButton(onSettings: () -> Unit, isLoading: Boolean, modifier: Modifier = Modifier) {
+    IconButton(
+        onClick = onSettings,
+        enabled = !isLoading,
+        modifier = modifier.size(36.dp),
+    ) {
+        Icon(
+            Icons.Filled.Settings,
+            contentDescription = "Configuracoes",
+            tint = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.size(20.dp),
+        )
     }
 }
 
