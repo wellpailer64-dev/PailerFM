@@ -2420,14 +2420,49 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         if (core != null) {
                             Log.d(TAG_RADIO_VOICE, "boletim: usando nucleo pre-aquecido (restam ${coreBuffer.size} no nucleo)")
                             script = core.script
-                            file = core.coreFile
                             scriptFromGemini = core.scriptFromGemini
-                            voiceFromGemini = core.voiceFromGemini
+                            if (core.coreFile != null) {
+                                file = core.coreFile
+                                voiceFromGemini = core.voiceFromGemini
+                            } else if (radioVoiceState.value.isEnabled) {
+                                // Nucleo restaurado do manifest sem audio (ex.: foi gerado numa
+                                // sessao com a voz desligada) - sintetiza AGORA em vez de deixar
+                                // esse item entrar no bulletinBuffer sem audio (achado ao vivo
+                                // 10/09/2026: 10 nucleos assim ficaram plantados na FRENTE da fila
+                                // e cada um, na vez de tocar, caia direto pro TTS do Android -
+                                // "boletim: sem audio pronto; usando TTS Android imediato" - mesmo
+                                // com a voz Gemini/local ligada e funcionando normalmente agora).
+                                syncBulletinBufferState(
+                                    statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...",
+                                )
+                                val voiceOutcome = voiceSynthesisMutex.withLock {
+                                    synthesizeLocalVoiceSafely(
+                                        script, BULLETIN_PREP_TIMEOUT_MS,
+                                        onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                        onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
+                                    )
+                                }
+                                file = voiceOutcome.file
+                                voiceFromGemini = voiceOutcome.fromGemini
+                            } else {
+                                file = null
+                                voiceFromGemini = false
+                            }
                             // Regrava o manifest agora que o item saiu do coreBuffer (ainda
                             // protegido de limpeza via sourceCore, ver saveCoreBufferManifest).
                             saveCoreBufferManifest()
-                            // Repoe o nucleo consumido, em paralelo (nao espera terminar).
-                            prewarmCoreBuffer()
+                            // NAO chama prewarmCoreBuffer() aqui de proposito (removido
+                            // 10/09/2026, achado ao vivo monitorando logcat: "gastou 1, produz 1"
+                            // era a regra pedida, mas promover um nucleo do coreBuffer pro
+                            // bulletinBuffer NAO gasta nada de verdade - o conteudo so mudou de
+                            // gaveta, o estoque total (coreBuffer+bulletinBuffer) continua o
+                            // mesmo. Entrar numa radio com o coreBuffer cheio promovia ate 10 de
+                            // uma vez (ver historico "CORRIGIDO 10/09/2026" acima) e cada promocao
+                            // disparava uma reposicao aqui, gerando ate 10 boletins novos via
+                            // Gemini SEM NADA TER TOCADO AINDA - com a cota gratuita de TTS
+                            // (limit: 10/chave) isso esgotava todas as chaves em minutos. Agora a
+                            // reposicao so dispara em speakNextNewsBreak(), no consumo de verdade
+                            // (boletim realmente vai ao ar).
                         } else {
                             freshGenerationDoneThisCall = true
                             val index = nextBulletinIndex % newsBulletins.size
@@ -2769,8 +2804,24 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             }
             coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE).writeText(array.toString())
             val referenced = allItems.mapNotNull { it.coreFile?.name }.toSet()
-            coreBufferDir.listFiles { file -> file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced }
-                ?.forEach { it.delete() }
+            // Margem de seguranca (achado ao vivo 10/09/2026): prewarmCoreBuffer() escreve o .wav
+            // em disco (dentro do withContext(IO) de GeminiFlashTtsEngine/LocalRadioVoiceEngine)
+            // ANTES de voltar pra Main e so entao dar coreBuffer.addLast()+saveCoreBufferManifest()
+            // - enquanto isso (sintese Gemini as vezes leva 60-90s com a cota no talo, ver
+            // GeminiFlashTtsEngine.GEMINI_TTS_RETRY_DELAY_MS), QUALQUER outra chamada concorrente
+            // a este metodo (refillBulletinBuffer roda "em paralelo" com esse prewarm, ver
+            // comentario dele) varria a pasta, via o arquivo ja escrito mas ainda nao registrado em
+            // nenhum buffer, e apagava como "orfao" - o item entrava na fila com script pronto mas
+            // arquivo fantasma (nao existe mais no disco), so descoberto na hora de tocar
+            // (speakNextNewsBreak: prepared.file?.takeIf { it.exists() } vinha null -> caia pro TTS
+            // do Android mesmo pra um boletim "100% Gemini" que a bolinha mostrava pronto). So
+            // apagar arquivo com alguns minutos de idade garante tempo de sobra pra qualquer sintese
+            // em andamento terminar e se registrar antes de ser considerado lixo de verdade.
+            val now = System.currentTimeMillis()
+            coreBufferDir.listFiles { file ->
+                file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced &&
+                    (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
+            }?.forEach { it.delete() }
         }.onFailure { Log.w(TAG_RADIO_VOICE, "nucleo: falha ao salvar manifest do buffer em disco", it) }
     }
 
@@ -3015,7 +3066,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // Regrava o manifest agora que o item saiu do bulletinBuffer de vez (vai tocar - "gasto"
         // de verdade, ver comentario de clearBulletinBuffer) - sem isso um processo morto logo
         // depois desse consumo ainda restauraria esse boletim ja falado na proxima abertura.
-        if (prepared != null) saveCoreBufferManifest()
+        if (prepared != null) {
+            saveCoreBufferManifest()
+            // Gasto de verdade acontece SO aqui (boletim realmente vai ao ar) - ver comentario
+            // removido de dentro da promocao em refillBulletinBuffer (10/09/2026): repor o
+            // coreBuffer (Nivel 1) precisa esperar o consumo de verdade, senao promover nucleos
+            // pro bulletinBuffer ao entrar numa radio (sem nada tocado ainda) disparava reposicao
+            // via Gemini pra cada um, torrando a cota gratuita de TTS a toa.
+            prewarmCoreBuffer()
+        }
         // Consumiu um item (ou tentou e o buffer estava vazio) - manda reabastecer ja, em
         // paralelo com a fala que vai comecar agora (ver ADR-019: buffer sempre com
         // BULLETIN_BUFFER_TARGET itens prontos, reposto assim que um sai).
@@ -3718,6 +3777,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // nada por radio (so promove o nucleo pronto direto, ver PreparedNewsCore), entao um
         // buffer maior nao adiciona trabalho novo, so reserva.
         const val BULLETIN_BUFFER_TARGET = 10
+
+        // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() (achado ao
+        // vivo 10/09/2026) - maior que o pior caso ja observado de uma sintese em andamento (~90s
+        // com a cota do Gemini no talo, retry por ate 8 chaves) com folga generosa.
+        const val ORPHAN_CLEANUP_GRACE_MS = 5 * 60 * 1000L
 
         // ~-5.2dB em amplitude linear (10^(-5.2/20)) - subido de 0.398 (-8dB, pedido do usuario
         // 02/09/2026 porque tocava alto demais) pra 0.55 (pedido do usuario 09/09/2026: "aumenta
