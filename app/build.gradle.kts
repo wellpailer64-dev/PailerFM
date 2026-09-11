@@ -17,6 +17,14 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// CI (ver .github/workflows/build-apk.yml) nao tem keystore.properties (fora do git de
+// proposito) - materializa o .jks decodificado do secret RELEASE_KEYSTORE_BASE64 num caminho
+// fixo dentro do checkout e passa senha/alias via env var, so em push/tag/workflow_dispatch
+// (nunca em pull_request, pra chave real nao ficar exposta num build de PR). RELEASE_KEYSTORE_PATH
+// vazio/ausente localmente = cai no bloco keystoreProperties acima, comportamento inalterado.
+val releaseKeystorePathFromEnv = System.getenv("RELEASE_KEYSTORE_PATH")
+val hasCiSigningConfig = !releaseKeystorePathFromEnv.isNullOrBlank()
+
 android {
     namespace = "com.pailer.localtune"
     compileSdk = 34
@@ -59,6 +67,13 @@ android {
                 keyAlias = keystoreProperties.getProperty("keyAlias")
                 keyPassword = keystoreProperties.getProperty("keyPassword")
             }
+        } else if (hasCiSigningConfig) {
+            create("release") {
+                storeFile = file(releaseKeystorePathFromEnv!!)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
         }
     }
 
@@ -66,10 +81,17 @@ android {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
-            // Chave de debug de proposito (nao a "release" acima) — ver comentario no topo
-            // do arquivo. Trocar pra signingConfigs.getByName("release") exige desinstalar
-            // o app do aparelho antes do proximo install (assinatura muda).
-            signingConfig = signingConfigs.getByName("debug")
+            // Local (keystore.properties nao existe na maquina de qualquer dev que nao seja
+            // a que gerou a chave): chave de debug de proposito — ver comentario no topo do
+            // arquivo, instalar por cima da build debug sem perder dados locais. CI (secrets
+            // do repo, so fora de pull_request - ver build-apk.yml) assina de verdade com a
+            // chave de release, pra release/tag publicado sair assinado com a chave que os
+            // aparelhos ja confiam.
+            signingConfig = if (hasCiSigningConfig) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

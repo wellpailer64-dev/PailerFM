@@ -47,10 +47,28 @@ jobs:
       - name: Gera local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
+      # So fora de pull_request - a chave de release real nunca fica exposta num build de PR
+      # (nem de fork nem de branch do proprio repo). Builds de PR continuam saindo com a
+      # assinatura de debug, igual sempre foi (ver app/build.gradle.kts).
+      - name: Materializa a keystore de release
+        if: github.event_name != 'pull_request'
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+
       - name: Build release APK
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ github.event_name != 'pull_request' && format('{0}/release.jks', github.workspace) || '' }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEYSTORE_PASSWORD || '' }}
+          RELEASE_KEY_ALIAS: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_ALIAS || '' }}
+          RELEASE_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_PASSWORD || '' }}
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Remove a keystore temporaria
+        if: always()
+        run: rm -f "$GITHUB_WORKSPACE/release.jks"
 
       - name: Renomeia APK
         run: |
