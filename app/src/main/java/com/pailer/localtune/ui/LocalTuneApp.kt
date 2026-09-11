@@ -40,6 +40,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -885,6 +886,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                 radioSession = emptyList()
                                 selectedRadio = it
                             },
+                            onOpenCurrentPlayer = { showFullPlayer = true },
                             onOpenPlayer = openActiveRadio,
                             onPlay = { list, index, shuffle -> viewModel.playSongs(list, index, shuffle, source = if (shuffle) "Misturar tudo" else "Biblioteca") },
                         )
@@ -3516,6 +3518,7 @@ private fun HomeScreen(
     onContinue: () -> Unit,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onOpenRadio: (LocalRadio) -> Unit,
+    onOpenCurrentPlayer: () -> Unit,
     onOpenPlayer: () -> Unit,
     onPlay: (List<LocalSong>, Int, Boolean) -> Unit,
 ) {
@@ -3530,6 +3533,32 @@ private fun HomeScreen(
     val homeSuggestedAlbums = remember(suggestedAlbums) { suggestedAlbums.take(6) }
     val homeFavoriteAlbums = remember(favoriteAlbums) { favoriteAlbums.take(6) }
     val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
+    val currentPlayerSong = remember(player.songId, songs) {
+        player.songId?.let { id -> songs.firstOrNull { it.id == id } }
+    }
+    val homePlaybackContent = when {
+        player.hasMedia && !radioIsActive -> HomePlaybackCardContent(
+            title = player.title.ifBlank { currentPlayerSong?.title.orEmpty() },
+            artist = player.artist.ifBlank { currentPlayerSong?.artist.orEmpty() },
+            album = player.album.ifBlank { currentPlayerSong?.album.orEmpty() },
+            artworkUri = player.artworkUri ?: currentPlayerSong?.artworkUri,
+            artworkSourceUri = player.artworkSourceUri ?: currentPlayerSong?.contentUri,
+            positionMs = player.positionMs,
+            durationMs = player.durationMs.takeIf { it > 0 } ?: currentPlayerSong?.durationMs ?: 0L,
+            isCurrentMedia = true,
+        )
+        continueSong != null && !radioIsActive -> HomePlaybackCardContent(
+            title = continueSong.title,
+            artist = continueSong.artist,
+            album = continueSong.album,
+            artworkUri = continueSong.artworkUri,
+            artworkSourceUri = continueSong.contentUri,
+            positionMs = continuePositionMs,
+            durationMs = continueSong.durationMs,
+            isCurrentMedia = false,
+        )
+        else -> null
+    }
 
     LazyColumn(
         flingBehavior = rememberSoftFlingBehavior(),
@@ -3545,14 +3574,14 @@ private fun HomeScreen(
                 )
             }
         }
-        // So mostra "Continuar ouvindo" quando nao ha radio tocando - com a radio ativa o
+        // So mostra "Tocando agora"/"Continuar ouvindo" quando nao ha radio tocando - com a radio ativa o
         // card "ao vivo" acima ja ocupa esse espaco (pedido do usuario).
-        if (continueSong != null && !radioIsActive) {
+        if (homePlaybackContent != null) {
             item {
                 ContinueListeningCard(
-                    song = continueSong,
-                    positionMs = continuePositionMs,
-                    onClick = onContinue,
+                    content = homePlaybackContent,
+                    isPlaying = player.hasMedia && player.isPlaying,
+                    onClick = if (homePlaybackContent.isCurrentMedia) onOpenCurrentPlayer else onContinue,
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
                 )
             }
@@ -6890,15 +6919,26 @@ private fun ActionTile(
     }
 }
 
+private data class HomePlaybackCardContent(
+    val title: String,
+    val artist: String,
+    val album: String,
+    val artworkUri: Uri?,
+    val artworkSourceUri: Uri?,
+    val positionMs: Long,
+    val durationMs: Long,
+    val isCurrentMedia: Boolean,
+)
+
 @Composable
 private fun ContinueListeningCard(
-    song: LocalSong,
-    positionMs: Long,
+    content: HomePlaybackCardContent,
+    isPlaying: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
-        SectionTitle("Continuar ouvindo")
+        SectionTitle(if (isPlaying) "Tocando agora" else "Continuar ouvindo")
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -6906,32 +6946,34 @@ private fun ContinueListeningCard(
                 .clickable(onClick = onClick),
         ) {
             Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)) {
-                ArtworkBox(
-                    uri = song.artworkUri,
-                    embeddedSourceUri = song.contentUri,
+                SpinningVinylArtwork(
+                    uri = content.artworkUri,
+                    embeddedSourceUri = content.artworkSourceUri,
+                    isPlaying = isPlaying,
                     modifier = Modifier.fillMaxSize(),
-                    iconModifier = Modifier.size(64.dp),
                 )
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .size(64.dp)
-                        .clip(CircleShape)
-                        .background(PailerCharcoal.copy(alpha = 0.75f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.Filled.PlayArrow,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(36.dp),
-                    )
+                if (!isPlaying) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(PailerCharcoal.copy(alpha = 0.75f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(36.dp),
+                        )
+                    }
                 }
                 // Barra de progresso tipo "linha do tempo" no rodape da capa, igual a marca de
                 // progresso das thumbnails do YouTube - pedido do usuario pra dar mais cara de
                 // player pro card de "continuar ouvindo".
-                val progress = if (song.durationMs > 0) {
-                    (positionMs.toFloat() / song.durationMs.toFloat()).coerceIn(0f, 1f)
+                val progress = if (content.durationMs > 0) {
+                    (content.positionMs.toFloat() / content.durationMs.toFloat()).coerceIn(0f, 1f)
                 } else {
                     0f
                 }
@@ -6952,7 +6994,7 @@ private fun ContinueListeningCard(
             }
             Spacer(Modifier.height(10.dp))
             Text(
-                song.title,
+                content.title,
                 color = MaterialTheme.colorScheme.onBackground,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
@@ -6960,16 +7002,105 @@ private fun ContinueListeningCard(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${song.artist} · ${song.album}",
+                listOf(content.artist, content.album).filter { it.isNotBlank() }.joinToString(" · "),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodySmall,
             )
             Text(
-                "Retomar em ${formatDuration(positionMs)}",
+                if (isPlaying && content.durationMs > 0) {
+                    "${formatDuration(content.positionMs)} de ${formatDuration(content.durationMs)}"
+                } else if (isPlaying) {
+                    "Tocando agora"
+                } else {
+                    "Retomar em ${formatDuration(content.positionMs)}"
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SpinningVinylArtwork(
+    uri: Uri?,
+    embeddedSourceUri: Uri?,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    var rotation by remember { mutableStateOf(0f) }
+
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) return@LaunchedEffect
+        var lastFrame = withFrameNanos { it }
+        while (isActive) {
+            val frame = withFrameNanos { it }
+            val elapsedMs = (frame - lastFrame) / 1_000_000f
+            lastFrame = frame
+            rotation = (rotation + elapsedMs * 360f / 28_000f) % 360f
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(PailerCharcoal),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize(0.96f)
+                .rotate(rotation)
+                .clip(CircleShape)
+                .background(
+                    Brush.radialGradient(
+                        colors = listOf(
+                            Color(0xFF2B2D33),
+                            Color(0xFF0F1014),
+                            Color(0xFF050506),
+                        ),
+                    ),
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .padding(20.dp)
+                    .border(1.dp, Color.White.copy(alpha = 0.08f), CircleShape),
+            )
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .padding(46.dp)
+                    .border(1.dp, Color.White.copy(alpha = 0.06f), CircleShape),
+            )
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .padding(72.dp)
+                    .border(1.dp, Color.White.copy(alpha = 0.05f), CircleShape),
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize(0.58f)
+                    .clip(CircleShape),
+            ) {
+                ArtworkBox(
+                    uri = uri,
+                    embeddedSourceUri = embeddedSourceUri,
+                    modifier = Modifier.fillMaxSize(),
+                    iconModifier = Modifier.size(64.dp),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .size(16.dp)
+                    .clip(CircleShape)
+                    .background(PailerCharcoal)
+                    .border(2.dp, Color.White.copy(alpha = 0.22f), CircleShape),
             )
         }
     }
@@ -7067,6 +7198,11 @@ private fun MiniPlayer(
     onDislike: () -> Unit,
 ) {
     val isRadio = player.activeRadioName.isNotBlank()
+    val statusLabel = when {
+        isRadio -> player.playbackSource.ifBlank { "Rádio" }
+        player.isPlaying -> "Tocando agora"
+        else -> player.playbackSource.ifBlank { "Continuar ouvindo" }
+    }
     Surface(color = PailerSurface.copy(alpha = 0.94f)) {
         Row(
             modifier = Modifier
@@ -7082,15 +7218,13 @@ private fun MiniPlayer(
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                if (player.playbackSource.isNotBlank()) {
-                    Text(
-                        player.playbackSource,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
+                Text(
+                    statusLabel,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelSmall,
+                )
                 Text(
                     player.title.ifBlank { "Tocando agora" },
                     maxLines = 1,
