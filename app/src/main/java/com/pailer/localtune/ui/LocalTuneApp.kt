@@ -609,8 +609,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     if (player.hasMedia) {
                         MiniPlayer(
                             player = player,
+                            isFavorite = viewModel.isCurrentSongFavorite(),
                             onOpen = { showFullPlayer = true },
+                            onToggleFavorite = viewModel::toggleCurrentSongFavorite,
                             onToggle = viewModel::togglePlayPause,
+                            onPrevious = viewModel::skipPrevious,
                             onNext = viewModel::skipNext,
                         )
                     }
@@ -6926,8 +6929,11 @@ private fun AlbumCoverCard(album: LocalAlbum, onClick: () -> Unit) {
 @Composable
 private fun MiniPlayer(
     player: PlayerUiState,
+    isFavorite: Boolean,
     onOpen: () -> Unit,
+    onToggleFavorite: () -> Unit,
     onToggle: () -> Unit,
+    onPrevious: () -> Unit,
     onNext: () -> Unit,
 ) {
     Surface(color = PailerSurface.copy(alpha = 0.94f)) {
@@ -6967,6 +6973,24 @@ private fun MiniPlayer(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+            IconButton(onClick = onToggleFavorite, enabled = player.songId != null) {
+                Icon(
+                    if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                    contentDescription = "Curtir faixa",
+                    tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                )
+            }
+            // Anterior/Proxima somem no modo radio, igual FullPlayer (fila ao vivo nao suporta
+            // pular pra tras/frente livremente) - só o play/pause e o coracaozinho continuam.
+            if (player.activeRadioName.isBlank()) {
+                IconButton(onClick = onPrevious) {
+                    Icon(
+                        Icons.Filled.SkipPrevious,
+                        contentDescription = "Anterior",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
             }
             IconButton(onClick = onToggle) {
                 Icon(
