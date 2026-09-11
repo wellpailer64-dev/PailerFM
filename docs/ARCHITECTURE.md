@@ -134,6 +134,7 @@ música de uma sessão nova. Mapa rádio → complemento:
 | `SharedPreferences("radio_bulletins")` | modo/duração/preferências dos boletins |
 | `SharedPreferences("metadata_overrides")` | correções de tag e unificações de artista |
 | `filesDir/library_cache.json` | cache da biblioteca |
+| `filesDir/lyrics/<songId>.lrc` + `index.json` | letras (colada/editada, tag embutida cacheada, LRCLIB) — ADR-023 |
 | `filesDir/radio_voice_package/` + `package.ready` | pacote de voz instalado |
 | `filesDir/radio_voice_import/` | temporário durante import do .zip |
 | `cacheDir/radio_voice_*.wav` | áudio dos anúncios (deletado após tocar) |

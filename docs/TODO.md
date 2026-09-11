@@ -39,7 +39,9 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 
 ## P2 — Testes das regras puras
 
-- [ ] Setup de teste unitário (JUnit + coroutines-test; sem instrumentado no começo)
+- [x] Setup de teste unitário (JUnit) — feito junto da feature de letras (ADR-023):
+      `junit:junit:4.13.2` em `testImplementation`, primeiro teste em
+      `app/src/test/.../LrcParserTest.kt`. `coroutines-test` ainda não foi adicionado.
 - [ ] `fitFor()` / `limitWords()` (limites de palavras por duração)
 - [ ] Anti-repetição de sessão (`radioSequenceSimilarity`, seeds)
 - [ ] Normalização/filtros de busca e lookup keys de artista/álbum

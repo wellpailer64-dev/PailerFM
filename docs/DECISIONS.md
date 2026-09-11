@@ -1138,3 +1138,44 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   com `minSize = 1`); `LocalAlbum.key` parou de incluir o resumo de artistas agregados
   (instável — mudava sozinho em álbuns tipo "WhatsApp Audio" toda vez que chegava
   mensagem de um remetente novo, fazendo favoritar/ocultar "esquecer" silenciosamente).
+
+## ADR-023 — Letras das músicas (tela do player, offline-first, fora dos arquivos de áudio)
+
+- **Contexto:** o usuário quer ver a letra da música tocando, arrastando pro lado na
+  área da capa (capa ⇄ letra), com destaque da linha atual quando a letra tiver
+  marcação de tempo.
+- **Decisão:**
+  1. **UI:** `HorizontalPager` de 2 páginas dentro do `FullPlayer` (`ui/LocalTuneApp.kt`),
+     travado na MESMA caixa `fillMaxWidth().aspectRatio(1f)` que a capa ocupava — página
+     0 = capa (chamada idêntica de `ArtworkBox`), página 1 = `LyricsPage`, com bolinhas
+     (`PagerDots`) abaixo. Um menu de 3 pontos no topo é o atalho ("Colar/Editar letra",
+     "Buscar letra online", "Remover letra"). **Só no modo não-rádio** — rádio mantém
+     `ArtworkBox` puro, sem pager nem bolinhas.
+  2. **Fontes, em prioridade:** letra colada/editada pelo usuário → tag embutida no
+     arquivo (`FieldKey.LYRICS` via jaudiotagger, só LEITURA, cópia temp no `cacheDir`
+     igual `writeTagsToAudioFile`) → busca online no **LRCLIB** (`lrclib.net`, público,
+     sem chave de API, `HttpURLConnection` + `org.json`, mesmo padrão de
+     `NewsBulletinRepository`) — a rede só entra **sob demanda** (botão), nunca sozinha
+     (ADR-002/004: offline-first).
+  3. **Armazenamento:** `filesDir/lyrics/<songId>.lrc` (texto verbatim, LRC ou puro) +
+     `filesDir/lyrics/index.json` (`{ source, synced, updatedAt, sig, provider }`) —
+     mesmo padrão de `filesDir/artist_photos`. Keyed por `songId` (MediaStore `_ID`,
+     como favoritos/histórico). Letra achada na tag é cacheada no `.lrc` pra abrir
+     rápido depois e entrar no backup.
+  4. **A letra NUNCA é gravada de volta nos arquivos de áudio do usuário** (ADR-008,
+     decisão explícita do usuário) — mora só no app + backup.
+  5. **Backup:** `BackupRepository` copia a pasta `lyrics/` em base64 igual
+     `artist_photos`; `BACKUP_SCHEMA_VERSION` 2 → 3 (chave aditiva, sem `.clear()`).
+  6. **Parser LRC** (`data/LrcParser.kt`): função pura, sem imports Android, com teste
+     unitário (`app/src/test/.../LrcParserTest.kt`, `junit:junit:4.13.2` — primeiro
+     teste automatizado do projeto, alvo do P2 de `docs/TODO.md`). Destaque sincronizado
+     usa `player.positionMs`, que já pulsa pelo loop de polling do `LocalTuneViewModel`
+     — sem timer novo.
+- **Motivo:** feature pedida; encaixa nos padrões existentes sem dependência nova
+  (`HorizontalPager` já vem na BOM 2024.06.00; `jaudiotagger` já é dep) e sem tocar a
+  máquina de estados do boletim, o loop de polling ou `updatePlayerState`.
+- **Não mudar sem:** o carregamento da letra é disparado da UI via
+  `LaunchedEffect(player.songId)`, **nunca** do `init{}` nem de `updatePlayerState`
+  (ADR-020: ler/escrever Compose `State` fora da Main na construção do VM derruba o app).
+  Se um dia a letra for gravável na tag, é ação manual explícita com confirmação
+  (ADR-008), reusando o fluxo de `MediaStore.createWriteRequest` que o tag writer já tem.

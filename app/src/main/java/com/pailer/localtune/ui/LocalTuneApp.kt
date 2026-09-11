@@ -77,7 +77,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -106,6 +109,7 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Pause
@@ -131,10 +135,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -210,12 +217,15 @@ import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
+import com.pailer.localtune.data.LrcParser
+import com.pailer.localtune.data.LyricsSource
 import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.PendingTagChange
 import com.pailer.localtune.data.capitalizeGenreTag
 import com.pailer.localtune.data.joinGenreTags
 import com.pailer.localtune.data.splitGenreTags
 import com.pailer.localtune.player.LocalTuneViewModel
+import com.pailer.localtune.player.LyricsUiState
 import com.pailer.localtune.player.AlbumArtworkUiState
 import com.pailer.localtune.player.ArtistPhotoUiState
 import com.pailer.localtune.player.ArtistNewsUiState
@@ -1003,9 +1013,17 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             val playingArtist = remember(player.artist, artists) {
                 artists.firstOrNull { it.key == player.artist.trim().lowercase() }
             }
+            val lyrics = viewModel.lyricsState.value
+            LaunchedEffect(player.songId, player.activeRadioName) {
+                if (player.activeRadioName.isBlank()) viewModel.loadLyricsFor(player.songId)
+            }
             FullPlayer(
                 player = player,
                 isFavorite = viewModel.isCurrentSongFavorite(),
+                lyrics = lyrics,
+                onFetchLyrics = { player.songId?.let(viewModel::fetchLyricsOnline) },
+                onEditLyrics = viewModel::openLyricsEditor,
+                onRemoveLyrics = { player.songId?.let(viewModel::removeLyrics) },
                 onClose = { showFullPlayer = false },
                 onToggleFavorite = viewModel::toggleCurrentSongFavorite,
                 onToggle = viewModel::togglePlayPause,
@@ -1029,6 +1047,16 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     }
                 },
             )
+            if (lyrics.editorOpen) {
+                LyricsEditorDialog(
+                    draft = lyrics.editorDraft,
+                    startedEmpty = lyrics.lyrics.isEmpty,
+                    onDraftChange = viewModel::updateLyricsDraft,
+                    onSave = { player.songId?.let(viewModel::saveLyrics) },
+                    onRemove = { player.songId?.let(viewModel::removeLyrics) },
+                    onDismiss = viewModel::dismissLyricsEditor,
+                )
+            }
         }
     }
 }
@@ -6849,6 +6877,7 @@ private fun MiniPlayer(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FullPlayer(
     player: PlayerUiState,
@@ -6861,6 +6890,10 @@ private fun FullPlayer(
     onShuffle: () -> Unit,
     onRepeat: () -> Unit,
     onSeek: (Long) -> Unit,
+    lyrics: LyricsUiState = LyricsUiState(),
+    onFetchLyrics: () -> Unit = {},
+    onEditLyrics: () -> Unit = {},
+    onRemoveLyrics: () -> Unit = {},
     albumSongs: List<LocalSong> = emptyList(),
     onOpenAlbum: (() -> Unit)? = null,
     onOpenArtist: (() -> Unit)? = null,
@@ -6916,6 +6949,15 @@ private fun FullPlayer(
                         tint = MaterialTheme.colorScheme.onBackground,
                     )
                 }
+                if (!isRadio) {
+                    LyricsOverflowMenu(
+                        hasLyrics = lyrics.lyrics.source != LyricsSource.NONE,
+                        enabled = player.songId != null,
+                        onEdit = onEditLyrics,
+                        onFetch = onFetchLyrics,
+                        onRemove = onRemoveLyrics,
+                    )
+                }
                 IconButton(onClick = onClose) {
                     Icon(
                         Icons.Filled.Close,
@@ -6925,15 +6967,53 @@ private fun FullPlayer(
                 }
             }
             Spacer(Modifier.height(36.dp))
-            ArtworkBox(
-                uri = player.artworkUri,
-                embeddedSourceUri = player.artworkSourceUri,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
-                    .clip(RoundedCornerShape(8.dp)),
-                iconModifier = Modifier.size(84.dp),
-            )
+            if (isRadio) {
+                ArtworkBox(
+                    uri = player.artworkUri,
+                    embeddedSourceUri = player.artworkSourceUri,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f)
+                        .clip(RoundedCornerShape(8.dp)),
+                    iconModifier = Modifier.size(84.dp),
+                )
+            } else {
+                // Arrasta pro lado: pagina 0 = capa (chamada identica de ArtworkBox), pagina 1 = letra.
+                // Travado na MESMA caixa fillMaxWidth().aspectRatio(1f) que a capa ocupava, entao
+                // titulo/seek/controles/"Mais de <album>" ficam na posicao exata de sempre.
+                val pagerState = rememberPagerState(pageCount = { 2 })
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f),
+                    verticalAlignment = Alignment.Top,
+                ) { page ->
+                    if (page == 0) {
+                        ArtworkBox(
+                            uri = player.artworkUri,
+                            embeddedSourceUri = player.artworkSourceUri,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(8.dp)),
+                            iconModifier = Modifier.size(84.dp),
+                        )
+                    } else {
+                        LyricsPage(
+                            lyrics = lyrics,
+                            positionMs = player.positionMs,
+                            onFetch = onFetchLyrics,
+                            onEdit = onEditLyrics,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(PailerGunmetal.copy(alpha = 0.35f)),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                PagerDots(count = 2, selected = pagerState.currentPage)
+            }
             Spacer(Modifier.height(28.dp))
             Text(
                 text = player.title.ifBlank { "Sem faixa selecionada" },
@@ -7106,6 +7186,217 @@ private fun FullPlayer(
             }
         }
     }
+}
+
+@Composable
+private fun LyricsOverflowMenu(
+    hasLyrics: Boolean,
+    enabled: Boolean,
+    onEdit: () -> Unit,
+    onFetch: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }, enabled = enabled) {
+            Icon(
+                Icons.Filled.MoreVert,
+                contentDescription = "Opções de letra",
+                tint = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text(if (hasLyrics) "Editar letra" else "Colar letra") },
+                onClick = { expanded = false; onEdit() },
+            )
+            DropdownMenuItem(
+                text = { Text("Buscar letra online") },
+                onClick = { expanded = false; onFetch() },
+            )
+            if (hasLyrics) {
+                DropdownMenuItem(
+                    text = { Text("Remover letra") },
+                    onClick = { expanded = false; onRemove() },
+                )
+            }
+        }
+    }
+}
+
+// Pagina de letra do player (arrasta pro lado a partir da capa). Estados: carregando / vazio
+// (com botoes buscar/colar) / buscando / com letra sincronizada (destaca e rola a linha atual
+// usando player.positionMs, que ja pulsa pelo polling existente - sem timer novo) / letra sem
+// sincronia (texto rolavel).
+@Composable
+private fun LyricsPage(
+    lyrics: LyricsUiState,
+    positionMs: Long,
+    onFetch: () -> Unit,
+    onEdit: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        when {
+            lyrics.isLoading -> CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+
+            lyrics.isFetching -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(12.dp))
+                Text("Buscando letra…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
+            lyrics.lyrics.isEmpty -> Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    "Sem letra para esta música",
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                lyrics.message?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onFetch) { Text("Buscar online") }
+                    OutlinedButton(onClick = onEdit) { Text("Colar letra") }
+                }
+            }
+
+            else -> {
+                val lines = lyrics.lyrics.lines
+                val current = if (lyrics.lyrics.synced) LrcParser.currentLineIndex(lines, positionMs) else -1
+                Column(Modifier.fillMaxSize()) {
+                    if (lyrics.lyrics.synced) {
+                        val listState = rememberLazyListState()
+                        LaunchedEffect(current) {
+                            if (current >= 0) runCatching { listState.animateScrollToItem(current) }
+                        }
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            flingBehavior = rememberSoftFlingBehavior(),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 24.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            itemsIndexed(lines) { index, line ->
+                                Text(
+                                    text = line.text.ifBlank { " " },
+                                    color = if (index == current) {
+                                        MaterialTheme.colorScheme.onBackground
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+                                    },
+                                    fontWeight = if (index == current) FontWeight.SemiBold else FontWeight.Normal,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                )
+                            }
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
+                                .padding(horizontal = 16.dp, vertical = 20.dp),
+                        ) {
+                            Text(
+                                lyrics.lyrics.plainText,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = when (lyrics.lyrics.source) {
+                                LyricsSource.EMBEDDED -> "Letra do arquivo"
+                                LyricsSource.MANUAL -> "Colada por você"
+                                LyricsSource.LRCLIB -> "LRCLIB"
+                                LyricsSource.NONE -> ""
+                            },
+                            modifier = Modifier.weight(1f),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                        IconButton(onClick = onEdit) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "Editar letra",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PagerDots(count: Int, selected: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        repeat(count) { i ->
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 3.dp)
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (i == selected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                    ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun LyricsEditorDialog(
+    draft: String,
+    startedEmpty: Boolean,
+    onDraftChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onRemove: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+        title = { Text("Letra da música") },
+        text = {
+            OutlinedTextField(
+                value = draft,
+                onValueChange = onDraftChange,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 360.dp),
+                minLines = 8,
+                placeholder = { Text("Cole a letra aqui (aceita formato .lrc com tempos).") },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onSave) { Text("Salvar") }
+        },
+        dismissButton = {
+            Row {
+                if (!startedEmpty) {
+                    TextButton(onClick = onRemove) {
+                        Text("Remover", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                TextButton(onClick = onDismiss) { Text("Cancelar") }
+            }
+        },
+    )
 }
 
 @Composable

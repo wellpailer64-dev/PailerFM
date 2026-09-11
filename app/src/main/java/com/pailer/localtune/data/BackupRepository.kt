@@ -119,6 +119,15 @@ class BackupRepository(private val context: Context) {
         }
         root.put(KEY_ARTIST_PHOTOS, photosJson)
 
+        // Letras coladas/editadas/buscadas (LyricsRepository, filesDir/lyrics/<id>.lrc + index.json)
+        // - mesmo motivo das fotos de artista: nao moram em SharedPreferences, entao sem embutir os
+        // bytes aqui o restore de uma reinstalacao nao teria os arquivos.
+        val lyricsJson = JSONObject()
+        File(context.filesDir, "lyrics").takeIf { it.exists() }?.listFiles()?.forEach { file ->
+            runCatching { lyricsJson.put(file.name, Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)) }
+        }
+        root.put(KEY_LYRICS, lyricsJson)
+
         return root
     }
 
@@ -179,16 +188,25 @@ class BackupRepository(private val context: Context) {
                 File(photoDir, fileName).writeBytes(Base64.decode(photosJson.getString(fileName), Base64.NO_WRAP))
             }
         }
+
+        val lyricsJson = root.optJSONObject(KEY_LYRICS) ?: JSONObject()
+        val lyricsDir = File(context.filesDir, "lyrics").apply { mkdirs() }
+        lyricsJson.keys().forEach { fileName ->
+            runCatching {
+                File(lyricsDir, fileName).writeBytes(Base64.decode(lyricsJson.getString(fileName), Base64.NO_WRAP))
+            }
+        }
     }
 
     companion object {
-        private const val BACKUP_SCHEMA_VERSION = 2
+        private const val BACKUP_SCHEMA_VERSION = 3
         private const val KEY_BACKUP_URI = "backup_uri"
         private const val KEY_LAST_BACKUP_AT = "last_backup_at"
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_CREATED_AT = "createdAt"
         private const val KEY_PREFS = "prefs"
         private const val KEY_ARTIST_PHOTOS = "artistPhotos"
+        private const val KEY_LYRICS = "lyrics"
 
         // As 4 SharedPreferences que guardam preferencia/estado do USUARIO (favoritos, overrides
         // de metadado, historico, config de boletim) - de proposito NAO inclui prefs puramente

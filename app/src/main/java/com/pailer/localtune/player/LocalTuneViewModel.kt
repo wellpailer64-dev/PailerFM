@@ -41,6 +41,9 @@ import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
+import com.pailer.localtune.data.Lyrics
+import com.pailer.localtune.data.LyricsRepository
+import com.pailer.localtune.data.LyricsSource
 import com.pailer.localtune.data.MusicLibraryRepository
 import com.pailer.localtune.data.ArtworkCandidate
 import com.pailer.localtune.data.GeminiApiKeySettings
@@ -125,6 +128,20 @@ data class PlayerUiState(
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
     val queueIndex: Int = 0,
     val queueSize: Int = 0,
+)
+
+// Letra da musica tocando, exibida na tela do player (arrasta pro lado: capa <-> letra). Ver
+// LyricsRepository - offline primeiro (tag embutida / letra colada), busca online (LRCLIB) so
+// sob demanda. Carregada pela UI via LaunchedEffect(player.songId), nunca do polling/init (ADR-020).
+data class LyricsUiState(
+    val songId: Long? = null,
+    val lyrics: Lyrics = Lyrics.EMPTY,
+    val isLoading: Boolean = false,
+    val isFetching: Boolean = false,
+    // "Letra nao encontrada online" ou erro - some no proximo load/fetch bem-sucedido.
+    val message: String? = null,
+    val editorOpen: Boolean = false,
+    val editorDraft: String = "",
 )
 
 data class MetadataUiState(
@@ -360,6 +377,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely/testGeminiFlashTtsVoices abaixo.
     private val geminiFlashTtsEngine = GeminiFlashTtsEngine(application)
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
+    private val lyricsRepository = LyricsRepository(application)
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
     private val radioPrefs = application.getSharedPreferences("radio_bulletins", Context.MODE_PRIVATE)
@@ -464,6 +482,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     var artistPhotoState = androidx.compose.runtime.mutableStateOf(ArtistPhotoUiState())
         private set
+
+    var lyricsState = androidx.compose.runtime.mutableStateOf(LyricsUiState())
+        private set
+
+    // Carregamento de letra da faixa atual - cancelado/substituido a cada troca de musica.
+    private var lyricsJob: Job? = null
 
     var backupState = androidx.compose.runtime.mutableStateOf(
         BackupUiState(
@@ -1249,6 +1273,93 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         favoritePrefs.edit()
             .putStringSet(KEY_FAVORITE_SONGS, updated.map { it.toString() }.toSet())
             .apply()
+    }
+
+    // --- Letra da musica (tela do player) ---
+
+    // Chamado pela UI num LaunchedEffect(player.songId) quando o player cheio esta aberto e NAO
+    // e modo radio. Lancado no viewModelScope (Main.immediate) e faz o I/O em Dispatchers.IO -
+    // nunca do init{} nem do polling de posicao (ADR-020). Early-return se ja carregou a mesma faixa.
+    fun loadLyricsFor(songId: Long?) {
+        if (songId == null) {
+            lyricsJob?.cancel()
+            lyricsState.value = LyricsUiState()
+            return
+        }
+        val current = lyricsState.value
+        if (current.songId == songId && (current.isLoading || !current.lyrics.isEmpty)) return
+
+        val song = libraryState.value.songs.firstOrNull { it.id == songId }
+        if (song == null) {
+            lyricsState.value = LyricsUiState(songId = songId)
+            return
+        }
+        lyricsJob?.cancel()
+        lyricsState.value = LyricsUiState(songId = songId, isLoading = true)
+        lyricsJob = viewModelScope.launch {
+            val result = lyricsRepository.load(song)
+            if (lyricsState.value.songId != songId) return@launch
+            lyricsState.value = lyricsState.value.copy(lyrics = result, isLoading = false)
+        }
+    }
+
+    fun fetchLyricsOnline(songId: Long) {
+        if (lyricsState.value.isFetching) return
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return
+        lyricsState.value = lyricsState.value.copy(isFetching = true, message = null)
+        viewModelScope.launch {
+            val fetched = lyricsRepository.fetchOnline(song)
+            if (lyricsState.value.songId != songId) return@launch
+            lyricsState.value = if (fetched != null) {
+                lyricsState.value.copy(lyrics = fetched, isFetching = false, message = null)
+            } else {
+                lyricsState.value.copy(isFetching = false, message = "Letra não encontrada online.")
+            }
+        }
+    }
+
+    fun openLyricsEditor() {
+        lyricsState.value = lyricsState.value.copy(
+            editorOpen = true,
+            editorDraft = lyricsState.value.lyrics.plainText,
+        )
+    }
+
+    fun updateLyricsDraft(text: String) {
+        lyricsState.value = lyricsState.value.copy(editorDraft = text)
+    }
+
+    fun dismissLyricsEditor() {
+        lyricsState.value = lyricsState.value.copy(editorOpen = false)
+    }
+
+    fun saveLyrics(songId: Long) {
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return
+        val draft = lyricsState.value.editorDraft
+        viewModelScope.launch {
+            val result = if (draft.isBlank()) {
+                lyricsRepository.remove(songId)
+                lyricsRepository.load(song)
+            } else {
+                lyricsRepository.save(song, draft, LyricsSource.MANUAL)
+            }
+            if (lyricsState.value.songId != songId) return@launch
+            lyricsState.value = lyricsState.value.copy(
+                lyrics = result,
+                editorOpen = false,
+                message = null,
+            )
+        }
+    }
+
+    fun removeLyrics(songId: Long) {
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return
+        viewModelScope.launch {
+            lyricsRepository.remove(songId)
+            val reloaded = lyricsRepository.load(song) // pode reaparecer a letra embutida na tag
+            if (lyricsState.value.songId != songId) return@launch
+            lyricsState.value = lyricsState.value.copy(lyrics = reloaded, editorOpen = false)
+        }
     }
 
     fun isArtistFavorite(artist: LocalArtist): Boolean = artist.key in libraryState.value.favoriteArtistKeys
