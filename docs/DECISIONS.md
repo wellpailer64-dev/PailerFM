@@ -1253,3 +1253,47 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Não mudar sem:** se algum dia o boletim deixar de ser 100% radio-agnóstico (citar
   música/rádio de novo na fala), esse "buffer único, independente de rádio" deixa de
   fazer sentido e a separação por rádio ativa (o antigo Nível 2) precisaria voltar.
+
+## ADR-025 — Boletim verde não cai para TTS Android
+
+- **Contexto:** em 11/09/2026, o usuário validou que os 10 boletins do buffer tocavam
+  corretamente pelo botão "Reproduzir boletim pronto", com voz Gemini sintetizada e
+  bolinhas verdes na UI. Mesmo assim, na reprodução real da rádio, ao chegar o intervalo
+  automático, o app falava o mesmo texto pelo TTS Android. Isso desperdiçava exatamente
+  o trabalho caro do Gemini: roteiro bom + WAV já sintetizado.
+- **Causa raiz (confirmada em logcat no aparelho):** `speakNextNewsBreak()` removia o
+  item de `bulletinBuffer` e chamava `saveCoreBufferManifest()` antes de o `MediaPlayer`
+  abrir o arquivo. A limpeza de órfãos dentro de `saveCoreBufferManifest()` monta a lista
+  de arquivos referenciados a partir dos itens que ainda estão no buffer. Como o boletim
+  escolhido já tinha saído da fila, seu `.wav` deixava de estar referenciado por alguns
+  instantes. Se esse arquivo já tivesse passado da margem `ORPHAN_CLEANUP_GRACE_MS`, o
+  sweep apagava justamente o áudio selecionado para tocar. O teste manual funcionava
+  porque ele só espiava o item do buffer; o bug aparecia na janela estreita do consumo
+  automático.
+- **Decisão:** o item escolhido para tocar agora fica protegido por
+  `protectedBulletinPlaybackFileName` desde antes do manifest ser salvo até o fim da
+  reprodução. `saveCoreBufferManifest()` considera esse nome como referência válida além
+  dos itens ainda presentes em `bulletinBuffer`, impedindo que o sweep de órfãos apague o
+  WAV em trânsito.
+- **Também corrigido no mesmo fluxo:**
+  1. `dequeueBufferedBulletinForPlayback()` procura o primeiro item com WAV tocável e
+     pula entradas sem áudio/quebradas na frente da fila.
+  2. Com a voz dos boletins ligada, falta de WAV tocável cancela a entrada em vez de cair
+     para TTS Android. Boletim preparado com voz não pode degradar silenciosamente para a
+     voz do sistema.
+  3. `playAnnouncementFile()` só apaga o WAV em conclusão bem-sucedida. Em erro do
+     `MediaPlayer`, chama `restoreBufferedBulletinToFront()` para devolver o boletim à
+     fila se o arquivo ainda existir e for válido.
+  4. O botão "Reproduzir boletim pronto", quando chamado no índice 0, pula um item sem
+     áudio na frente e toca o primeiro WAV válido disponível, mantendo o teste coerente
+     com o consumo real.
+- **Verificado no aparelho:** build debug instalada e rádio monitorada via `adb logcat`.
+  Na virada da terceira música, o app registrou:
+  `boletim: consumindo do buffer (audio=true, arquivo=radio_core_gemini_1789113322478.wav, bytes=1861050, ...)`,
+  depois `boletim: tocando audio do buffer arquivo=... bytes=1861050` e, no fim,
+  `announcement file completed bytes=1861050`. Não apareceu chamada de
+  `boletim: falando via TTS Android` nesse intervalo.
+- **Não mudar sem:** preservar a garantia de que bolinha verde significa "áudio Gemini
+  pronto e será usado". Qualquer fallback para TTS Android nesse caminho precisa ser
+  uma decisão explícita de produto, não um efeito colateral de limpeza, erro silencioso
+  ou arquivo transitório fora do manifest.

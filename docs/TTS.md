@@ -11,6 +11,14 @@
 | **Principal** | sherpa-onnx offline, pacote instalado pelo usuário, roda no processo `:radio_voice` | `radioVoiceState.isEnabled` e síntese OK (timeout 12 s) |
 | **Fallback** | `android.speech.tts.TextToSpeech` do sistema, pt-BR, rate 0.98 / pitch 0.88 | sem pacote ativo, ou síntese local falhou/estourou timeout |
 
+Depois do ajuste de 11/09/2026, o fallback Android não é mais aceito para a entrada
+automática da rádio quando a voz dos boletins está ligada. Um boletim verde/Gemini ou
+com voz local preparada precisa tocar pelo WAV do buffer; se esse WAV não estiver
+tocável na hora do intervalo, a entrada é cancelada e o buffer é reposto/corrigido em
+segundo plano. O TTS Android continua existindo como fallback quando a voz dos boletins
+está desligada, e como rede de compatibilidade para caminhos que não representam um
+boletim pré-sintetizado pronto.
+
 O fallback usa utterance IDs distintos para intro (`pailer_player_radio_intro`) e boletim
 (`pailer_player_news_break`); o `UtteranceProgressListener` chama `finishRadioIntro()` /
 `finishNewsBreak()` em `onDone` e `onError`.

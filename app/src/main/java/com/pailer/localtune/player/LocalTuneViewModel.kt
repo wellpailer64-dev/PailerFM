@@ -437,6 +437,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val bulletinBuffer = ArrayDeque<PreparedBulletin>()
     private val llmGenerationMutex = Mutex()
     private val voiceSynthesisMutex = Mutex()
+    private var protectedBulletinPlaybackFileName: String? = null
     // Achado 11/09/2026 (terceira rodada, ao vivo - usuario: "porque o audio fica morto? é um
     // gemini verde, não podemos matar ele prematuramente"): a limpeza de .wav orfaos em
     // saveCoreBufferManifest() so usava um TIMER (ORPHAN_CLEANUP_GRACE_MS, 5min) pra decidir se um
@@ -2791,7 +2792,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             // caso o flag reseta pra false no proximo processo, entao o timer ainda cobre esse
             // cenario raro).
             if (!coreSynthesisInFlight) {
-                val referenced = bulletinBuffer.mapNotNull { it.file?.name }.toSet()
+                val referenced = (bulletinBuffer.mapNotNull { it.file?.name } +
+                    listOfNotNull(protectedBulletinPlaybackFileName)).toSet()
                 val now = System.currentTimeMillis()
                 coreBufferDir.listFiles { file ->
                     file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced &&
@@ -3029,6 +3031,36 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.volume = radioVolume()
     }
 
+    private fun PreparedBulletin.playableAudioFile(): File? =
+        file?.takeIf { it.exists() && it.length() > LocalRadioVoiceEngine.WAV_HEADER_SIZE }
+
+    private fun dequeueBufferedBulletinForPlayback(): Pair<PreparedBulletin?, Int> {
+        var skippedWithoutAudio = 0
+        while (bulletinBuffer.isNotEmpty()) {
+            val candidate = bulletinBuffer.removeFirst()
+            if (candidate.playableAudioFile() != null) {
+                return candidate to skippedWithoutAudio
+            }
+            skippedWithoutAudio += 1
+            candidate.file?.takeIf { !it.exists() || it.length() <= LocalRadioVoiceEngine.WAV_HEADER_SIZE }?.delete()
+        }
+        return null to skippedWithoutAudio
+    }
+
+    private fun restoreBufferedBulletinToFront(item: PreparedBulletin, reason: String) {
+        if (item.playableAudioFile() == null) return
+        bulletinBuffer.addFirst(item)
+        saveCoreBufferManifest()
+        syncBulletinBufferState()
+        Log.w(TAG_RADIO_VOICE, "boletim: devolvido para frente do buffer ($reason)")
+    }
+
+    private fun clearProtectedBulletinPlaybackFile(file: File?) {
+        if (protectedBulletinPlaybackFileName == file?.name) {
+            protectedBulletinPlaybackFileName = null
+        }
+    }
+
     private fun speakNextNewsBreak() {
         if (!ttsReady || speakingNews) {
             cancelEarlyNewsBreakIfPending()
@@ -3038,12 +3070,22 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             cancelEarlyNewsBreakIfPending()
             return
         }
-        val prepared = bulletinBuffer.removeFirstOrNull()
+        val (prepared, skippedWithoutAudio) = dequeueBufferedBulletinForPlayback()
+        val protectedReadyFile = prepared?.playableAudioFile()
+        protectedBulletinPlaybackFileName = protectedReadyFile?.name
         // Regrava o manifest agora que o item saiu do bulletinBuffer de vez (vai tocar - "gasto"
-        // de verdade) - sem isso um processo morto logo depois desse consumo ainda restauraria
-        // esse boletim ja falado na proxima abertura.
-        if (prepared != null) {
+        // de verdade) ou depois de pular itens sem WAV na frente da fila. Sem isso um processo
+        // morto logo depois desse consumo ainda restauraria boletins ja falados/quebrados.
+        if (prepared != null || skippedWithoutAudio > 0) {
             saveCoreBufferManifest()
+        }
+        if (skippedWithoutAudio > 0) {
+            Log.w(
+                TAG_RADIO_VOICE,
+                "boletim: pulados $skippedWithoutAudio item(ns) sem audio na frente do buffer; procurando WAV pronto",
+            )
+            syncBulletinBufferState()
+            scheduleFallbackAutoFix()
         }
         // Consumiu um item (ou tentou e o buffer estava vazio) - manda reabastecer ja, em
         // paralelo com a fala que vai comecar agora (ver ADR-019: buffer sempre com
@@ -3054,9 +3096,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val readyFile: File?
         if (prepared != null) {
             bulletin = prepared.script
-            readyFile = prepared.file?.takeIf { it.exists() }
-            Log.d(TAG_RADIO_VOICE, "boletim: consumindo do buffer (audio=${readyFile != null}, restam ${bulletinBuffer.size})")
+            readyFile = protectedReadyFile?.takeIf { it.exists() && it.length() > LocalRadioVoiceEngine.WAV_HEADER_SIZE }
+            Log.d(
+                TAG_RADIO_VOICE,
+                "boletim: consumindo do buffer (audio=${readyFile != null}, arquivo=${readyFile?.name}, bytes=${readyFile?.length() ?: 0}, titulo='${bulletin.displayText}', restam ${bulletinBuffer.size})",
+            )
         } else {
+            if (radioVoiceState.value.isEnabled) {
+                Log.w(TAG_RADIO_VOICE, "boletim: nenhum audio pronto no buffer; cancelando entrada para nao usar TTS Android")
+                clearProtectedBulletinPlaybackFile(protectedReadyFile)
+                cancelEarlyNewsBreakIfPending()
+                return
+            }
             if (newsBulletins.isEmpty()) {
                 // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed
                 // fora do ar - ver NewsBulletinRepository.loadStories, falha e ignorada
@@ -3065,6 +3116,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 // diagnosticar; reloadNewsBulletinsIfNeeded ja tenta de novo em segundo plano.
                 Log.w(TAG_RADIO_VOICE, "boletim: buffer e newsBulletins vazios - tentando recarregar")
                 reloadNewsBulletinsIfNeeded()
+                clearProtectedBulletinPlaybackFile(protectedReadyFile)
                 cancelEarlyNewsBreakIfPending()
                 return
             }
@@ -3098,14 +3150,27 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // TTS Android) porque entra antes da bifurcacao.
         playPassagem {
             if (!speakingNews) return@playPassagem
-            if (readyFile != null) {
-                Log.d(TAG_RADIO_VOICE, "boletim: tocando audio do buffer")
-                playAnnouncementFile(readyFile) { finishNewsBreak() }
+            if (readyFile != null && prepared != null) {
+                Log.d(TAG_RADIO_VOICE, "boletim: tocando audio do buffer arquivo=${readyFile.name} bytes=${readyFile.length()}")
+                playAnnouncementFile(
+                    readyFile,
+                    onError = { restoreBufferedBulletinToFront(prepared, "erro no MediaPlayer") },
+                ) {
+                    clearProtectedBulletinPlaybackFile(readyFile)
+                    finishNewsBreak()
+                }
                 armAnnouncementWatchdog()
                 return@playPassagem
             }
 
-            Log.d(TAG_RADIO_VOICE, "boletim: sem audio pronto; usando TTS Android imediato")
+            if (radioVoiceState.value.isEnabled) {
+                Log.w(TAG_RADIO_VOICE, "boletim: sem audio pronto com voz ligada; cancelando TTS Android")
+                clearProtectedBulletinPlaybackFile(readyFile)
+                finishNewsBreak()
+                return@playPassagem
+            }
+
+            Log.d(TAG_RADIO_VOICE, "boletim: sem audio pronto e voz desligada; usando TTS Android")
             val tts = textToSpeech
             val accepted = if (tts != null && ttsReady) {
                 runCatching {
@@ -3116,6 +3181,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             }
             if (accepted != TextToSpeech.SUCCESS) {
                 Log.w(TAG_RADIO_VOICE, "tts fallback rejected bulletin - resuming playback")
+                clearProtectedBulletinPlaybackFile(readyFile)
                 finishNewsBreak()
             } else {
                 Log.d(TAG_RADIO_VOICE, "boletim: falando via TTS Android")
@@ -3256,7 +3322,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // clicavel pra sua posicao.
     fun playReadyBufferedBulletin(index: Int = 0) {
         if (radioBulletinBufferState.value.isPlayingPreview) return
-        val mainFile = bulletinBuffer.elementAtOrNull(index)?.file
+        val selected = bulletinBuffer.elementAtOrNull(index)
+            ?.takeIf { it.playableAudioFile() != null }
+            ?: if (index == 0) bulletinBuffer.firstOrNull { it.playableAudioFile() != null } else null
+        val mainFile = selected?.playableAudioFile()
         if (mainFile == null) {
             // Achado 03/09/2026: sem isso, tocar numa posicao sem audio (ex.: item que caiu pro
             // roteiro padrao apos falha do redator - fallback nunca tem audio) nao fazia NADA
@@ -3307,7 +3376,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }.onFailure { onFinished() }
     }
 
-    private fun playAnnouncementFile(file: java.io.File, onFinished: () -> Unit) {
+    private fun playAnnouncementFile(
+        file: java.io.File,
+        deleteOnCompletion: Boolean = true,
+        onError: () -> Unit = {},
+        onFinished: () -> Unit,
+    ) {
         announcementPlayer?.release()
         announcementPlayer = null
         runCatching {
@@ -3320,14 +3394,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     Log.d(TAG_RADIO_VOICE, "announcement file completed bytes=${file.length()}")
                     it.release()
                     if (announcementPlayer === it) announcementPlayer = null
-                    file.delete()
+                    if (deleteOnCompletion) file.delete()
                     onFinished()
                 }
                 setOnErrorListener { player, what, extra ->
                     Log.w(TAG_RADIO_VOICE, "announcement file error what=$what extra=$extra bytes=${file.length()}")
                     player.release()
                     if (announcementPlayer === player) announcementPlayer = null
-                    file.delete()
+                    onError()
                     onFinished()
                     true
                 }
@@ -3337,7 +3411,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }.onFailure {
             Log.e(TAG_RADIO_VOICE, "failed to play announcement file bytes=${file.length()}", it)
-            file.delete()
+            onError()
             onFinished()
         }
     }

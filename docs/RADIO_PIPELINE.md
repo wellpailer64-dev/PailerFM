@@ -81,11 +81,14 @@ onMediaItemTransition(reason = AUTO)        [Player.Listener]
   ├─ completedRadioSongs += 1
   ├─ a cada settings.songsBetweenBulletins (padrão 3):
   │    speakNextNewsBreak()
-  │      ├─ bulletinBuffer.removeFirstOrNull() → refillBulletinBuffer() (repõe já)
-  │      ├─ item do buffer pronto: usa script+WAV já preparados
-  │      │  (buffer vazio: monta boletim ao vivo, sem redator local, timeout 12 s)
+  │      ├─ dequeueBufferedBulletinForPlayback() → pega o 1º item com WAV tocável
+  │      │  (itens sem áudio são pulados e regenerados)
+  │      ├─ protege temporariamente o nome do WAV escolhido contra a limpeza de órfãos
+  │      ├─ refillBulletinBuffer() (repõe já)
+  │      ├─ voz ligada: só toca WAV pronto; sem WAV, cancela a entrada para não usar TTS Android
+  │      │  voz desligada: pode montar boletim ao vivo e falar via TTS Android
   │      ├─ resumeAfterNews = player.isPlaying; player.pause()
-  │      ├─ playPassagem() → MediaPlayer toca o WAV do boletim (cacheDir/radio_voice_<ts>.wav)
+  │      ├─ playPassagem() → MediaPlayer toca o WAV do buffer (filesDir/radio_bulletins_ready/radio_core_*.wav)
   │      │  → playPassagem() de novo → finishNewsBreak() → retoma playback
   └─ refillBulletinBuffer()                  (nudge idempotente, no-op se já cheio)
 ```
@@ -193,11 +196,12 @@ pronto. Assim o app evita gerar dez notícias de uma vez (o buffer já vem pront
 mas também não fica refém de "só 1 música de antecedência" - qualquer soluço pontual de
 síntese tem folga de até 10 boletins pra se resolver antes de faltar áudio pronto.
 
-Regra de segurança em produção: depois que a música pausa, o app não chama mais o redator
-local nem tenta sintetizar voz local pesada se o WAV não estava pronto. Se o roteiro/áudio
-preparado não chegou a tempo, o boletim entra imediatamente com o roteiro-base e TTS do
-Android. A voz local é ganho de qualidade quando chega antes do intervalo, não dependência
-para a rádio continuar falando.
+Regra de segurança em produção (11/09/2026): com a voz dos boletins ligada, a rádio não
+pode transformar um boletim verde/Gemini em TTS Android. Se não houver WAV tocável no
+momento do intervalo, a entrada é cancelada e o buffer tenta se corrigir/repor em segundo
+plano. O TTS Android só fica como fallback quando a voz dos boletins está desligada pelo
+usuário ou em caminhos manuais/legados específicos. A voz preparada é parte do valor do
+boletim, não um detalhe descartável.
 
 O botão de teste de boletim também usa o caminho real: busca uma notícia RSS no momento,
 monta o roteiro, aplica o redator local se estiver disponível, sintetiza e toca o resultado.
@@ -234,7 +238,14 @@ orçamento.
 ## Arquivos temporários e limpeza
 
 - WAVs de anúncio: `cacheDir/radio_voice_<timestamp>.wav`;
-- Deletados em `onCompletion`, `onError` ou falha de preparo do `MediaPlayer`;
+- WAVs persistentes do buffer: `filesDir/radio_bulletins_ready/radio_core_*.wav`;
+- Quando um boletim sai do buffer para tocar, o nome do arquivo fica em
+  `protectedBulletinPlaybackFileName` até o `MediaPlayer` concluir; isso impede que
+  `saveCoreBufferManifest()` trate o WAV recém-selecionado como órfão só porque ele já
+  saiu da fila.
+- WAV de boletim automático é deletado no `onCompletion`. Em erro do `MediaPlayer`, o app
+  tenta devolver o item para a frente do buffer se o arquivo ainda for tocável, para não
+  perder trabalho caro de escrita/síntese.
 - **Órfãos conhecidos:** se o ViewModel estourar o timeout de 12 s (`withTimeoutOrNull`)
   ou for destruído antes do callback, o serviço ainda escreve o WAV e ninguém deleta.
   Correção planejada — ver [TODO.md](TODO.md).
@@ -246,7 +257,10 @@ orçamento.
 - Anúncio local (sherpa) e vinhetas gravadas dividem o mesmo `MediaPlayer` dedicado
   (`announcementPlayer`) e o mesmo watchdog de 90 s — um por vez, release do anterior
   antes do novo;
-- Anúncio fallback (boletim sem WAV local pronto): TTS do sistema com `QUEUE_FLUSH`; vinhetas não
-  têm fallback de TTS — se o `MediaPlayer` falhar, pula direto pra música;
+- Anúncio automático com voz ligada: `MediaPlayer` precisa tocar o WAV do buffer. Se o
+  WAV não estiver tocável, a entrada é cancelada e a música volta; não cai para TTS
+  Android.
+- Anúncio fallback com voz desligada: TTS do sistema com `QUEUE_FLUSH`; vinhetas não têm
+  fallback de TTS — se o `MediaPlayer` falhar, pula direto pra música;
 - Widgets/notificação continuam operando o player de música normalmente — é daí que
   nascem as races de "música por cima da locução" (R2 em [STATE_MACHINE.md](STATE_MACHINE.md)).
