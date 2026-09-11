@@ -113,6 +113,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.QueueMusic
+import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Repeat
@@ -190,6 +191,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Constraints
@@ -247,13 +249,21 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalTime
 
-private enum class LibraryTab(val label: String) {
-    Home("Inicio"),
+// Reestruturado 10/09/2026 (pedido do usuario): eram 6 abas na barra inferior (Inicio,
+// Artistas, Albuns, Musicas, Categorias, Radio) - virou 3 (MainTab), com a Radio em destaque
+// no meio como funcao principal do app, e Artistas/Albuns/Musicas/Categorias viraram filtros
+// (LibrarySection) dentro da aba Biblioteca, nao abas proprias.
+private enum class MainTab(val label: String) {
+    Home("Início"),
+    Radio("Rádio"),
+    Library("Biblioteca"),
+}
+
+private enum class LibrarySection(val label: String) {
     Artists("Artistas"),
-    Albums("Albuns"),
-    Songs("Musicas"),
+    Albums("Álbuns"),
+    Songs("Músicas"),
     Genres("Categorias"),
-    Playlists("Radio"),
 }
 
 private enum class SettingsPage {
@@ -382,7 +392,8 @@ private fun PermissionGate(onGrant: () -> Unit) {
 
 @Composable
 private fun LibraryShell(viewModel: LocalTuneViewModel) {
-    var selectedTab by rememberSaveable { mutableStateOf(LibraryTab.Home) }
+    var selectedTab by rememberSaveable { mutableStateOf(MainTab.Home) }
+    var librarySection by rememberSaveable { mutableStateOf(LibrarySection.Artists) }
     var showFullPlayer by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var settingsPage by rememberSaveable { mutableStateOf(SettingsPage.Main) }
@@ -550,7 +561,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         selectedRadio != null ||
         selectedGenre != null ||
         library.query.isNotBlank() ||
-        selectedTab != LibraryTab.Home
+        selectedTab != MainTab.Home
 
     BackHandler(enabled = canHandleBack) {
         when {
@@ -567,7 +578,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             selectedArtist != null -> selectedArtist = null
             selectedGenre != null -> selectedGenre = null
             library.query.isNotBlank() -> viewModel.setQuery("")
-            selectedTab != LibraryTab.Home -> selectedTab = LibraryTab.Home
+            // Dentro da Biblioteca com um filtro diferente do padrao, o back volta o filtro pro
+            // padrao primeiro (mesma logica de "fechar 1 nivel por vez" dos casos acima) antes de
+            // sair pra Inicio no proximo back.
+            selectedTab == MainTab.Library && librarySection != LibrarySection.Artists ->
+                librarySection = LibrarySection.Artists
+            selectedTab != MainTab.Home -> selectedTab = MainTab.Home
         }
     }
 
@@ -592,7 +608,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
                         containerColor = PailerSurface.copy(alpha = 0.94f),
                     ) {
-                        LibraryTab.entries.forEach { tab ->
+                        MainTab.entries.forEach { tab ->
+                            val isRadio = tab == MainTab.Radio
                             NavigationBarItem(
                                 selected = selectedTab == tab,
                                 onClick = {
@@ -607,13 +624,40 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                     isGeneratingRadio = false
                                     selectedTab = tab
                                 },
-                                icon = { Icon(tab.icon(), contentDescription = tab.label) },
+                                icon = {
+                                    if (isRadio) {
+                                        // Radio em destaque no meio da barra (pedido do usuario
+                                        // 10/09/2026: "a radio no meio em destaque como funcao
+                                        // principal do app") - selo circular na cor de destaque,
+                                        // sempre colorido (selecionado ou nao), maior que os
+                                        // outros icones pra chamar mais atencao.
+                                        Box(
+                                            modifier = Modifier
+                                                .size(46.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    if (selectedTab == tab) PailerRed else PailerRed.copy(alpha = 0.75f),
+                                                ),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.Radio,
+                                                contentDescription = tab.label,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(24.dp),
+                                            )
+                                        }
+                                    } else {
+                                        Icon(tab.icon(), contentDescription = tab.label)
+                                    }
+                                },
                                 label = {
                                     Text(
                                         tab.label,
                                         maxLines = 1,
                                         softWrap = false,
                                         fontSize = 10.sp,
+                                        fontWeight = if (isRadio) FontWeight.Bold else FontWeight.Normal,
                                     )
                                 },
                             )
@@ -779,7 +823,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         photoUriFor = viewModel::artistPhotoUri,
                         listState = genreDetailListState,
                     )
-                    selectedTab == LibraryTab.Home -> HomeNewsDrawer(
+                    selectedTab == MainTab.Home -> HomeNewsDrawer(
                         favoriteArtists = favoriteArtists,
                         newsState = artistNews,
                         onRequestLoad = { viewModel.loadArtistNewsIfNeeded(favoriteArtists) },
@@ -805,41 +849,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             onPlay = { list, index, shuffle -> viewModel.playSongs(list, index, shuffle, source = if (shuffle) "Misturar tudo" else "Biblioteca") },
                         )
                     }
-                    selectedTab == LibraryTab.Artists -> ArtistsScreen(
-                        artists = artists,
-                        onOpenArtist = { selectedArtist = it },
-                        onLongPressArtist = { artistActionsTarget = it },
-                        favoriteArtistKeys = library.favoriteArtistKeys,
-                        photoUriFor = viewModel::artistPhotoUri,
-                        scrollState = artistsScrollState,
-                    )
-                    selectedTab == LibraryTab.Albums -> AlbumsScreen(
-                        albums = albums,
-                        onOpenAlbum = { selectedAlbum = it },
-                        onLongPressAlbum = { albumActionsTarget = it },
-                        favoriteAlbumKeys = library.favoriteAlbumKeys,
-                        scrollState = albumsScrollState,
-                    )
-                    selectedTab == LibraryTab.Songs -> SongsScreen(
-                        songs = songs,
-                        isSongFavorite = viewModel::isSongFavorite,
-                        onToggleSongFavorite = viewModel::toggleSongFavorite,
-                        onPlay = { index -> viewModel.playSongs(songs, index, source = "Músicas") },
-                        onDeleteSong = { pendingDeleteSong = it },
-                        listState = songsListState,
-                    )
-                    selectedTab == LibraryTab.Genres -> PlaylistsScreen(
-                        radios = genreRadios,
-                        player = player,
-                        onOpenRadio = {
-                            radioSession = emptyList()
-                            selectedGenre = it
-                        },
-                        onOpenPlayer = openActiveRadio,
-                        showGifBanner = false,
-                        listState = genresListState,
-                    )
-                    selectedTab == LibraryTab.Playlists -> PlaylistsScreen(
+                    selectedTab == MainTab.Radio -> PlaylistsScreen(
                         radios = radios,
                         player = player,
                         onOpenRadio = {
@@ -849,6 +859,48 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onOpenPlayer = openActiveRadio,
                         listState = radiosListState,
                     )
+                    selectedTab == MainTab.Library -> Column(Modifier.fillMaxSize()) {
+                        LibrarySectionTabs(
+                            selected = librarySection,
+                            onSelect = { librarySection = it },
+                        )
+                        when (librarySection) {
+                            LibrarySection.Artists -> ArtistsScreen(
+                                artists = artists,
+                                onOpenArtist = { selectedArtist = it },
+                                onLongPressArtist = { artistActionsTarget = it },
+                                favoriteArtistKeys = library.favoriteArtistKeys,
+                                photoUriFor = viewModel::artistPhotoUri,
+                                scrollState = artistsScrollState,
+                            )
+                            LibrarySection.Albums -> AlbumsScreen(
+                                albums = albums,
+                                onOpenAlbum = { selectedAlbum = it },
+                                onLongPressAlbum = { albumActionsTarget = it },
+                                favoriteAlbumKeys = library.favoriteAlbumKeys,
+                                scrollState = albumsScrollState,
+                            )
+                            LibrarySection.Songs -> SongsScreen(
+                                songs = songs,
+                                isSongFavorite = viewModel::isSongFavorite,
+                                onToggleSongFavorite = viewModel::toggleSongFavorite,
+                                onPlay = { index -> viewModel.playSongs(songs, index, source = "Músicas") },
+                                onDeleteSong = { pendingDeleteSong = it },
+                                listState = songsListState,
+                            )
+                            LibrarySection.Genres -> PlaylistsScreen(
+                                radios = genreRadios,
+                                player = player,
+                                onOpenRadio = {
+                                    radioSession = emptyList()
+                                    selectedGenre = it
+                                },
+                                onOpenPlayer = openActiveRadio,
+                                showGifBanner = false,
+                                listState = genresListState,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1110,6 +1162,45 @@ private fun LibraryHeader(
                 tint = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.size(20.dp),
             )
+        }
+    }
+}
+
+// Filtros internos da aba Biblioteca (pedido do usuario 10/09/2026: Artistas/Albuns/Musicas/
+// Categorias deixaram de ser abas proprias na barra inferior e viraram um seletor DENTRO da
+// Biblioteca). Pilulas simples, no mesmo estilo de superficie arredondada ja usado em outros
+// cards do app (ver PailerSurfaceHigh/RoundedCornerShape em RadioBulletinBufferStatusCard).
+@Composable
+private fun LibrarySectionTabs(
+    selected: LibrarySection,
+    onSelect: (LibrarySection) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp)
+            .padding(bottom = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        LibrarySection.entries.forEach { section ->
+            val isSelected = section == selected
+            Surface(
+                onClick = { onSelect(section) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(50),
+                color = if (isSelected) MaterialTheme.colorScheme.primary else PailerSurfaceHigh,
+            ) {
+                Text(
+                    section.label,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    softWrap = false,
+                    fontSize = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -7542,13 +7633,11 @@ private fun EmptyLibrary(hasQuery: Boolean) {
     }
 }
 
-private fun LibraryTab.icon() = when (this) {
-    LibraryTab.Home -> Icons.Filled.Home
-    LibraryTab.Artists -> Icons.Filled.Person
-    LibraryTab.Albums -> Icons.Filled.Album
-    LibraryTab.Songs -> Icons.Filled.QueueMusic
-    LibraryTab.Genres -> Icons.Filled.Category
-    LibraryTab.Playlists -> Icons.Filled.PlaylistPlay
+private fun MainTab.icon() = when (this) {
+    MainTab.Home -> Icons.Filled.Home
+    MainTab.Radio -> Icons.Filled.Radio // nao usado de fato (Radio ganha selo circular custom
+        // no NavigationBar acima), so aqui pra when ficar exaustivo.
+    MainTab.Library -> Icons.Filled.LibraryMusic
 }
 
 @Composable
