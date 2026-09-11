@@ -300,6 +300,22 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Não mudar sem:** avisar antes — trocar pra `signingConfigs.getByName("release")`
   exige desinstalar o app do aparelho (perde dados locais) no primeiro install seguinte.
   Ver [RELEASE.md](RELEASE.md).
+- **Atualização (10/09/2026, pedido do usuário):** o CI (`.github/workflows/build-apk.yml`)
+  passou a assinar a release com a chave dedicada `pailer-release.jks`, materializada de
+  4 secrets do repositório (`RELEASE_KEYSTORE_BASE64` + senha/alias/senha-da-chave). O
+  `.jks` **nunca** entra no git (`.gitignore` já cobre `*.jks`/`keystore.properties`); o
+  workflow decodifica o secret, escreve `keystore.properties` só durante o build e apaga
+  os dois no fim. `app/build.gradle.kts` escolhe sozinho:
+  `signingConfigs.findByName("release") ?: getByName("debug")` — **com** `keystore.properties`
+  (CI, ou dev que tem o `.jks`) assina com a chave de release; **sem** ele (dev novo) cai
+  na chave de debug local, build continua funcionando offline sem o arquivo. O aparelho
+  que já rodava um APK assinado com a chave de release (baixado do GitHub Releases) passa
+  a atualizar por cima sem desinstalar; um aparelho vindo de um APK assinado com chave de
+  debug de OUTRA máquina precisa de um desinstall único (fazer backup pela UI antes).
+- **Não mudar sem (atualização):** os 4 secrets vivem só nas configs do repositório no
+  GitHub. Se forem perdidos, é só recriá-los a partir do `pailer-release.jks` (que o dev
+  guarda fora do repo) — nenhum aparelho perde a compatibilidade de assinatura por isso,
+  desde que o mesmo `.jks` seja reusado.
 
 ## ADR-013 — Pacote de voz Kokoro (Dora/Alex) + timeout de boletim maior
 

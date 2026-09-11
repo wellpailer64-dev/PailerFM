@@ -47,10 +47,44 @@ jobs:
       - name: Gera local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
+      # Se os secrets de assinatura estao configurados, materializa a chave de release
+      # (pailer-release.jks) + keystore.properties, que app/build.gradle.kts detecta pra
+      # assinar a release com a chave dedicada em vez da chave de debug. Sem os secrets
+      # (ex.: PR de fork), o APK sai assinado com a chave de debug, como antes.
+      - name: Configura assinatura de release (se secrets presentes)
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "::notice::Sem RELEASE_KEYSTORE_BASE64 - APK sai assinado com a chave de debug."
+            exit 0
+          fi
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > pailer-release.jks
+          {
+            echo "storeFile=pailer-release.jks"
+            echo "storePassword=$RELEASE_KEYSTORE_PASSWORD"
+            echo "keyAlias=$RELEASE_KEY_ALIAS"
+            echo "keyPassword=$RELEASE_KEY_PASSWORD"
+          } > keystore.properties
+          echo "::notice::keystore.properties criado - APK sera assinado com a chave de release."
+
       - name: Build release APK
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Remove keystore do runner
+        if: always()
+        run: rm -f pailer-release.jks keystore.properties
+
+      - name: Mostra qual chave assinou o APK
+        run: |
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/app-release.apk \
+            | grep -E "Signer #1 certificate (DN|SHA-256)" || true
 
       - name: Renomeia APK
         run: |

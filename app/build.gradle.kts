@@ -66,10 +66,16 @@ android {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
-            // Chave de debug de proposito (nao a "release" acima) — ver comentario no topo
-            // do arquivo. Trocar pra signingConfigs.getByName("release") exige desinstalar
-            // o app do aparelho antes do proximo install (assinatura muda).
-            signingConfig = signingConfigs.getByName("debug")
+            // Assinatura da release:
+            //  - COM `keystore.properties` (a chave dedicada `pailer-release.jks`): usa ela. E o
+            //    caso do CI (o workflow materializa keystore.properties a partir dos secrets) e
+            //    da maquina do dev que ja tem o arquivo. APKs assim instalam por cima uns dos
+            //    outros sem desinstalar.
+            //  - SEM `keystore.properties` (dev novo, sem a chave): cai na chave de debug local,
+            //    como sempre foi (ADR-012) - build funciona offline, sem precisar do .jks.
+            // Trocar de uma familia de assinatura pra outra num aparelho que ja tem o app exige
+            // UM desinstall (assinatura muda) - ver docs/RELEASE.md.
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

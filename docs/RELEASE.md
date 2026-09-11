@@ -9,15 +9,35 @@ ADB e como investigar problema quando algo não aparece na tela.
 Toda instalação de teste usa **release**, não debug, por pedido do usuário: builds
 mais rápidas de instalar/testar e mais perto do app "de verdade".
 
-A assinatura da build release é **de propósito a mesma chave de debug** (ver
-`app/build.gradle.kts`, `buildTypes.release.signingConfig`), e não a chave de release
-dedicada em `keystore.properties`/`../keystore/pailer-release.jks`. Isso é intencional:
-com a mesma assinatura, `adb install -r` sempre atualiza por cima do app já instalado,
-sem nunca precisar desinstalar — e desinstalar apaga dados locais (favoritos,
-histórico, overrides de metadados, o pacote de vozes TTS importado). A chave de
-release dedicada fica pronta e sem uso pra um dia publicar de verdade (Play Store ou
-distribuição fora do debug); trocar pra ela em `buildTypes.release` é decisão consciente
-— ver comentário no topo do `app/build.gradle.kts`.
+A assinatura da build release depende de existir um `keystore.properties`
+(`app/build.gradle.kts`, `buildTypes.release.signingConfig =
+signingConfigs.findByName("release") ?: getByName("debug")`):
+
+- **Com `keystore.properties`** (o `pailer-release.jks` dedicado): assina com a chave de
+  release. É o caso do **CI** — o workflow `.github/workflows/build-apk.yml` materializa
+  `keystore.properties` a partir de 4 secrets (`RELEASE_KEYSTORE_BASE64`,
+  `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS`, `RELEASE_KEY_PASSWORD`) e apaga o
+  arquivo + o `.jks` no fim do job — e da máquina do dev que guarda o `.jks`. O APK do
+  GitHub Releases é esse.
+- **Sem `keystore.properties`** (clone novo, sem o `.jks`): cai na chave de debug local
+  automática, como sempre foi (ADR-012). Build funciona offline, sem precisar do arquivo.
+
+`adb install -r` só atualiza por cima **sem desinstalar** quando a assinatura bate. APKs
+da mesma família de chave (todos do CI, ou todos de debug da mesma máquina) instalam uns
+por cima dos outros; trocar de família num aparelho que já tem o app exige **um**
+desinstall (apaga favoritos, histórico, overrides, pacotes TTS, letras, pasta oficial) —
+fazer backup pela UI antes (Configurações → Backup). Ver ADR-012.
+
+### Configurar os secrets de assinatura (uma vez)
+
+```
+base64 -w0 pailer-release.jks > keystore.b64
+gh secret set RELEASE_KEYSTORE_BASE64   < keystore.b64
+gh secret set RELEASE_KEYSTORE_PASSWORD          # cola a senha do keystore
+gh secret set RELEASE_KEY_ALIAS                  # cola o alias da chave
+gh secret set RELEASE_KEY_PASSWORD               # cola a senha da chave
+rm keystore.b64
+```
 
 `isMinifyEnabled = false` também é de propósito: R8/shrink pode quebrar reflection
 (jaudiotagger, MediaStore) e o JNI do sherpa-onnx de formas difíceis de depurar, e o
