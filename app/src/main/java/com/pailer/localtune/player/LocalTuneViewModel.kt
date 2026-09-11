@@ -216,6 +216,14 @@ data class AppFolderUiState(
     val folderName: String? = null,
 )
 
+data class UserProfileUiState(
+    val name: String = "",
+    val birthday: String = "",
+    val photoUri: Uri? = null,
+    val appliedVersion: Int = 0,
+    val message: String? = null,
+)
+
 // Sessao "arraste pra revelar" da Home com noticias/curiosidades dos artistas favoritados (ver
 // ArtistNewsRepository) - pedido do usuario 06/09/2026. hasLoaded fica true mesmo em caso de erro
 // ou lista vazia, pra loadArtistNewsIfNeeded() nao ficar refazendo a busca toda vez que o painel
@@ -361,6 +369,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
     private val radioPrefs = application.getSharedPreferences("radio_bulletins", Context.MODE_PRIVATE)
+    private val profilePrefs = application.getSharedPreferences("user_profile", Context.MODE_PRIVATE)
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     private var textToSpeech: TextToSpeech? = null
@@ -510,6 +519,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     )
         private set
 
+    var profileState = androidx.compose.runtime.mutableStateOf(loadProfile())
+        private set
+
     var artistNewsState = androidx.compose.runtime.mutableStateOf(ArtistNewsUiState())
         private set
 
@@ -549,6 +561,45 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         var boundary = now.withHour(5).withMinute(0).withSecond(0).withNano(0)
         if (now.isBefore(boundary)) boundary = boundary.minusDays(1)
         return loadedAtMillis < boundary.toInstant().toEpochMilli()
+    }
+
+    fun saveUserProfile(name: String, birthday: String) {
+        profilePrefs.edit()
+            .putString(KEY_PROFILE_NAME, name.trim())
+            .putString(KEY_PROFILE_BIRTHDAY, birthday.trim())
+            .apply()
+        profileState.value = loadProfile(profileState.value.appliedVersion).copy(message = "Perfil salvo.")
+    }
+
+    fun importProfilePhoto(uri: Uri) {
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = getApplication<Application>().contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: return@withContext false
+                    val dir = File(getApplication<Application>().filesDir, "profile").apply { mkdirs() }
+                    val file = File(dir, PROFILE_PHOTO_FILE_NAME)
+                    file.writeBytes(bytes)
+                    profilePrefs.edit().putString(KEY_PROFILE_PHOTO_PATH, file.absolutePath).apply()
+                    true
+                }.getOrDefault(false)
+            }
+            val nextVersion = profileState.value.appliedVersion + 1
+            profileState.value = loadProfile(nextVersion).copy(
+                message = if (ok) "Foto atualizada." else "Nao consegui usar essa imagem.",
+            )
+        }
+    }
+
+    private fun loadProfile(appliedVersion: Int = 0): UserProfileUiState {
+        val path = profilePrefs.getString(KEY_PROFILE_PHOTO_PATH, null)
+        val photoUri = path?.let { File(it) }?.takeIf { it.exists() }?.let { Uri.fromFile(it) }
+        return UserProfileUiState(
+            name = profilePrefs.getString(KEY_PROFILE_NAME, "").orEmpty(),
+            birthday = profilePrefs.getString(KEY_PROFILE_BIRTHDAY, "").orEmpty(),
+            photoUri = photoUri,
+            appliedVersion = appliedVersion,
+        )
     }
 
     // Bytes da capa baixada pro candidato selecionado - fora do StateFlow/State de proposito
@@ -1616,7 +1667,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 isWorking = false,
                 message = if (ok) "Backup restaurado." else "Nao consegui ler esse arquivo de backup.",
             )
-            if (ok) refreshLibrary()
+            if (ok) {
+                profileState.value = loadProfile(profileState.value.appliedVersion + 1)
+                refreshLibrary()
+            }
         }
     }
 
@@ -3747,6 +3801,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_FAVORITE_ALBUMS = "favorite_album_keys"
         const val KEY_FAVORITE_SONGS = "favorite_song_ids"
         const val KEY_FAVORITE_ARTISTS = "favorite_artist_keys"
+        const val KEY_PROFILE_NAME = "profile_name"
+        const val KEY_PROFILE_BIRTHDAY = "profile_birthday"
+        const val KEY_PROFILE_PHOTO_PATH = "profile_photo_path"
+        const val PROFILE_PHOTO_FILE_NAME = "profile.jpg"
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
         const val KEY_RADIO_BULLETIN_LOCAL_WRITER = "radio_bulletin_local_writer"
         const val KEY_RADIO_BULLETIN_CLOUD_WRITER = "radio_bulletin_cloud_writer"

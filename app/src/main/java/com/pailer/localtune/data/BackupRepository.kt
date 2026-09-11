@@ -128,6 +128,12 @@ class BackupRepository(private val context: Context) {
         }
         root.put(KEY_LYRICS, lyricsJson)
 
+        val profilePhotoJson = JSONObject()
+        File(context.filesDir, "profile").takeIf { it.exists() }?.listFiles()?.forEach { file ->
+            runCatching { profilePhotoJson.put(file.name, Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)) }
+        }
+        root.put(KEY_PROFILE_PHOTO, profilePhotoJson)
+
         return root
     }
 
@@ -196,10 +202,18 @@ class BackupRepository(private val context: Context) {
                 File(lyricsDir, fileName).writeBytes(Base64.decode(lyricsJson.getString(fileName), Base64.NO_WRAP))
             }
         }
+
+        val profilePhotoJson = root.optJSONObject(KEY_PROFILE_PHOTO) ?: JSONObject()
+        val profileDir = File(context.filesDir, "profile").apply { mkdirs() }
+        profilePhotoJson.keys().forEach { fileName ->
+            runCatching {
+                File(profileDir, fileName).writeBytes(Base64.decode(profilePhotoJson.getString(fileName), Base64.NO_WRAP))
+            }
+        }
     }
 
     companion object {
-        private const val BACKUP_SCHEMA_VERSION = 3
+        private const val BACKUP_SCHEMA_VERSION = 4
         private const val KEY_BACKUP_URI = "backup_uri"
         private const val KEY_LAST_BACKUP_AT = "last_backup_at"
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
@@ -207,6 +221,7 @@ class BackupRepository(private val context: Context) {
         private const val KEY_PREFS = "prefs"
         private const val KEY_ARTIST_PHOTOS = "artistPhotos"
         private const val KEY_LYRICS = "lyrics"
+        private const val KEY_PROFILE_PHOTO = "profilePhoto"
 
         // As 4 SharedPreferences que guardam preferencia/estado do USUARIO (favoritos, overrides
         // de metadado, historico, config de boletim) - de proposito NAO inclui prefs puramente
@@ -216,6 +231,7 @@ class BackupRepository(private val context: Context) {
             "metadata_overrides",
             "playback_history",
             "radio_bulletins",
+            "user_profile",
         )
     }
 }

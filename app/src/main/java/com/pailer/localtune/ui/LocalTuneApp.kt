@@ -14,7 +14,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -25,7 +24,6 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.FlingBehavior
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.ScrollScope
 import kotlin.math.abs
@@ -44,7 +42,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
@@ -111,8 +108,10 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
@@ -165,7 +164,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -189,18 +187,10 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.Layout
-import androidx.compose.ui.layout.SubcomposeLayout
-import androidx.compose.ui.layout.boundsInWindow
-import androidx.compose.ui.layout.layout
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.core.view.ViewCompat
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -210,7 +200,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -247,6 +236,7 @@ import com.pailer.localtune.player.PlayerUiState
 import com.pailer.localtune.player.RadioBulletinBufferUiState
 import com.pailer.localtune.player.RadioBulletinUiState
 import com.pailer.localtune.player.RadioVoiceUiState
+import com.pailer.localtune.player.UserProfileUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
 import com.pailer.localtune.ui.theme.PailerCharcoal
 import com.pailer.localtune.ui.theme.PailerGunmetal
@@ -287,6 +277,9 @@ private enum class LibrarySection(val label: String) {
 
 private enum class SettingsPage {
     Main,
+    Profile,
+    RadioSettings,
+    LibraryMaintenance,
     Metadata,
     AlbumArtists,
     TagWriter,
@@ -427,8 +420,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // usuario aperta "voltar". As telas de detalhe (artista/album/genero/radio) usam a chave
     // da entidade aberta pra resetar o scroll quando o usuario abre uma entidade DIFERENTE,
     // mas preservar quando volta pra mesma (ex.: abriu um album de dentro do artista e voltou).
-    val artistsScrollState = rememberScrollState()
-    val albumsScrollState = rememberScrollState()
+    val artistsScrollState = rememberLazyGridState()
+    val albumsScrollState = rememberLazyGridState()
     val songsListState = rememberLazyGridState()
     val genresListState = rememberLazyGridState()
     val radiosListState = rememberLazyGridState()
@@ -508,6 +501,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     ) { uri ->
         uri?.let(viewModel::importRadioVoicePackage)
     }
+    val profilePhotoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let(viewModel::importProfilePhoto)
+    }
     val writerPackageLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -548,6 +546,10 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         // conteudo sem trocar de nome/Uri.
         if (artistPhoto.appliedVersion > 0) artworkMemoryCache.evictAll()
     }
+    val profile = viewModel.profileState.value
+    LaunchedEffect(profile.appliedVersion) {
+        if (profile.appliedVersion > 0) artworkMemoryCache.evictAll()
+    }
     val radioBulletins = viewModel.radioBulletinState.value
     val radioBulletinBuffer = viewModel.radioBulletinBufferState.value
     val radioVoice = viewModel.radioVoiceState.value
@@ -563,6 +565,16 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val favoriteAlbums = content.favoriteAlbums
     val continueSong = content.continueSong
     val artistNews = viewModel.artistNewsState.value
+    var showNewsDrawer by rememberSaveable { mutableStateOf(false) }
+    var lastSeenNewsLoadedAtMillis by rememberSaveable { mutableStateOf(0L) }
+    val hasNewArtistNews = artistNews.hasLoaded &&
+        artistNews.cards.isNotEmpty() &&
+        artistNews.loadedAtMillis > lastSeenNewsLoadedAtMillis
+    LaunchedEffect(showNewsDrawer, artistNews.loadedAtMillis) {
+        if (showNewsDrawer && artistNews.hasLoaded) {
+            lastSeenNewsLoadedAtMillis = artistNews.loadedAtMillis
+        }
+    }
     LaunchedEffect(player.songId, songs.size) {
         viewModel.loadLyricsFor(player.songId)
     }
@@ -598,6 +610,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     }
     val canHandleBack = showFullPlayer ||
         showSettings ||
+        showNewsDrawer ||
         selectedAlbum != null ||
         selectedArtist != null ||
         selectedRadio != null ||
@@ -609,12 +622,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         when {
             showFullPlayer -> showFullPlayer = false
             showSettings -> {
-                if (settingsPage == SettingsPage.Main) {
-                    showSettings = false
-                } else {
-                    settingsPage = SettingsPage.Main
+                when (settingsPage) {
+                    SettingsPage.Main -> showSettings = false
+                    SettingsPage.Profile -> settingsPage = SettingsPage.Main
+                    SettingsPage.Metadata,
+                    SettingsPage.AlbumArtists,
+                    SettingsPage.TagWriter,
+                    SettingsPage.Artists,
+                    SettingsPage.AlbumArtwork -> settingsPage = SettingsPage.LibraryMaintenance
+                    else -> settingsPage = SettingsPage.Main
                 }
             }
+            showNewsDrawer -> showNewsDrawer = false
             selectedAlbum != null -> selectedAlbum = null
             selectedRadio != null -> selectedRadio = null
             selectedArtist != null -> selectedArtist = null
@@ -705,8 +724,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(end = if (isLandscape) landscapeRailWidth else 0.dp)
-                        .windowInsetsPadding(WindowInsets.statusBars),
+                        .padding(end = if (isLandscape) landscapeRailWidth else 0.dp),
                 ) {
                 LibraryHeader(
                     query = library.query,
@@ -716,6 +734,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         settingsPage = SettingsPage.Main
                         showSettings = true
                     },
+                    onNews = {
+                        showNewsDrawer = true
+                        viewModel.loadArtistNewsIfNeeded(favoriteArtists)
+                    },
+                    hasNewNews = hasNewArtistNews,
                     // Pedido do usuario (10/09/2026): busca só faz sentido em Biblioteca/Rádio -
                     // a aba Início não tem lista pra filtrar, então a barra sumia sem função. Logo
                     // centraliza sozinha quando a busca some (ver LibraryHeader).
@@ -864,12 +887,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         photoUriFor = viewModel::artistPhotoUri,
                         listState = genreDetailListState,
                     )
-                    selectedTab == MainTab.Home -> HomeNewsDrawer(
-                        favoriteArtists = favoriteArtists,
-                        newsState = artistNews,
-                        onRequestLoad = { viewModel.loadArtistNewsIfNeeded(favoriteArtists) },
-                        onOpenLink = onOpenNewsLink,
-                    ) {
+                    selectedTab == MainTab.Home -> {
                         HomeScreen(
                             songs = songs,
                             continueSong = continueSong,
@@ -913,7 +931,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                 artists = artists,
                                 onOpenArtist = { selectedArtist = it },
                                 onLongPressArtist = { artistActionsTarget = it },
-                                favoriteArtistKeys = library.favoriteArtistKeys,
                                 photoUriFor = viewModel::artistPhotoUri,
                                 scrollState = artistsScrollState,
                             )
@@ -921,7 +938,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                 albums = albums,
                                 onOpenAlbum = { selectedAlbum = it },
                                 onLongPressAlbum = { albumActionsTarget = it },
-                                favoriteAlbumKeys = library.favoriteAlbumKeys,
                                 scrollState = albumsScrollState,
                             )
                             LibrarySection.Songs -> SongsScreen(
@@ -961,6 +977,14 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         }
 
         val activityContext = LocalContext.current
+        ArtistNewsDrawer(
+            visible = showNewsDrawer,
+            favoriteArtists = favoriteArtists,
+            newsState = artistNews,
+            onRequestLoad = { viewModel.loadArtistNewsIfNeeded(favoriteArtists) },
+            onOpenLink = onOpenNewsLink,
+            onClose = { showNewsDrawer = false },
+        )
         SettingsDrawer(
             visible = showSettings,
             page = settingsPage,
@@ -969,6 +993,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             radioBulletins = radioBulletins,
             radioBulletinBuffer = radioBulletinBuffer,
             radioVoice = radioVoice,
+            profile = profile,
             batteryProtected = viewModel.isIgnoringBatteryOptimizations(),
             onRequestBatteryExemption = {
                 viewModel.createBatteryOptimizationExemptionIntent()?.let { intent ->
@@ -1011,6 +1036,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onResetBulletinBuffer = viewModel::resetBulletinBuffer,
             onFixFallbackBulletins = viewModel::fixFallbackBulletins,
             onPlayReadyBulletin = viewModel::playReadyBufferedBulletin,
+            onChooseProfilePhoto = { profilePhotoLauncher.launch(arrayOf("image/*")) },
+            onSaveProfile = viewModel::saveUserProfile,
             hasHiddenRadios = viewModel.hasHiddenRadios(),
             onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
             hasHiddenLibraryItems = viewModel.hasHiddenArtistsOrAlbums(),
@@ -1272,72 +1299,68 @@ private fun LibraryHeader(
     isLoading: Boolean,
     onQueryChange: (String) -> Unit,
     onSettings: () -> Unit,
+    onNews: () -> Unit,
+    hasNewNews: Boolean,
     showSearch: Boolean = true,
 ) {
-    // Sem busca (aba Início) a logo centraliza no lugar de ficar encostada a esquerda com um
-    // espaco vazio grande do lado - Box com align() em vez do Row de sempre, menu continua
-    // no canto direito (mesma posicao das outras abas, pedido do usuario 10/09/2026).
-    if (!showSearch) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 2.dp),
-        ) {
-            HeaderLogo(modifier = Modifier.align(Alignment.Center))
-            HeaderSettingsButton(
-                onSettings = onSettings,
-                isLoading = isLoading,
-                modifier = Modifier.align(Alignment.CenterEnd),
-            )
-        }
-        return
-    }
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .background(PailerSurface)
+            .windowInsetsPadding(WindowInsets.statusBars),
     ) {
-        HeaderLogo()
-        Spacer(Modifier.width(10.dp))
         Row(
             modifier = Modifier
-                .weight(1f)
-                .height(30.dp)
-                .clip(RoundedCornerShape(15.dp))
-                .background(MaterialTheme.colorScheme.surface)
+                .fillMaxWidth()
+                .height(40.dp)
                 .padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                Icons.Filled.Search,
-                contentDescription = null,
-                modifier = Modifier.size(15.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.width(6.dp))
-            Box(Modifier.weight(1f)) {
-                if (query.isEmpty()) {
-                    Text(
-                        "Buscar",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            HeaderSettingsButton(onSettings = onSettings, isLoading = isLoading)
+            Spacer(Modifier.width(8.dp))
+            HeaderLogo()
+            if (showSearch) {
+                Spacer(Modifier.width(10.dp))
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(28.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.White.copy(alpha = 0.12f))
+                        .padding(horizontal = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.Search,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = Color.White.copy(alpha = 0.68f),
                     )
+                    Spacer(Modifier.width(6.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (query.isEmpty()) {
+                            Text(
+                                "Buscar",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.White.copy(alpha = 0.58f),
+                            )
+                        }
+                        BasicTextField(
+                            value = query,
+                            onValueChange = onQueryChange,
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodySmall.copy(color = Color.White),
+                            cursorBrush = SolidColor(PailerRed),
+                        )
+                    }
                 }
-                BasicTextField(
-                    value = query,
-                    onValueChange = onQueryChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    textStyle = MaterialTheme.typography.bodySmall.copy(
-                        color = MaterialTheme.colorScheme.onBackground,
-                    ),
-                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                )
+            } else {
+                Spacer(Modifier.weight(1f))
             }
+            Spacer(Modifier.width(6.dp))
+            HeaderNewsButton(onNews = onNews, hasNewNews = hasNewNews)
         }
-        Spacer(Modifier.width(4.dp))
-        HeaderSettingsButton(onSettings = onSettings, isLoading = isLoading)
     }
 }
 
@@ -1346,11 +1369,11 @@ private fun HeaderLogo(modifier: Modifier = Modifier) {
     Text(
         buildAnnotatedString {
             withStyle(SpanStyle(fontFamily = FontFamily.Cursive)) { append("Pailer ") }
-            withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary)) { append("FM") }
+            withStyle(SpanStyle(color = PailerRed)) { append("FM") }
         },
         style = MaterialTheme.typography.titleSmall,
         fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.onBackground,
+        color = Color.White,
         maxLines = 1,
         modifier = modifier,
     )
@@ -1364,11 +1387,36 @@ private fun HeaderSettingsButton(onSettings: () -> Unit, isLoading: Boolean, mod
         modifier = modifier.size(30.dp),
     ) {
         Icon(
-            Icons.Filled.MoreVert,
+            Icons.Filled.Menu,
             contentDescription = "Configuracoes",
-            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.38f),
-            modifier = Modifier.size(18.dp),
+            tint = Color.White.copy(alpha = if (isLoading) 0.28f else 0.66f),
+            modifier = Modifier.size(24.dp),
         )
+    }
+}
+
+@Composable
+private fun HeaderNewsButton(onNews: () -> Unit, hasNewNews: Boolean, modifier: Modifier = Modifier) {
+    IconButton(
+        onClick = onNews,
+        modifier = modifier.size(30.dp),
+    ) {
+        Box(contentAlignment = Alignment.TopEnd) {
+            Icon(
+                Icons.Filled.Notifications,
+                contentDescription = "Noticias",
+                tint = Color.White.copy(alpha = 0.92f),
+                modifier = Modifier.size(21.dp),
+            )
+            if (hasNewNews) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(PailerRed),
+                )
+            }
+        }
     }
 }
 
@@ -1422,6 +1470,7 @@ private fun SettingsDrawer(
     radioBulletins: RadioBulletinUiState,
     radioBulletinBuffer: RadioBulletinBufferUiState,
     radioVoice: RadioVoiceUiState,
+    profile: UserProfileUiState,
     batteryProtected: Boolean,
     onRequestBatteryExemption: () -> Unit,
     onClose: () -> Unit,
@@ -1460,6 +1509,8 @@ private fun SettingsDrawer(
     onResetBulletinBuffer: () -> Unit,
     onFixFallbackBulletins: () -> Unit,
     onPlayReadyBulletin: (Int) -> Unit,
+    onChooseProfilePhoto: () -> Unit,
+    onSaveProfile: (String, String) -> Unit,
     hasHiddenRadios: Boolean = false,
     onRestoreHiddenRadios: () -> Unit = {},
     hasHiddenLibraryItems: Boolean = false,
@@ -1491,9 +1542,9 @@ private fun SettingsDrawer(
             )
             AnimatedVisibility(
                 visible = visible,
-                enter = slideInHorizontally(initialOffsetX = { it }),
-                exit = slideOutHorizontally(targetOffsetX = { it }),
-                modifier = Modifier.align(Alignment.CenterEnd),
+                enter = slideInHorizontally(initialOffsetX = { -it }),
+                exit = slideOutHorizontally(targetOffsetX = { -it }),
+                modifier = Modifier.align(Alignment.CenterStart),
             ) {
                 Surface(
                     modifier = Modifier
@@ -1505,9 +1556,31 @@ private fun SettingsDrawer(
                     when (page) {
                         SettingsPage.Main -> SettingsMainPanel(
                             onClose = onClose,
+                            profile = profile,
                             onSync = onSync,
                             batteryProtected = batteryProtected,
                             onRequestBatteryExemption = onRequestBatteryExemption,
+                            onOpenProfile = { onPageChange(SettingsPage.Profile) },
+                            onOpenLibraryMaintenance = { onPageChange(SettingsPage.LibraryMaintenance) },
+                            onOpenRadioSettings = { onPageChange(SettingsPage.RadioSettings) },
+                        )
+                        SettingsPage.Profile -> UserProfileSettingsPanel(
+                            profile = profile,
+                            onBack = { onPageChange(SettingsPage.Main) },
+                            onChoosePhoto = onChooseProfilePhoto,
+                            onSave = onSaveProfile,
+                            onOpenBackup = { onPageChange(SettingsPage.Backup) },
+                        )
+                        SettingsPage.RadioSettings -> RadioSettingsPanel(
+                            onBack = { onPageChange(SettingsPage.Main) },
+                            onOpenRadioBulletins = { onPageChange(SettingsPage.RadioBulletins) },
+                            hasHiddenRadios = hasHiddenRadios,
+                            onRestoreHiddenRadios = onRestoreHiddenRadios,
+                            hasRadioDislikedSongs = radioDislikedSongs.isNotEmpty(),
+                            onOpenRadioDislikedSongs = { onPageChange(SettingsPage.RadioDislikedSongs) },
+                        )
+                        SettingsPage.LibraryMaintenance -> LibraryMaintenanceSettingsPanel(
+                            onBack = { onPageChange(SettingsPage.Main) },
                             onOpenMetadata = {
                                 onPageChange(SettingsPage.Metadata)
                                 onScanMetadata()
@@ -1524,42 +1597,34 @@ private fun SettingsDrawer(
                                 onPageChange(SettingsPage.Artists)
                                 onScanArtists()
                             },
-                            onOpenRadioBulletins = {
-                                onPageChange(SettingsPage.RadioBulletins)
-                            },
                             onOpenAlbumArtwork = {
                                 onPageChange(SettingsPage.AlbumArtwork)
                                 onScanAlbumArtwork()
                             },
-                            onOpenBackup = { onPageChange(SettingsPage.Backup) },
-                            hasHiddenRadios = hasHiddenRadios,
-                            onRestoreHiddenRadios = onRestoreHiddenRadios,
                             hasHiddenLibraryItems = hasHiddenLibraryItems,
                             onRestoreHiddenLibraryItems = onRestoreHiddenLibraryItems,
-                            hasRadioDislikedSongs = radioDislikedSongs.isNotEmpty(),
-                            onOpenRadioDislikedSongs = { onPageChange(SettingsPage.RadioDislikedSongs) },
                         )
                         SettingsPage.Metadata -> MetadataSettingsPanel(
                             metadata = metadata,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanMetadata,
                             onSuggest = onSuggestGenres,
                             onApproveGenre = onApproveGenre,
                         )
                         SettingsPage.AlbumArtists -> AlbumArtistCleanupSettingsPanel(
                             metadata = metadata,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanMissingArtists,
                             onApproveArtist = onApproveAlbumArtist,
                         )
                         SettingsPage.TagWriter -> TagWriterSettingsPanel(
                             metadata = metadata,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanPendingTagWrites,
                         )
                         SettingsPage.Artists -> ArtistCleanupSettingsPanel(
                             metadata = metadata,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanArtists,
                             onUnifyArtist = onUnifyArtist,
                         )
@@ -1567,7 +1632,7 @@ private fun SettingsDrawer(
                             radioBulletins = radioBulletins,
                             bulletinBuffer = radioBulletinBuffer,
                             radioVoice = radioVoice,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.RadioSettings) },
                             onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
                             onSetCloudWriterEnabled = onSetRadioBulletinCloudWriterEnabled,
                             onSetTtsProvider = onSetRadioBulletinTtsProvider,
@@ -1596,7 +1661,7 @@ private fun SettingsDrawer(
                         )
                         SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
                             state = albumArtwork,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanAlbumArtwork,
                             onOpenSearch = onOpenArtworkSearch,
                             onCloseSearch = onCloseArtworkSearch,
@@ -1616,7 +1681,7 @@ private fun SettingsDrawer(
                         )
                         SettingsPage.RadioDislikedSongs -> RadioDislikedSongsSettingsPanel(
                             songs = radioDislikedSongs,
-                            onBack = { onPageChange(SettingsPage.Main) },
+                            onBack = { onPageChange(SettingsPage.RadioSettings) },
                             onUndislike = onUndislikeSong,
                         )
                     }
@@ -1629,28 +1694,18 @@ private fun SettingsDrawer(
 @Composable
 private fun SettingsMainPanel(
     onClose: () -> Unit,
+    profile: UserProfileUiState,
     onSync: () -> Unit,
     batteryProtected: Boolean,
     onRequestBatteryExemption: () -> Unit,
-    onOpenMetadata: () -> Unit,
-    onOpenAlbumArtists: () -> Unit,
-    onOpenTagWriter: () -> Unit,
-    onOpenArtists: () -> Unit,
-    onOpenRadioBulletins: () -> Unit,
-    onOpenAlbumArtwork: () -> Unit,
-    onOpenBackup: () -> Unit = {},
-    hasHiddenRadios: Boolean = false,
-    onRestoreHiddenRadios: () -> Unit = {},
-    hasHiddenLibraryItems: Boolean = false,
-    onRestoreHiddenLibraryItems: () -> Unit = {},
-    hasRadioDislikedSongs: Boolean = false,
-    onOpenRadioDislikedSongs: () -> Unit = {},
+    onOpenProfile: () -> Unit,
+    onOpenLibraryMaintenance: () -> Unit,
+    onOpenRadioSettings: () -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
             .padding(horizontal = 18.dp, vertical = 22.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1665,96 +1720,330 @@ private fun SettingsMainPanel(
                 Icon(Icons.Filled.Close, contentDescription = "Fechar", tint = MaterialTheme.colorScheme.onBackground)
             }
         }
-        Spacer(Modifier.height(16.dp))
-        SettingsActionRow(
-            title = "Sincronizar biblioteca",
-            subtitle = "Ler novas faixas salvas no celular",
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior()),
+        ) {
+            Spacer(Modifier.height(16.dp))
+            SettingsActionRow(
+            title = "Sincronizar",
+            subtitle = "Ler novas faixas do celular",
             icon = Icons.Filled.Sync,
             onClick = onSync,
         )
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         if (!batteryProtected) {
             SettingsActionRow(
-                title = "Manter radio viva em segundo plano",
-                subtitle = "Retirar o app da otimizacao de bateria do Android",
+                title = "Segundo plano",
+                subtitle = "Evitar pausa pela bateria",
                 icon = Icons.Filled.BatteryAlert,
                 onClick = onRequestBatteryExemption,
             )
             HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         }
+            SettingsActionRow(
+                title = "Radio Settings",
+                subtitle = "Boletins, radios e bloqueios",
+                icon = Icons.Filled.Radio,
+                onClick = onOpenRadioSettings,
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Biblioteca Settings",
+                subtitle = "Metadados, capas e itens ocultos",
+                icon = Icons.Filled.Tune,
+                onClick = onOpenLibraryMaintenance,
+            )
+        }
+        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+        ProfileFooter(profile = profile, onOpenProfile = onOpenProfile)
+    }
+}
+
+@Composable
+private fun RadioSettingsPanel(
+    onBack: () -> Unit,
+    onOpenRadioBulletins: () -> Unit,
+    hasHiddenRadios: Boolean,
+    onRestoreHiddenRadios: () -> Unit,
+    hasRadioDislikedSongs: Boolean,
+    onOpenRadioDislikedSongs: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Radio Settings",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Text(
+            "Ajustes da radio, noticias e o que fica fora da programacao.",
+            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
         SettingsActionRow(
-            title = "Boletins da radio",
-            subtitle = "Configurar manchetes, dialogo e redator local",
+            title = "Boletins",
+            subtitle = "Noticias, vozes e redator",
             icon = Icons.Filled.GraphicEq,
             onClick = onOpenRadioBulletins,
         )
+        if (hasHiddenRadios) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Radios ocultas",
+                subtitle = "Restaurar radios apagadas",
+                icon = Icons.Filled.VisibilityOff,
+                onClick = onRestoreHiddenRadios,
+            )
+        }
+        if (hasRadioDislikedSongs) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Faixas bloqueadas",
+                subtitle = "Liberar musicas da radio",
+                icon = Icons.Filled.ThumbDown,
+                onClick = onOpenRadioDislikedSongs,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileFooter(
+    profile: UserProfileUiState,
+    onOpenProfile: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ProfileAvatar(profile.photoUri, modifier = Modifier.size(42.dp))
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                profile.name.ifBlank { "Meu perfil" },
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onOpenProfile, modifier = Modifier.size(34.dp)) {
+            Icon(
+                Icons.Filled.MoreVert,
+                contentDescription = "Meu perfil",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileAvatar(photoUri: Uri?, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(PailerGunmetal.copy(alpha = 0.8f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (photoUri != null) {
+            ArtworkBox(
+                uri = photoUri,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape),
+                iconModifier = Modifier.size(18.dp),
+            )
+        } else {
+            Icon(
+                Icons.Filled.Person,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.78f),
+                modifier = Modifier.size(22.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun UserProfileSettingsPanel(
+    profile: UserProfileUiState,
+    onBack: () -> Unit,
+    onChoosePhoto: () -> Unit,
+    onSave: (String, String) -> Unit,
+    onOpenBackup: () -> Unit,
+) {
+    var nameDraft by remember(profile.name) { mutableStateOf(profile.name) }
+    var birthdayDraft by remember(profile.birthday) { mutableStateOf(profile.birthday) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Meu perfil",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            ProfileAvatar(profile.photoUri, modifier = Modifier.size(96.dp))
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onChoosePhoto) {
+                Icon(Icons.Filled.Image, contentDescription = null, modifier = Modifier.size(17.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Escolher foto")
+            }
+        }
+        Spacer(Modifier.height(18.dp))
+        OutlinedTextField(
+            value = nameDraft,
+            onValueChange = { nameDraft = it },
+            label = { Text("Nome") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = birthdayDraft,
+            onValueChange = { birthdayDraft = it },
+            label = { Text("Data de aniversario") },
+            placeholder = { Text("dd/mm") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        profile.message?.let { message ->
+            Spacer(Modifier.height(10.dp))
+            Text(
+                message,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Spacer(Modifier.height(18.dp))
+        Button(
+            onClick = { onSave(nameDraft, birthdayDraft) },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Salvar alteracoes")
+        }
+        Spacer(Modifier.height(18.dp))
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         SettingsActionRow(
+            title = "Backup",
+            subtitle = "Favoritos, fotos e app",
+            icon = Icons.Filled.CloudUpload,
+            onClick = onOpenBackup,
+        )
+    }
+}
+
+@Composable
+private fun LibraryMaintenanceSettingsPanel(
+    onBack: () -> Unit,
+    onOpenMetadata: () -> Unit,
+    onOpenAlbumArtists: () -> Unit,
+    onOpenTagWriter: () -> Unit,
+    onOpenArtists: () -> Unit,
+    onOpenAlbumArtwork: () -> Unit,
+    hasHiddenLibraryItems: Boolean,
+    onRestoreHiddenLibraryItems: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Biblioteca Settings",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Text(
+            "Ferramentas para organizar a colecao local.",
+            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        SettingsActionRow(
             title = "Metadados",
-            subtitle = "Encontrar albuns sem genero e sugerir categorias",
+            subtitle = "Generos e categorias",
             icon = Icons.Filled.Tune,
             onClick = onOpenMetadata,
         )
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         SettingsActionRow(
             title = "Albuns sem artista",
-            subtitle = "Corrigir artista desconhecido album por album",
+            subtitle = "Corrigir nomes ausentes",
             icon = Icons.Filled.Person,
             onClick = onOpenAlbumArtists,
         )
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         SettingsActionRow(
             title = "Tags pendentes",
-            subtitle = "Ver o que ainda falta sincronizar",
+            subtitle = "Sincronizacoes restantes",
             icon = Icons.Filled.Check,
             onClick = onOpenTagWriter,
         )
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         SettingsActionRow(
-            title = "Artistas duplicados",
-            subtitle = "Unificar nomes parecidos na biblioteca",
+            title = "Duplicados",
+            subtitle = "Unificar artistas parecidos",
             icon = Icons.Filled.Person,
             onClick = onOpenArtists,
         )
         HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
         SettingsActionRow(
-            title = "Corrigir capas",
-            subtitle = "Buscar capa na internet pros albuns sem imagem",
+            title = "Capas",
+            subtitle = "Buscar imagens faltantes",
             icon = Icons.Filled.Image,
             onClick = onOpenAlbumArtwork,
         )
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-        SettingsActionRow(
-            title = "Backup",
-            subtitle = "Guardar favoritos e fotos de artista num arquivo seu",
-            icon = Icons.Filled.CloudUpload,
-            onClick = onOpenBackup,
-        )
-        if (hasHiddenRadios) {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-            SettingsActionRow(
-                title = "Restaurar radios ocultas",
-                subtitle = "Traz de volta as radios de perfil/genero que voce apagou",
-                icon = Icons.Filled.Sync,
-                onClick = onRestoreHiddenRadios,
-            )
-        }
         if (hasHiddenLibraryItems) {
             HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
             SettingsActionRow(
-                title = "Restaurar artistas/albuns ocultos",
-                subtitle = "Traz de volta o que voce ocultou (nao apaga nada do aparelho)",
+                title = "Itens ocultos",
+                subtitle = "Restaurar artistas e albuns",
                 icon = Icons.Filled.VisibilityOff,
                 onClick = onRestoreHiddenLibraryItems,
-            )
-        }
-        if (hasRadioDislikedSongs) {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-            SettingsActionRow(
-                title = "Faixas deslikadas na radio",
-                subtitle = "Faixas banidas do shuffle da radio pelo botao de deslike",
-                icon = Icons.Filled.ThumbDown,
-                onClick = onOpenRadioDislikedSongs,
             )
         }
     }
@@ -3327,14 +3616,27 @@ private fun SettingsActionRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
-            .padding(vertical = 14.dp),
+            .padding(vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(28.dp))
-        Spacer(Modifier.width(14.dp))
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(23.dp))
+        Spacer(Modifier.width(13.dp))
         Column(Modifier.weight(1f)) {
-            Text(title, color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            Text(
+                title,
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                subtitle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -3850,183 +4152,107 @@ private fun ContinuousAlbumRow(
     }
 }
 
-// Painel de noticias/curiosidades dos artistas favoritados, revelado arrastando a Home pra
-// direita (pedido do usuario 06/09/2026 - so na Home, ver LocalTuneApp.kt onde e usado). A zona
-// de deteccao do gesto fica so numa faixa fina na borda esquerda pra nao brigar com os carrosseis
-// horizontais da propria Home (Albuns recentes, Ouvir de novo etc.) - uma vez aberto, o proprio
-// painel e o scrim tambem aceitam arrastar/tocar pra fechar.
+// Painel de noticias/curiosidades dos artistas favoritados, aberto pelo sino da navbar.
 @Composable
-private fun HomeNewsDrawer(
+private fun ArtistNewsDrawer(
+    visible: Boolean,
     favoriteArtists: List<LocalArtist>,
     newsState: ArtistNewsUiState,
     onRequestLoad: () -> Unit,
     onOpenLink: (String) -> Unit,
-    content: @Composable () -> Unit,
+    onClose: () -> Unit,
 ) {
-    val density = LocalDensity.current
     val configuration = LocalConfiguration.current
     // Cobre quase a tela toda, deixando so um filete da Home visivel na ponta (pedido do usuario)
     // - 32dp de sobra em vez da largura cheia, pra ainda dar pra perceber que tem conteudo atras.
     val panelWidthDp = (configuration.screenWidthDp.dp - 32.dp).coerceAtLeast(240.dp)
-    val panelWidthPx = with(density) { panelWidthDp.toPx() }
-    val offsetX = remember { Animatable(-panelWidthPx) }
-    val scope = rememberCoroutineScope()
-    val isOpen = offsetX.value > -panelWidthPx / 2
-    val progress = ((offsetX.value + panelWidthPx) / panelWidthPx).coerceIn(0f, 1f)
 
-    LaunchedEffect(isOpen) {
-        if (isOpen) onRequestLoad()
-    }
-    BackHandler(enabled = progress > 0f) {
-        scope.launch { offsetX.animateTo(-panelWidthPx) }
+    LaunchedEffect(visible) {
+        if (visible) onRequestLoad()
     }
 
-    // O gesto de voltar do sistema (navegacao por gestos, Android 10+) tambem escuta a borda
-    // esquerda da tela - sem excluir essa faixa, o Android intercepta o arrasto como "voltar" e
-    // sai do app antes do nosso proprio detector de arrasto receber o toque.
-    val view = LocalView.current
-    var edgeZoneBounds by remember { mutableStateOf<android.graphics.Rect?>(null) }
-    DisposableEffect(view, edgeZoneBounds) {
-        edgeZoneBounds?.let { rect -> ViewCompat.setSystemGestureExclusionRects(view, listOf(rect)) }
-        onDispose { ViewCompat.setSystemGestureExclusionRects(view, emptyList()) }
-    }
-
-    val dragModifier = Modifier.pointerInput(panelWidthPx) {
-        detectHorizontalDragGestures(
-            onDragEnd = {
-                scope.launch {
-                    offsetX.animateTo(if (offsetX.value > -panelWidthPx / 2) 0f else -panelWidthPx)
-                }
-            },
-            onHorizontalDrag = { change, dragAmount ->
-                change.consume()
-                scope.launch { offsetX.snapTo((offsetX.value + dragAmount).coerceIn(-panelWidthPx, 0f)) }
-            },
-        )
-    }
-
-    Box(Modifier.fillMaxSize()) {
-        content()
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+    ) {
         Box(
-            modifier = Modifier
-                .align(Alignment.CenterStart)
-                .fillMaxHeight()
-                .width(28.dp)
-                .onGloballyPositioned { coordinates ->
-                    val bounds = coordinates.boundsInWindow()
-                    edgeZoneBounds = android.graphics.Rect(
-                        bounds.left.roundToInt(),
-                        bounds.top.roundToInt(),
-                        bounds.right.roundToInt(),
-                        bounds.bottom.roundToInt(),
-                    )
-                }
-                .then(dragModifier),
-        )
-        // Alca visual da gaveta de noticias - sem ela o usuario nao tem como saber que aquela
-        // faixa fina na borda esquerda arrasta pra abrir (pedido do usuario 10/09/2026). E so
-        // indicacao visual (nao tem pointerInput proprio), entao o toque atravessa pra Box de
-        // deteccao de arrasto logo acima; ela mesma some assim que o painel comeca a cobri-la.
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(bottom = 24.dp)
-                .alpha((1f - progress * 4f).coerceIn(0f, 1f))
-                .width(16.dp)
-                .height(64.dp)
-                .clip(RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp))
-                .background(PailerRed),
-            contentAlignment = Alignment.Center,
+            Modifier.fillMaxSize(),
         ) {
-            // rotate() sozinho nao basta: o Box pai mede o Text ANTES de rotacionar, entao com
-            // maxWidth=16dp a palavra ficava truncada em "NE". O Modifier.layout mede o texto sem
-            // limite de largura (na horizontal, como se nao fosse rotacionar) e devolve pro pai um
-            // tamanho com largura/altura invertidas - o que a rotacao de 90 graus realmente ocupa.
-            Text(
-                "NEWS",
-                modifier = Modifier
-                    .layout { measurable, constraints ->
-                        val placeable = measurable.measure(constraints.copy(minWidth = 0, maxWidth = Constraints.Infinity))
-                        layout(placeable.height, placeable.width) {
-                            placeable.place(
-                                x = -(placeable.width - placeable.height) / 2,
-                                y = -(placeable.height - placeable.width) / 2,
-                            )
-                        }
-                    }
-                    .rotate(-90f),
-                color = Color.White,
-                style = MaterialTheme.typography.labelSmall.copy(
-                    fontSize = 9.sp,
-                    letterSpacing = 1.5.sp,
-                    fontWeight = FontWeight.Bold,
-                ),
-                maxLines = 1,
-                softWrap = false,
-            )
-        }
-        if (progress > 0f) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f * progress))
-                    .clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                    ) { scope.launch { offsetX.animateTo(-panelWidthPx) } }
-                    .then(dragModifier),
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .clickable(onClick = onClose),
             )
-        }
-        Column(
-            modifier = Modifier
-                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
-                .width(panelWidthDp)
-                .fillMaxHeight()
-                .background(PailerCharcoal)
-                .then(dragModifier)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(vertical = 18.dp),
-        ) {
-            Text(
-                "Novidades dos seus favoritos",
-                modifier = Modifier.padding(horizontal = 18.dp),
-                color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Black,
-            )
-            Spacer(Modifier.height(4.dp))
-            when {
-                favoriteArtists.isEmpty() -> Text(
-                    "Curta um artista pra ver noticias e curiosidades dele aqui.",
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                newsState.isLoading -> Box(
-                    modifier = Modifier.fillMaxWidth().padding(24.dp),
-                    contentAlignment = Alignment.Center,
+            AnimatedVisibility(
+                visible = visible,
+                enter = slideInHorizontally(initialOffsetX = { it }),
+                exit = slideOutHorizontally(targetOffsetX = { it }),
+                modifier = Modifier.align(Alignment.CenterEnd),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .width(panelWidthDp)
+                        .fillMaxHeight()
+                        .background(PailerCharcoal)
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(vertical = 18.dp),
                 ) {
-                    CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
-                }
-                newsState.hasLoaded && newsState.cards.isEmpty() -> Text(
-                    "Nao encontrei noticias recentes dos seus favoritos agora.",
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                else -> LazyColumn(
-                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    items(newsState.cards, key = { it.link }) { card ->
-                        val artist = favoriteArtists.firstOrNull { it.key == card.artistName.lowercase().trim() }
-                        val coverSong = artist?.songs?.firstOrNull { it.artworkUri != null }
-                        ArtistNewsCardView(
-                            card = card,
-                            artworkUri = coverSong?.artworkUri,
-                            embeddedSourceUri = coverSong?.contentUri,
-                            onClick = { onOpenLink(card.link) },
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = onClose) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Fechar",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
+                        Text(
+                            "Novidades dos seus favoritos",
+                            modifier = Modifier.weight(1f),
+                            color = MaterialTheme.colorScheme.onBackground,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Black,
                         )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    when {
+                        favoriteArtists.isEmpty() -> Text(
+                            "Curta um artista pra ver noticias e curiosidades dele aqui.",
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        newsState.isLoading -> Box(
+                            modifier = Modifier.fillMaxWidth().padding(24.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+                        }
+                        newsState.hasLoaded && newsState.cards.isEmpty() -> Text(
+                            "Nao encontrei noticias recentes dos seus favoritos agora.",
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        else -> LazyColumn(
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            items(newsState.cards, key = { it.link }) { card ->
+                                val artist = favoriteArtists.firstOrNull { it.key == card.artistName.lowercase().trim() }
+                                val coverSong = artist?.songs?.firstOrNull { it.artworkUri != null }
+                                ArtistNewsCardView(
+                                    card = card,
+                                    artworkUri = coverSong?.artworkUri,
+                                    embeddedSourceUri = coverSong?.contentUri,
+                                    onClick = { onOpenLink(card.link) },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -4128,30 +4354,24 @@ private fun ArtistsScreen(
     artists: List<LocalArtist>,
     onOpenArtist: (LocalArtist) -> Unit,
     onLongPressArtist: (LocalArtist) -> Unit = {},
-    favoriteArtistKeys: Set<String> = emptySet(),
     photoUriFor: (LocalArtist) -> Uri? = { null },
-    scrollState: ScrollState = rememberScrollState(),
+    scrollState: LazyGridState = rememberLazyGridState(),
 ) {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
-    // Bento: favoritos ocupam bloco 2x2 de verdade, os demais fluem 1x1 ao redor - por isso
-    // isso nao e mais LazyVerticalGrid (GridItemSpan so estica largura dentro da MESMA linha,
-    // nao da pra reservar altura extra com vizinhos preenchendo do lado). Ver BentoGrid.
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
-            .padding(
-                horizontal = if (isLandscape) 14.dp else 18.dp,
-                vertical = if (isLandscape) 8.dp else 12.dp,
-            ),
+    val columns = if (isLandscape) 4 else 3
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(columns),
+        state = scrollState,
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(
+            horizontal = if (isLandscape) 14.dp else 18.dp,
+            vertical = if (isLandscape) 8.dp else 12.dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 14.dp else 18.dp),
     ) {
-        BentoGrid(
-            items = artists,
-            isFavorite = { !isLandscape && it.key in favoriteArtistKeys },
-            columns = if (isLandscape) 4 else 3,
-            gap = if (isLandscape) 10.dp else 12.dp,
-        ) { artist ->
+        gridItems(artists, key = { it.key }) { artist ->
             ArtistGridCard(
                 artist = artist,
                 onClick = { onOpenArtist(artist) },
@@ -4159,115 +4379,6 @@ private fun ArtistsScreen(
                 photoUri = photoUriFor(artist),
                 compact = isLandscape,
             )
-        }
-    }
-}
-
-// Placement (linha, coluna, quantas colunas/linhas de lado) de um item na grade bento.
-private data class BentoPlacement(val row: Int, val col: Int, val span: Int)
-
-// Empacotamento "first-fit dense" (mesma ideia do `grid-auto-flow: dense` do CSS Grid):
-// varre da esquerda pra direita, de cima pra baixo, e encaixa cada item no primeiro espaco
-// livre grande o suficiente - itens 1x1 preenchem os buracos ao redor de um bloco 2x2 sem
-// deixar lacunas. `isBig` na ordem de `artists` decide o tamanho (2x2 pros favoritos).
-private fun packBentoGrid(isBig: List<Boolean>, columns: Int): List<BentoPlacement> {
-    val occupied = mutableListOf<BooleanArray>()
-    fun ensureRow(row: Int) {
-        while (occupied.size <= row) occupied.add(BooleanArray(columns))
-    }
-    fun fits(row: Int, col: Int, span: Int): Boolean {
-        if (col + span > columns) return false
-        for (dr in 0 until span) {
-            ensureRow(row + dr)
-            for (dc in 0 until span) {
-                if (occupied[row + dr][col + dc]) return false
-            }
-        }
-        return true
-    }
-    fun occupy(row: Int, col: Int, span: Int) {
-        for (dr in 0 until span) {
-            ensureRow(row + dr)
-            for (dc in 0 until span) {
-                occupied[row + dr][col + dc] = true
-            }
-        }
-    }
-    val placements = ArrayList<BentoPlacement>(isBig.size)
-    for (big in isBig) {
-        val span = if (big) 2 else 1
-        var row = 0
-        var placed = false
-        while (!placed) {
-            ensureRow(row)
-            for (col in 0..(columns - span)) {
-                if (fits(row, col, span)) {
-                    occupy(row, col, span)
-                    placements.add(BentoPlacement(row, col, span))
-                    placed = true
-                    break
-                }
-            }
-            row++
-        }
-    }
-    return placements
-}
-
-// Grade bento generica: favoritos (isFavorite) ganham um bloco 2x2, os demais ficam 1x1 - usada
-// tanto por artistas (ArtistGridCard) quanto por albuns (AlbumGridCard, pedido do usuario
-// 04/09/2026 pra ter a mesma sensacao de "capa maior pro favorito" nos dois lugares), os dois
-// escalam capa/texto proporcionalmente porque o card recebido em `itemContent` e sempre
-// fillMaxWidth(). Layout customizado porque LazyVerticalGrid nao suporta item ocupando varias
-// LINHAS com vizinhos preenchendo ao redor (so estica coluna na mesma linha) - ver
-// packBentoGrid(). Nao e lazy: mede todos os cards de uma vez (aceitavel pro tamanho tipico de
-// biblioteca pessoal; numa biblioteca MUITO maior, valeria a pena revisar).
-@Composable
-private fun <T> BentoGrid(
-    items: List<T>,
-    isFavorite: (T) -> Boolean,
-    modifier: Modifier = Modifier,
-    columns: Int = 3,
-    gap: Dp = 12.dp,
-    itemContent: @Composable (T) -> Unit,
-) {
-    val bigFlags = items.map(isFavorite)
-    val placements = remember(items, bigFlags) { packBentoGrid(bigFlags, columns) }
-    val rowCount = placements.maxOfOrNull { it.row + it.span } ?: 0
-
-    SubcomposeLayout(modifier = modifier.fillMaxWidth()) { constraints ->
-        val gapPx = gap.roundToPx()
-        val totalWidth = constraints.maxWidth
-        val cellWidth = (totalWidth - gapPx * (columns - 1)) / columns
-
-        // Card tipico nao e quadrado (capa 1:1 + linhas de texto embaixo) - pra saber a altura
-        // de 1 celula sem cravar um numero de dp fixo (que quebraria com fonte do sistema
-        // maior), mede um card de amostra a parte pela subcomposicao "probe", nao colocado na
-        // tela. Compose so deixa medir cada Measurable uma vez, entao a grade de verdade abaixo
-        // usa uma subcomposicao separada da sonda.
-        val cellHeight = items.firstOrNull()?.let { sampleItem ->
-            subcompose("bento-probe") {
-                itemContent(sampleItem)
-            }.first().measure(Constraints(minWidth = cellWidth, maxWidth = cellWidth)).height
-        } ?: cellWidth
-
-        val placedChildren = subcompose("bento-grid") {
-            items.forEach { item -> itemContent(item) }
-        }.mapIndexed { index, measurable ->
-            val placement = placements[index]
-            val width = (cellWidth * placement.span + gapPx * (placement.span - 1)).coerceAtLeast(0)
-            val height = (cellHeight * placement.span + gapPx * (placement.span - 1)).coerceAtLeast(0)
-            measurable.measure(Constraints.fixed(width, height)) to placement
-        }
-
-        val totalHeight = if (rowCount == 0) 0 else cellHeight * rowCount + gapPx * (rowCount - 1)
-
-        layout(totalWidth, totalHeight) {
-            placedChildren.forEach { (placeable, placement) ->
-                val x: Int = placement.col * (cellWidth + gapPx)
-                val y: Int = placement.row * (cellHeight + gapPx)
-                placeable.place(x = x, y = y)
-            }
         }
     }
 }
@@ -5060,28 +5171,23 @@ private fun AlbumsScreen(
     albums: List<LocalAlbum>,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onLongPressAlbum: (LocalAlbum) -> Unit = {},
-    favoriteAlbumKeys: Set<String> = emptySet(),
-    scrollState: ScrollState = rememberScrollState(),
+    scrollState: LazyGridState = rememberLazyGridState(),
 ) {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
-    // Mesmo bento de ArtistsScreen (ver BentoGrid) - pedido do usuario (04/09/2026): favoritar
-    // um album tambem deve dar capa maior, igual ja acontecia so pra artista.
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState, flingBehavior = rememberSoftFlingBehavior())
-            .padding(
-                horizontal = if (isLandscape) 14.dp else 18.dp,
-                vertical = if (isLandscape) 8.dp else 12.dp,
-            ),
+    val columns = if (isLandscape) 4 else 3
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(columns),
+        state = scrollState,
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(
+            horizontal = if (isLandscape) 14.dp else 18.dp,
+            vertical = if (isLandscape) 8.dp else 12.dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 14.dp else 18.dp),
     ) {
-        BentoGrid(
-            items = albums,
-            isFavorite = { !isLandscape && it.key in favoriteAlbumKeys },
-            columns = if (isLandscape) 4 else 3,
-            gap = if (isLandscape) 10.dp else 12.dp,
-        ) { album ->
+        gridItems(albums, key = { it.key }) { album ->
             AlbumGridCard(
                 album = album,
                 onClick = { onOpenAlbum(album) },
