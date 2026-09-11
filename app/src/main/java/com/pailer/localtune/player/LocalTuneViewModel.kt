@@ -131,6 +131,14 @@ data class PlayerUiState(
     val queueSize: Int = 0,
 )
 
+// Retorno de LocalTuneViewModel.dislikeCurrentRadioSong() - so preenchido quando a faixa
+// tocando foi mesmo trocada por outra do album (null quando pulou pra proxima da fila por
+// falta de substituto). A UI (LocalTuneApp.kt) usa isso pra corrigir a MESMA posicao no
+// snapshot local `radioSession` ("Sequencia ao vivo") - controller.replaceMediaItem so muda a
+// fila de verdade do ExoPlayer, radioSession e um estado de UI separado que nao sabe da troca
+// sozinho.
+data class RadioDislikeResult(val index: Int, val replacement: LocalSong)
+
 // Letra da musica tocando, exibida na tela do player (arrasta pro lado: capa <-> letra). Ver
 // LyricsRepository - offline primeiro (tag embutida / letra colada), busca online (LRCLIB) so
 // sob demanda. Carregada pela UI via LaunchedEffect(player.songId), nunca do polling/init (ADR-020).
@@ -1252,6 +1260,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             .apply()
     }
 
+    // --- Faixas "deslike" na radio (tela de Configuracoes, ver dislikeCurrentRadioSong) ---
+
+    fun radioDislikedSongs(): List<LocalSong> {
+        val ids = repository.radioDislikedSongIds()
+        return libraryState.value.songs.filter { it.id in ids }
+    }
+
+    fun undislikeSongForRadio(song: LocalSong) {
+        repository.undislikeSongForRadio(song.id)
+        rebuildLibraryContent()
+    }
+
     // --- Letra da musica (tela do player) ---
 
     // Chamado pela UI num LaunchedEffect(player.songId) quando o player cheio esta aberto e NAO
@@ -2235,6 +2255,43 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.volume = target
         announcementPlayer?.setVolume(target, target)
         controller?.let { updatePlayerState(it) }
+    }
+
+    // Botao de deslike do mini player em modo radio (pedido do usuario 11/09/2026): faixas que
+    // caem na radio mas nao sao musica de verdade pra aquele contexto (intro, outro, faixa de
+    // transicao) - deslike na faixa TOCANDO AGORA faz duas coisas: troca ela na hora por outra
+    // faixa do MESMO album (LocalSong.albumId), e marca o id em
+    // MusicLibraryRepository.dislikeSongForRadio pra nunca mais ser escolhida no shuffle de
+    // nenhuma radio (ver filtro em radioSessionFrom). So o resto do album continua tocando
+    // normal - diferente de ocultar artista/album inteiro.
+    fun dislikeCurrentRadioSong(): RadioDislikeResult? {
+        if (activeRadioName.isBlank()) return null
+        val player = controller ?: return null
+        val songId = playerState.value.songId ?: return null
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return null
+        repository.dislikeSongForRadio(songId)
+        val disliked = repository.radioDislikedSongIds()
+        // Prefere uma faixa do album que ainda nao esta na fila ao vivo (evita repetir a mesma
+        // faixa 2x na mesma sessao) - se todas as opcoes ja estiverem na fila, tanto faz, usa
+        // qualquer uma mesmo (melhor repetir que nao trocar).
+        val queuedIds = (0 until player.mediaItemCount).mapNotNull {
+            player.getMediaItemAt(it).mediaId.toLongOrNull()
+        }.toSet()
+        val albumSongs = libraryState.value.songs.filter { it.albumId == song.albumId && it.id !in disliked }
+        val replacement = albumSongs.filterNot { it.id in queuedIds }.ifEmpty { albumSongs }.randomOrNull()
+        val index = player.currentMediaItemIndex
+        val result = if (replacement != null) {
+            player.replaceMediaItem(index, replacement.toMediaItem(activeRadioName))
+            RadioDislikeResult(index, replacement)
+        } else {
+            // Nenhuma outra faixa sobrou nesse album (so tinha essa, ou as outras ja estavam
+            // deslikadas) - pula pra proxima da fila em vez de deixar a faixa deslikada tocando.
+            player.seekToNextMediaItem()
+            null
+        }
+        updatePlayerState(player)
+        showToast("Faixa removida da radio - nao vai mais tocar aqui.")
+        return result
     }
 
     // "Sair da radio" - ao contrario de so fechar a tela (que deixa a radio tocando em

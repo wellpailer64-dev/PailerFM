@@ -340,6 +340,30 @@ class MusicLibraryRepository(private val context: Context) {
         metadataPrefs.edit().remove(KEY_HIDDEN_ALBUMS).apply()
     }
 
+    // --- Faixas "deslike" na radio (pedido do usuario 11/09/2026): faixas que caem numa radio
+    // mas nao sao musica de verdade pra aquele contexto (intro, outro, faixa de transicao).
+    // Deslike na faixa tocando agora (ver LocalTuneViewModel.dislikeCurrentRadioSong) troca ela
+    // na hora por outra do mesmo album e marca o id aqui pra radioSessionFrom() nunca mais
+    // escolher essa faixa no shuffle de NENHUMA radio - mesmo padrao de hiddenArtistKeys/
+    // hiddenAlbumKeys acima (metadataPrefs, entra no backup de graca). Diferente de ocultar
+    // album/artista inteiro: aqui e so a faixa especifica (ex.: uma unica faixa de intro no
+    // meio de um album bom), o resto do album continua tocando normal.
+    fun radioDislikedSongIds(): Set<Long> =
+        metadataPrefs.getStringSet(KEY_RADIO_DISLIKED_SONGS, emptySet())
+            ?.mapNotNull { it.toLongOrNull() }?.toSet() ?: emptySet()
+
+    fun dislikeSongForRadio(songId: Long) {
+        metadataPrefs.edit()
+            .putStringSet(KEY_RADIO_DISLIKED_SONGS, (radioDislikedSongIds() + songId).map { it.toString() }.toSet())
+            .apply()
+    }
+
+    fun undislikeSongForRadio(songId: Long) {
+        metadataPrefs.edit()
+            .putStringSet(KEY_RADIO_DISLIKED_SONGS, (radioDislikedSongIds() - songId).map { it.toString() }.toSet())
+            .apply()
+    }
+
     // --- Radios personalizadas (a partir de album/artista) ---
     // Persistidas em metadataPrefs (mesmo SharedPreferences de overrides/sessao) como um unico
     // JSON array - lista pequena, nao precisa de schema versionado como os overrides.
@@ -537,7 +561,19 @@ class MusicLibraryRepository(private val context: Context) {
     // com o minimo padrao pra nao poluir a aba de radios de verdade.
     fun allGenreRadios(songs: List<LocalSong>): List<LocalRadio> = dynamicGenreRadios(songs, minSize = 1)
 
-    fun radioSessionFrom(radio: LocalRadio): List<LocalSong> {
+    fun radioSessionFrom(radioParam: LocalRadio): List<LocalSong> {
+        // Faixas deslikadas (ver dislikeSongForRadio) nunca entram em NENHUMA sessao de radio -
+        // filtra aqui, no unico ponto de entrada, antes de qualquer um dos fluxos abaixo (album
+        // unico/artista unico/generico) escolher songs. Se filtrar tudo (album so tinha faixas
+        // deslikadas) cai pra lista original sem filtro - radio tocar algo indesejado uma vez e
+        // melhor que radio nao tocar nada.
+        val disliked = radioDislikedSongIds()
+        val radio = if (disliked.isEmpty()) {
+            radioParam
+        } else {
+            radioParam.songs.filterNot { it.id in disliked }
+                .let { filtered -> if (filtered.isEmpty()) radioParam else radioParam.copy(songs = filtered) }
+        }
         // Radio personalizada de album/artista unico e uma lista fechada de poucos artistas de
         // proposito - o algoritmo de diversidade abaixo foi feito pra pools com muitos artistas
         // e cortaria uma radio de artista/album unico pra so 5 faixas (radioArtistLimit pra
@@ -1608,6 +1644,7 @@ class MusicLibraryRepository(private val context: Context) {
         const val KEY_HIDDEN_RADIOS = "hidden_radio_keys"
         const val KEY_HIDDEN_ARTISTS = "hidden_artist_keys"
         const val KEY_HIDDEN_ALBUMS = "hidden_album_keys"
+        const val KEY_RADIO_DISLIKED_SONGS = "radio_disliked_song_ids"
         const val ARTWORK_CANDIDATE_LIMIT = 10
         const val METADATA_SCHEMA_VERSION = 2
         const val RADIO_LIMIT = 30

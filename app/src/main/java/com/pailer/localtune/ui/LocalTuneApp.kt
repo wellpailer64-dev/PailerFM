@@ -116,6 +116,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Refresh
@@ -129,6 +130,8 @@ import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.ThumbDown
+import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VolumeOff
@@ -288,6 +291,7 @@ private enum class SettingsPage {
     GeminiApiKeys,
     AlbumArtwork,
     Backup,
+    RadioDislikedSongs,
 }
 
 // Fling mais suave/macio pra rolagem do app inteiro (pedido do usuario 04/09/2026) - o default
@@ -619,6 +623,21 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             onNext = viewModel::skipNext,
                             onToggleMute = viewModel::toggleRadioMute,
                             onExitRadio = viewModel::stopRadio,
+                            onDislike = {
+                                // dislikeCurrentRadioSong() so troca a fila de verdade do
+                                // ExoPlayer (controller.replaceMediaItem) - radioSession e um
+                                // snapshot separado de UI (ver RadioDetailScreen/sessionSongs,
+                                // "Sequencia ao vivo") que precisa ser corrigido manualmente na
+                                // MESMA posicao, senao a faixa antiga continuava aparecendo la
+                                // mesmo com o player ja tocando a substituta (achado ao vivo
+                                // 11/09/2026).
+                                viewModel.dislikeCurrentRadioSong()?.let { result ->
+                                    if (result.index in radioSession.indices) {
+                                        radioSession = radioSession.toMutableList()
+                                            .apply { this[result.index] = result.replacement }
+                                    }
+                                }
+                            },
                         )
                     }
                     NavigationBar(
@@ -981,6 +1000,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onRestoreHiddenRadios = viewModel::restoreHiddenRadios,
             hasHiddenLibraryItems = viewModel.hasHiddenArtistsOrAlbums(),
             onRestoreHiddenLibraryItems = viewModel::restoreHiddenArtistsAndAlbums,
+            radioDislikedSongs = viewModel.radioDislikedSongs(),
+            onUndislikeSong = viewModel::undislikeSongForRadio,
             backup = viewModel.backupState.value,
             onChooseBackupDestination = { backupCreateLauncher.launch("pailer_fm_backup.json") },
             onBackupNow = viewModel::performBackupNow,
@@ -1328,6 +1349,8 @@ private fun SettingsDrawer(
     appFolder: AppFolderUiState = AppFolderUiState(),
     onChooseAppFolder: () -> Unit = {},
     onClearAppFolder: () -> Unit = {},
+    radioDislikedSongs: List<LocalSong> = emptyList(),
+    onUndislikeSong: (LocalSong) -> Unit = {},
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -1390,6 +1413,8 @@ private fun SettingsDrawer(
                             onRestoreHiddenRadios = onRestoreHiddenRadios,
                             hasHiddenLibraryItems = hasHiddenLibraryItems,
                             onRestoreHiddenLibraryItems = onRestoreHiddenLibraryItems,
+                            hasRadioDislikedSongs = radioDislikedSongs.isNotEmpty(),
+                            onOpenRadioDislikedSongs = { onPageChange(SettingsPage.RadioDislikedSongs) },
                         )
                         SettingsPage.Metadata -> MetadataSettingsPanel(
                             metadata = metadata,
@@ -1466,6 +1491,11 @@ private fun SettingsDrawer(
                             onChooseAppFolder = onChooseAppFolder,
                             onClearAppFolder = onClearAppFolder,
                         )
+                        SettingsPage.RadioDislikedSongs -> RadioDislikedSongsSettingsPanel(
+                            songs = radioDislikedSongs,
+                            onBack = { onPageChange(SettingsPage.Main) },
+                            onUndislike = onUndislikeSong,
+                        )
                     }
                 }
             }
@@ -1490,6 +1520,8 @@ private fun SettingsMainPanel(
     onRestoreHiddenRadios: () -> Unit = {},
     hasHiddenLibraryItems: Boolean = false,
     onRestoreHiddenLibraryItems: () -> Unit = {},
+    hasRadioDislikedSongs: Boolean = false,
+    onOpenRadioDislikedSongs: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -1591,6 +1623,15 @@ private fun SettingsMainPanel(
                 subtitle = "Traz de volta o que voce ocultou (nao apaga nada do aparelho)",
                 icon = Icons.Filled.VisibilityOff,
                 onClick = onRestoreHiddenLibraryItems,
+            )
+        }
+        if (hasRadioDislikedSongs) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            SettingsActionRow(
+                title = "Faixas deslikadas na radio",
+                subtitle = "Faixas banidas do shuffle da radio pelo botao de deslike",
+                icon = Icons.Filled.ThumbDown,
+                onClick = onOpenRadioDislikedSongs,
             )
         }
     }
@@ -3011,6 +3052,88 @@ private fun TagWriterSettingsPanel(
             } else {
                 items(metadata.pendingTagChanges, key = { it.id }) { change ->
                     PendingTagChangeRow(change = change)
+                }
+            }
+        }
+    }
+}
+
+// Faixas marcadas como "deslike" na radio (pedido do usuario 11/09/2026, ver
+// LocalTuneViewModel.dislikeCurrentRadioSong/radioDislikedSongs) - lista o que esta banido do
+// shuffle de qualquer radio hoje, com botao por faixa pra desfazer (volta a poder ser
+// escolhida).
+@Composable
+private fun RadioDislikedSongsSettingsPanel(
+    songs: List<LocalSong>,
+    onBack: () -> Unit,
+    onUndislike: (LocalSong) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(horizontal = 18.dp, vertical = 22.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text(
+                "Faixas deslikadas na rádio",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Text(
+            "Nunca mais escolhidas no shuffle de nenhuma rádio - o resto do álbum continua tocando normal.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(Modifier.height(16.dp))
+        if (songs.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "Nenhuma faixa deslikada ainda.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                flingBehavior = rememberSoftFlingBehavior(),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                contentPadding = PaddingValues(bottom = 24.dp),
+            ) {
+                items(songs, key = { it.id }) { song ->
+                    RowItem(
+                        title = song.title,
+                        subtitle = "${song.artist} • ${song.album}",
+                        icon = {
+                            ArtworkBox(
+                                uri = song.artworkUri,
+                                embeddedSourceUri = song.contentUri,
+                                modifier = Modifier.size(52.dp),
+                            )
+                        },
+                        onClick = {},
+                        trailing = {
+                            IconButton(onClick = { onUndislike(song) }) {
+                                Icon(
+                                    Icons.Filled.ThumbUp,
+                                    contentDescription = "Desfazer deslike",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        },
+                    )
                 }
             }
         }
@@ -6941,6 +7064,7 @@ private fun MiniPlayer(
     onNext: () -> Unit,
     onToggleMute: () -> Unit,
     onExitRadio: () -> Unit,
+    onDislike: () -> Unit,
 ) {
     val isRadio = player.activeRadioName.isNotBlank()
     Surface(color = PailerSurface.copy(alpha = 0.94f)) {
@@ -6981,6 +7105,19 @@ private fun MiniPlayer(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+            // So em modo radio (pedido do usuario 11/09/2026): faixa que caiu na radio mas nao e
+            // musica de verdade pra ali (intro/outro/transicao) - troca na hora por outra do
+            // mesmo album e nunca mais entra no shuffle de nenhuma radio (ver
+            // dislikeCurrentRadioSong). Fica a esquerda do coracaozinho.
+            if (isRadio) {
+                IconButton(onClick = onDislike, enabled = player.songId != null) {
+                    Icon(
+                        Icons.Filled.ThumbDown,
+                        contentDescription = "Nao curti essa faixa na radio",
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+            }
             IconButton(onClick = onToggleFavorite, enabled = player.songId != null) {
                 Icon(
                     if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
@@ -6988,9 +7125,9 @@ private fun MiniPlayer(
                     tint = if (isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
                 )
             }
-            // Modo radio (pedido do usuario 11/09/2026): nao tem anterior/proxima (fila ao vivo
-            // nao suporta pular livremente, ver ADR) e o play/pause vira mute (a radio "ao vivo"
-            // continua avancando, so silencia - ver toggleRadioMute) + um botao pra sair de vez.
+            // Modo radio: nao tem anterior/proxima (fila ao vivo nao suporta pular livremente,
+            // ver ADR) e o play/pause vira mute (a radio "ao vivo" continua avancando, so
+            // silencia - ver toggleRadioMute) + um botao pra sair de vez (power off).
             if (isRadio) {
                 IconButton(onClick = onToggleMute) {
                     Icon(
@@ -7001,7 +7138,7 @@ private fun MiniPlayer(
                 }
                 IconButton(onClick = onExitRadio) {
                     Icon(
-                        Icons.Filled.Close,
+                        Icons.Filled.PowerSettingsNew,
                         contentDescription = "Sair da radio",
                         tint = MaterialTheme.colorScheme.onBackground,
                     )
