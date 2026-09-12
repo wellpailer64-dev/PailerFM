@@ -4173,10 +4173,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // assincrona, atraves do SDK do Cast).
     private fun onCastSessionActive(session: CastSession) {
         val remoteMediaClient = session.remoteMediaClient ?: return
-        startRemoteSession(CastPlaybackBridge(remoteMediaClient))
-        remoteDeviceState.value = remoteDeviceState.value.copy(
-            connectedLabel = session.castDevice?.friendlyName ?: "TV",
-        )
+        if (startRemoteSession(CastPlaybackBridge(remoteMediaClient))) {
+            remoteDeviceState.value = remoteDeviceState.value.copy(
+                connectedLabel = session.castDevice?.friendlyName ?: "TV",
+            )
+        } else {
+            runCatching { CastContext.getSharedInstance(getApplication()).sessionManager.endCurrentSession(true) }
+        }
     }
 
     // Sessao de Cast terminou (usuario desconectou ou a TV caiu). So encerra a sessao remota se
@@ -4235,8 +4238,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         CastContext.getSharedInstance(getApplication()).sessionManager.endCurrentSession(true)
                     }
                 }
-                startRemoteSession(DlnaPlaybackBridge(entry.device.controlUrl))
-                remoteDeviceState.value = remoteDeviceState.value.copy(connectedLabel = entry.device.friendlyName)
+                Log.d(TAG_REMOTE_PLAYBACK, "Conectando DLNA em ${entry.device.friendlyName} -> ${entry.device.controlUrl}")
+                if (startRemoteSession(DlnaPlaybackBridge(entry.device.controlUrl))) {
+                    remoteDeviceState.value = remoteDeviceState.value.copy(connectedLabel = entry.device.friendlyName)
+                }
             }
         }
     }
@@ -4255,20 +4260,28 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // de verdade, so mudo - ver comentario de remoteHttpServer acima) e sobe o servidor HTTP local
     // que serve os arquivos de musica (content:// do MediaStore) pra TV alcancar via rede Wi-Fi.
     // Sempre encerra qualquer sessao remota anterior primeiro (Cast OU DLNA) - so uma de cada vez.
-    private fun startRemoteSession(bridge: RemotePlaybackBridge) {
+    private fun startRemoteSession(bridge: RemotePlaybackBridge): Boolean {
         endRemoteSession()
         val context = getApplication<Application>()
+        val player = controller
+        val mediaItem = player?.currentMediaItem
+        val songUri = mediaItem?.localConfiguration?.uri
+        if (player == null || mediaItem == null || songUri == null) {
+            showToast("Escolha uma musica antes de transmitir pra TV.")
+            bridge.release()
+            return false
+        }
         val wifiAddress = LocalWifiAddress.find(context)
         if (wifiAddress == null) {
             showToast("Conecte o celular numa rede Wi-Fi pra transmitir pra TV.")
             bridge.release()
-            return
+            return false
         }
         val server = CastMediaHttpServer(context, java.util.UUID.randomUUID().toString())
         if (!runCatching { server.start() }.isSuccess) {
             showToast("Nao consegui iniciar o servidor local pra transmitir pra TV.")
             bridge.release()
-            return
+            return false
         }
         remoteHttpServer = server
         remoteHttpBaseUrl = "http://${wifiAddress.hostAddress}:${server.listeningPort}"
@@ -4276,7 +4289,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         remoteMirroredMediaId = null
         remoteMirroredIsPlaying = null
         controller?.volume = 0f
-        controller?.let { mirrorToRemoteIfNeeded(it) }
+        Log.d(TAG_REMOTE_PLAYBACK, "Sessao remota pronta em $remoteHttpBaseUrl")
+        mirrorToRemoteIfNeeded(player)
+        return true
     }
 
     // Sessao remota terminou (Cast desconectou ou DLNA foi desconectado pelo usuario) - desliga o
@@ -4308,11 +4323,22 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val songUri = mediaItem?.localConfiguration?.uri
             if (mediaItem != null && songUri != null) {
                 val token = server.registerSong(songUri)
+                val remoteUrl = "$baseUrl${server.pathFor(token)}"
+                val artworkUrl = mediaItem.mediaMetadata.artworkUri?.let { artworkUri ->
+                    val artworkToken = server.registerArtwork(artworkUri)
+                    "$baseUrl${server.artworkPathFor(artworkToken)}"
+                }
+                Log.d(
+                    TAG_REMOTE_PLAYBACK,
+                    "Espelhando midia para remoto: mediaId=$mediaId url=$remoteUrl artwork=$artworkUrl isPlaying=${player.isPlaying}",
+                )
                 bridge.playUrl(
-                    url = "$baseUrl${server.pathFor(token)}",
+                    url = remoteUrl,
                     mimeType = getApplication<Application>().contentResolver.getType(songUri) ?: "audio/*",
                     title = mediaItem.mediaMetadata.title?.toString().orEmpty(),
                     artist = mediaItem.mediaMetadata.artist?.toString().orEmpty(),
+                    album = mediaItem.mediaMetadata.albumTitle?.toString().orEmpty(),
+                    artworkUrl = artworkUrl,
                     startPositionMs = player.currentPosition.coerceAtLeast(0L),
                     autoplay = player.isPlaying,
                 )
@@ -4322,6 +4348,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
         if (player.isPlaying != remoteMirroredIsPlaying) {
             remoteMirroredIsPlaying = player.isPlaying
+            Log.d(TAG_REMOTE_PLAYBACK, "Espelhando estado remoto: isPlaying=${player.isPlaying}")
             if (player.isPlaying) bridge.resume() else bridge.pause()
         }
     }
@@ -4566,6 +4593,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val GEMINI_TTS_TEST_TIMEOUT_MS = 960_000L
         const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
+        const val TAG_REMOTE_PLAYBACK = "PailerRemote"
         const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
 
         // Chave = nome da radio normalizado (lowercase, so letras/digitos) — ver

@@ -31,10 +31,14 @@ object SsdpDiscovery {
     private const val TAG = "PailerDlna"
     private const val MULTICAST_ADDRESS = "239.255.255.250"
     private const val MULTICAST_PORT = 1900
-    // "ssdp:all" (nao um ST especifico de AVTransport) porque nem todo dispositivo responde a
-    // buscas por tipo de servico especifico (varias TVs so respondem a ssdp:all/rootdevice) -
-    // filtra por AVTransport depois, na descricao do dispositivo (fetchDeviceDescription).
-    private const val SEARCH_TARGET = "ssdp:all"
+    // Alvos especificos primeiro reduzem ruido e fazem algumas TVs LG/webOS responderem de forma
+    // mais confiavel; ssdp:all/rootdevice ficam como fallback para renderizadores menos estritos.
+    private val SEARCH_TARGETS = listOf(
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "upnp:rootdevice",
+        "ssdp:all",
+    )
 
     suspend fun discover(context: Context, timeoutMs: Long = 6000L): List<DlnaDevice> = withContext(Dispatchers.IO) {
         val locations = linkedSetOf<String>()
@@ -42,26 +46,28 @@ object SsdpDiscovery {
         val multicastLock = wifiManager?.createMulticastLock("PailerFmSsdp")?.apply { setReferenceCounted(true) }
         // Sem vincular o socket a rede Wi-Fi explicitamente, o Android pode rotear o pacote pela
         // rede de dados moveis mesmo com o Wi-Fi conectado (celular com as duas ativas ao mesmo
-        // tempo) - o M-SEARCH nunca chega na LAN. E sem ENTRAR no grupo multicast (nao basta so
-        // mandar pra ele) o socket nao recebe respostas que a TV manda de volta via multicast em
-        // vez de unicast (alguns fabricantes fogem do padrao) - foi exatamente essa a causa
-        // encontrada ao testar em 12/09/2026: nenhuma excecao, nenhuma resposta, nos dois casos.
+        // tempo) - o M-SEARCH nunca chega na LAN.
         val wifiNetwork = LocalWifiAddress.findWifiNetwork(context)
         val wifiInterface = LocalWifiAddress.findWifiNetworkInterface(context)
-        if (wifiNetwork == null || wifiInterface == null) {
+        val wifiAddress = LocalWifiAddress.find(context)
+        if (wifiNetwork == null || wifiInterface == null || wifiAddress == null) {
             Log.w(TAG, "Sem rede Wi-Fi ativa - desistindo da busca SSDP")
             return@withContext emptyList()
         }
         runCatching { multicastLock?.acquire() }
         val group = InetAddress.getByName(MULTICAST_ADDRESS)
-        val groupSocketAddress = InetSocketAddress(group, MULTICAST_PORT)
         try {
             val socket = runCatching {
-                MulticastSocket(MULTICAST_PORT).apply {
+                // Controle SSDP normalmente envia M-SEARCH a partir de uma porta temporaria e
+                // recebe respostas unicast nessa mesma porta. Algumas LG webOS ignoram buscas
+                // vindas da porta 1900 (que e a porta multicast de anuncio), entao nao usamos
+                // MulticastSocket(1900) aqui.
+                MulticastSocket(null).apply {
                     reuseAddress = true
                     wifiNetwork.bindSocket(this)
+                    bind(InetSocketAddress(wifiAddress, 0))
                     networkInterface = wifiInterface
-                    joinGroup(groupSocketAddress, wifiInterface)
+                    timeToLive = 2
                 }
             }.getOrNull()
             if (socket == null) {
@@ -69,12 +75,13 @@ object SsdpDiscovery {
                 return@withContext emptyList()
             }
             socket.use {
-                val request = buildSearchRequest()
-                val requestBytes = request.toByteArray(Charsets.UTF_8)
                 fun sendSearch() {
-                    runCatching {
-                        socket.send(DatagramPacket(requestBytes, requestBytes.size, group, MULTICAST_PORT))
-                    }.onFailure { Log.w(TAG, "Falha ao enviar M-SEARCH", it) }
+                    SEARCH_TARGETS.forEach { searchTarget ->
+                        val requestBytes = buildSearchRequest(searchTarget).toByteArray(Charsets.UTF_8)
+                        runCatching {
+                            socket.send(DatagramPacket(requestBytes, requestBytes.size, group, MULTICAST_PORT))
+                        }.onFailure { Log.w(TAG, "Falha ao enviar M-SEARCH para $searchTarget", it) }
+                    }
                 }
                 sendSearch()
                 val deadline = System.currentTimeMillis() + timeoutMs
@@ -114,7 +121,6 @@ object SsdpDiscovery {
                     // que o timeoutMs pretendido pra busca inteira.
                     locations += location
                 }
-                runCatching { socket.leaveGroup(groupSocketAddress, wifiInterface) }
             }
         } finally {
             runCatching { multicastLock?.release() }
@@ -131,12 +137,13 @@ object SsdpDiscovery {
         }
     }
 
-    private fun buildSearchRequest(): String =
+    private fun buildSearchRequest(searchTarget: String): String =
         "M-SEARCH * HTTP/1.1\r\n" +
             "HOST: $MULTICAST_ADDRESS:$MULTICAST_PORT\r\n" +
             "MAN: \"ssdp:discover\"\r\n" +
             "MX: 2\r\n" +
-            "ST: $SEARCH_TARGET\r\n" +
+            "ST: $searchTarget\r\n" +
+            "USER-AGENT: Android UPnP/1.1 PailerFM/1.0\r\n" +
             "\r\n"
 
     private fun parseHeader(response: String, name: String): String? =

@@ -1356,34 +1356,47 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
      que já falava HTTPS com APIs externas). Isso NÃO afeta o servidor HTTP local em si
      (ele é o lado que RECEBE conexões — a restrição é só sobre chamadas HTTP feitas
      pelo próprio app).
-- **Descoberta SSDP (`dlna/SsdpDiscovery.kt`):** `MulticastSocket` na porta 1900,
-  vinculado à rede Wi-Fi e à interface de rede Wi-Fi (`joinGroup(SocketAddress,
-  NetworkInterface)`, não só `send()` pro grupo — sem entrar de verdade no grupo
-  multicast, respostas que o dispositivo manda via multicast em vez de unicast nunca
-  chegam). Busca por `ST: ssdp:all` (não um tipo de serviço específico) porque nem todo
-  dispositivo responde a buscas por serviço específico — filtra por AVTransport depois,
-  lendo a descrição XML de cada dispositivo. M-SEARCH é reenviado a cada ~1.2s durante
-  uma janela de 6s (UDP não garante entrega). A busca do XML de descrição de cada
-  dispositivo (`fetchDeviceDescription`, com `HttpURLConnection` + timeout de 2s
-  explícito) acontece **depois** do loop de recebimento, nunca durante — uma primeira
-  versão sem esse timeout travava o recebimento de pacotes seguintes por muito mais que
-  o tempo pretendido quando um dispositivo respondia com uma `LOCATION` lenta/
-  inalcançável (aconteceu com o roteador da casa, que respondeu com um endereço IPv6 que
-  o celular não roteava de verdade).
+- **Descoberta SSDP (`dlna/SsdpDiscovery.kt`):** `MulticastSocket` vinculado à rede
+  Wi-Fi e à interface de rede Wi-Fi, mas com porta local temporária, não a porta 1900.
+  A porta 1900 é a porta multicast de anúncio SSDP; controle SSDP normalmente envia
+  `M-SEARCH` de uma porta efêmera e recebe respostas unicast nessa mesma porta. Em
+  12/09/2026, teste direto na LAN achou a TV LG webOS (`192.168.0.42`,
+  `[LG] webOS TV UP7550PSF`) quando a busca saiu por uma porta temporária, inclusive
+  com `ST: urn:schemas-upnp-org:service:AVTransport:1`; a versão anterior do app usava
+  `MulticastSocket(1900)` e a TV específica não aparecia. A busca envia alvos
+  específicos (`AVTransport`/`MediaRenderer`) primeiro, depois `upnp:rootdevice` e
+  `ssdp:all` como fallback, sempre filtrando por AVTransport depois, lendo a descrição
+  XML de cada dispositivo. M-SEARCH é reenviado a cada ~1.2s durante uma janela de 6s
+  (UDP não garante entrega). A busca do XML de descrição de cada dispositivo
+  (`fetchDeviceDescription`, com `HttpURLConnection` + timeout de 2s explícito)
+  acontece **depois** do loop de recebimento, nunca durante — uma primeira versão sem
+  esse timeout travava o recebimento de pacotes seguintes por muito mais que o tempo
+  pretendido quando um dispositivo respondia com uma `LOCATION` lenta/inalcançável
+  (aconteceu com o roteador da casa, que respondeu com um endereço IPv6 que o celular
+  não roteava de verdade).
 - **UI unificada (`HeaderCastButton`/`RemoteDeviceSheet` em `LocalTuneApp.kt`):** um único
   ícone (pedido explícito do usuário — "um só ícone, as duas funções lá dentro") abre
   uma bottom sheet que lista rotas Cast (via `androidx.mediarouter.media.MediaRouter`
   direto, não o `MediaRouteButton` padrão — que só mostra Cast, não dá pra combinar com
   DLNA) e dispositivos DLNA (SSDP) juntos. `MediaRouter.selectRoute()` numa rota Cast
   dispara a sessão normalmente, capturada pelo `SessionManagerListener` já existente.
-- **Limitação conhecida, não resolvida:** mesmo com os 3 bugs de rede acima corrigidos
-  (confirmados via `adb logcat` no aparelho: descoberta achou e conectou no PC do usuário
-  via UPnP, e o seletor de Cast abre e busca normalmente), a **TV LG webOS específica do
-  usuário nunca respondeu** à nossa busca SSDP em nenhum teste, embora o app Symfonik
-  ache essa mesma TV sem nenhuma configuração extra nela. Causa raiz não identificada -
-  provavelmente exigiria uma captura de pacotes de verdade (Wireshark na mesma rede) pra
-  diagnosticar com certeza. Decisão do usuário (12/09/2026): aceitar como limitação
-  conhecida por ora em vez de continuar investigando às cegas.
+- **Diagnóstico da LG webOS:** a TV foi localizada na LAN via SSDP fora do app em
+  12/09/2026: `LOCATION: http://192.168.0.42:1149/`, `SERVER: Linux/i686 UPnP/1,0
+  DLNADOC/1.50 LGE WebOS TV/Version 0.9`, com `MediaRenderer`, `AVTransport` e
+  `RenderingControl`. O XML de descrição expôs o `controlURL`
+  `/AVTransport/a9628769-d594-a83d-011a-4c761f3d1d1b/control.xml`, que encaixa no
+  parser atual. Se voltar a falhar no aparelho, o próximo diagnóstico deve comparar
+  no `adb logcat` se as respostas de `192.168.0.42` chegam ao app; não partir da
+  premissa de que a TV não responde SSDP.
+- **Reprodução na LG webOS:** no mesmo teste real, a TV recusou a primeira tentativa
+  de `SetAVTransportURI` com `701 Transition not available` quando o app tentava
+  carregar a faixa sem parar o renderizador antes. A sequência que funcionou foi:
+  `Stop`, `SetAVTransportURI`, depois `Play`; `Seek` antes do `Play` falhou com
+  `711 Illegal Seek Target`, então DLNA começa a faixa do início por enquanto. A TV
+  também espera conseguir buscar capa via HTTP, não `content://`; por isso o servidor
+  local agora registra e serve album art em `/media/{sessao}/artwork/{token}`, e o
+  DIDL-Lite inclui `upnp:album` e `upnp:albumArtURI`. Validação ao vivo: a LG fez
+  `HEAD` no MP3, `GET` no JPEG da capa, `GET` no MP3, e respondeu `Play OK: HTTP 200`.
 - **Não mudar sem:** manter o `controller` local como única fonte de verdade (nunca
   fazer `CastPlaybackBridge`/`DlnaPlaybackBridge` decidir fila/próxima-faixa/rádio por
   conta própria) — é essa escolha que mantém o Cast/DLNA sem risco pro bug do ADR-009.

@@ -4,6 +4,7 @@ import android.util.Log
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata as CastMediaMetadata
+import com.google.android.gms.common.images.WebImage
 import com.google.android.gms.cast.framework.media.RemoteMediaClient
 import com.pailer.localtune.player.RemotePlaybackBridge
 
@@ -25,10 +26,21 @@ class CastPlaybackBridge(private val remoteMediaClient: RemoteMediaClient) : Rem
         remoteMediaClient.registerCallback(callback)
     }
 
-    override fun playUrl(url: String, mimeType: String, title: String, artist: String, startPositionMs: Long, autoplay: Boolean) {
+    override fun playUrl(
+        url: String,
+        mimeType: String,
+        title: String,
+        artist: String,
+        album: String,
+        artworkUrl: String?,
+        startPositionMs: Long,
+        autoplay: Boolean,
+    ) {
         val metadata = CastMediaMetadata(CastMediaMetadata.MEDIA_TYPE_MUSIC_TRACK).apply {
             putString(CastMediaMetadata.KEY_TITLE, title)
             putString(CastMediaMetadata.KEY_ARTIST, artist)
+            putString(CastMediaMetadata.KEY_ALBUM_TITLE, album)
+            artworkUrl?.let { addImage(WebImage(android.net.Uri.parse(it))) }
         }
         val mediaInfo = MediaInfo.Builder(url)
             .setContentUrl(url)
