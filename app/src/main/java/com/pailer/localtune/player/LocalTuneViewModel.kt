@@ -72,6 +72,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.random.Random
@@ -271,6 +273,9 @@ data class RadioBulletinUiState(
 data class RadioBulletinBufferUiState(
     val readyCount: Int = 0,
     val targetCount: Int = 3,
+    val scriptReadyCount: Int = 0,
+    val scriptTargetCount: Int = 0,
+    val scriptRefillThreshold: Int = 0,
     val isPreparing: Boolean = false,
     val isPaused: Boolean = false,
     val statusMessage: String? = null,
@@ -467,6 +472,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // producao nunca corre risco, sem depender de nenhum numero de timeout adivinhado.
     @Volatile
     private var coreSynthesisInFlight = false
+    // Estoque anterior ao audio: roteiros ja escritos pelo Gemini em lote, consumidos em FIFO
+    // por refillBulletinBuffer() para gastar chamadas so na sintese. So usado quando a escrita
+    // em nuvem esta ligada/configurada; redator local continua sempre 1 por vez.
+    private val cloudScriptBuffer = ArrayDeque<RadioScript>()
     // Job da correcao automatica de fallback (ver scheduleFallbackAutoFix/fixFallbackBulletins) -
     // guarda contra agendar mais de uma correcao sobreposta; roda com um pequeno delay pra dar
     // tempo de uma falha transitoria (rede, Gemini fora do ar) se resolver antes de tentar de
@@ -615,7 +624,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         private set
 
     var radioBulletinBufferState = androidx.compose.runtime.mutableStateOf(
-        RadioBulletinBufferUiState(targetCount = BULLETIN_BUFFER_TARGET),
+        RadioBulletinBufferUiState(
+            targetCount = BULLETIN_BUFFER_TARGET,
+            scriptTargetCount = CLOUD_SCRIPT_BUFFER_TARGET,
+            scriptRefillThreshold = CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD,
+        ),
     )
         private set
 
@@ -697,6 +710,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // perceptivel na abertura.
         viewModelScope.launch {
             loadCoreBufferManifest()
+            loadCloudScriptBufferManifest()
             syncBulletinBufferState()
             refillBulletinBuffer()
         }
@@ -808,6 +822,40 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun downloadRadioWriterPackage() {
+        if (radioBulletinState.value.localWriterImporting) return
+        radioBulletinState.value = radioBulletinState.value.copy(
+            localWriterImporting = true,
+            localWriterMessage = "Baixando redator local...",
+        )
+        viewModelScope.launch {
+            runCatching {
+                val packageFile = downloadGoogleDrivePackage(
+                    fileId = RADIO_WRITER_DRIVE_FILE_ID,
+                    fileName = RADIO_WRITER_DOWNLOAD_FILE_NAME,
+                    maxBytes = RADIO_WRITER_DOWNLOAD_MAX_BYTES,
+                )
+                writerPackageRepository.importPackage(packageFile).also {
+                    packageFile.delete()
+                }
+            }.onSuccess {
+                val suffix = if (AppFolderRepository(getApplication()).hasFolder()) {
+                    " Uma copia ficou na pasta oficial."
+                } else {
+                    ""
+                }
+                radioBulletinState.value = loadRadioBulletinUiState().copy(
+                    localWriterMessage = "Redator local baixado e importado.$suffix",
+                )
+                showToast("Redator local pronto.")
+            }.onFailure { error ->
+                val message = error.message ?: "Nao consegui baixar o redator local."
+                radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = message)
+                showToast(message)
+            }
+        }
+    }
+
     fun clearRadioWriterPackage() {
         writerPackageRepository.clearPackage()
         radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = "Redator local removido.")
@@ -833,6 +881,41 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     radioVoiceState.value = loadRadioVoiceUiState().copy(message = message)
                     showToast(message)
                 }
+        }
+    }
+
+    fun downloadRadioVoicePackage() {
+        if (radioVoiceState.value.isImporting) return
+        radioVoiceState.value = radioVoiceState.value.copy(
+            isImporting = true,
+            message = "Baixando pacote de voz...",
+        )
+        viewModelScope.launch {
+            runCatching {
+                val packageFile = downloadGoogleDrivePackage(
+                    fileId = RADIO_VOICE_DRIVE_FILE_ID,
+                    fileName = RADIO_VOICE_DOWNLOAD_FILE_NAME,
+                    maxBytes = RADIO_VOICE_DOWNLOAD_MAX_BYTES,
+                )
+                voicePackageRepository.importPackage(packageFile).also {
+                    packageFile.delete()
+                }
+            }.onSuccess { status ->
+                radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, false).apply()
+                val suffix = if (AppFolderRepository(getApplication()).hasFolder()) {
+                    " Copia salva na pasta oficial."
+                } else {
+                    ""
+                }
+                radioVoiceState.value = status.toUiState(
+                    message = "Pacote baixado e importado.$suffix Voz local fica desligada ate testarmos com seguranca.",
+                )
+                showToast("Pacote de voz pronto.")
+            }.onFailure { error ->
+                val message = error.message ?: "Nao consegui baixar o pacote de voz."
+                radioVoiceState.value = loadRadioVoiceUiState().copy(message = message)
+                showToast(message)
+            }
         }
     }
 
@@ -1062,6 +1145,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     } ?: false
 
     private fun updateRadioBulletinSettings(settings: RadioBulletinSettings) {
+        val previous = radioBulletinState.value.settings
         radioPrefs.edit()
             .putString(KEY_RADIO_BULLETIN_MODE, settings.mode.name)
             .putBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, settings.preferLocalWriter)
@@ -1069,6 +1153,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             .putString(KEY_RADIO_BULLETIN_TTS_PROVIDER, settings.ttsProvider.name)
             .putString(KEY_RADIO_BULLETIN_TTS_MODEL, settings.ttsModel.name)
             .apply()
+        if (
+            previous.mode != settings.mode ||
+            previous.preferLocalWriter != settings.preferLocalWriter ||
+            previous.cloudWriterEnabled != settings.cloudWriterEnabled
+        ) {
+            cloudScriptBuffer.clear()
+            saveCloudScriptBufferManifest()
+            syncBulletinBufferState(statusMessage = null)
+        }
         radioBulletinState.value = loadRadioBulletinUiState()
     }
 
@@ -2142,6 +2235,107 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         showToast(message)
     }
 
+    private suspend fun downloadGoogleDrivePackage(
+        fileId: String,
+        fileName: String,
+        maxBytes: Long,
+    ): File = withContext(Dispatchers.IO) {
+        val destination = getApplication<Application>()
+            .cacheDir
+            .resolve("package_downloads")
+            .resolve(fileName)
+        destination.parentFile?.mkdirs()
+        destination.delete()
+
+        var url = URL("https://drive.google.com/uc?export=download&id=$fileId")
+        val cookies = linkedSetOf<String>()
+        var attempt = 0
+        while (attempt < 5) {
+            attempt++
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 30_000
+                readTimeout = 120_000
+                setRequestProperty("User-Agent", "PailerFM/1.0")
+                if (cookies.isNotEmpty()) {
+                    setRequestProperty("Cookie", cookies.joinToString("; "))
+                }
+            }
+            connection.headerFields["Set-Cookie"]
+                ?.mapNotNull { it.substringBefore(";").takeIf(String::isNotBlank) }
+                ?.let(cookies::addAll)
+
+            val responseCode = connection.responseCode
+            if (responseCode in 300..399) {
+                val location = connection.getHeaderField("Location") ?: error("Download redirecionou sem destino.")
+                url = URL(url, location)
+                connection.disconnect()
+                continue
+            }
+            if (responseCode !in 200..299) {
+                val errorText = connection.errorStream?.bufferedReader()?.use { it.readText().take(160) }.orEmpty()
+                connection.disconnect()
+                error("Download falhou (${responseCode}). $errorText".trim())
+            }
+
+            val contentType = connection.contentType.orEmpty().lowercase(Locale.ROOT)
+            val contentDisposition = connection.getHeaderField("Content-Disposition").orEmpty()
+            if (contentDisposition.isBlank() && contentType.contains("text/html")) {
+                val html = connection.inputStream.bufferedReader().use { it.readText() }
+                connection.disconnect()
+                val confirmedUrl = findGoogleDriveConfirmedDownloadUrl(html, fileId)
+                    ?: error("Google Drive pediu confirmacao e nao liberou o arquivo automaticamente.")
+                url = URL(url, confirmedUrl)
+                continue
+            }
+
+            var copied = 0L
+            connection.inputStream.use { input ->
+                destination.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        copied += read
+                        if (copied > maxBytes) {
+                            destination.delete()
+                            error("Arquivo maior que o esperado.")
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            connection.disconnect()
+            if (copied <= 0L) {
+                destination.delete()
+                error("Download veio vazio.")
+            }
+            return@withContext destination
+        }
+
+        destination.delete()
+        error("Nao consegui iniciar o download pelo Google Drive.")
+    }
+
+    private fun findGoogleDriveConfirmedDownloadUrl(html: String, fileId: String): String? {
+        val href = Regex("""href="([^"]*(?:/uc\?export=download|drive\.usercontent\.google\.com/download)[^"]*)"""")
+            .find(html)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.replace("&amp;", "&")
+            ?.replace("\\u003d", "=")
+            ?.replace("\\u0026", "&")
+        if (!href.isNullOrBlank()) {
+            return if (href.startsWith("http")) href else "https://drive.google.com$href"
+        }
+
+        val confirm = Regex("""confirm=([0-9A-Za-z_\-]+)""")
+            .find(html)
+            ?.groupValues
+            ?.getOrNull(1)
+        return confirm?.let { "https://drive.google.com/uc?export=download&confirm=$it&id=$fileId" }
+    }
+
     private fun showToast(message: String) {
         Toast.makeText(getApplication(), message, Toast.LENGTH_SHORT).show()
     }
@@ -2605,6 +2799,58 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
+    private fun canUseCloudScriptBatch(settings: RadioBulletinSettings): Boolean =
+        settings.mode == RadioBulletinMode.Dialogue &&
+            settings.preferLocalWriter &&
+            settings.cloudWriterEnabled &&
+            radioBulletinState.value.geminiConfigured
+
+    private fun takeUpcomingBaseScripts(count: Int): List<RadioScript> {
+        if (newsBulletins.isEmpty()) return emptyList()
+        return (0 until count).map { offset ->
+            newsBulletins[(nextBulletinIndex + offset) % newsBulletins.size]
+        }
+    }
+
+    private fun advanceBulletinIndex(consumed: Int) {
+        repeat(consumed) {
+            nextBulletinIndex += 1
+            reloadNewsBulletinsIfCycleComplete()
+        }
+    }
+
+    private fun shouldRefillCloudScriptBuffer(settings: RadioBulletinSettings): Boolean =
+        canUseCloudScriptBatch(settings) &&
+            cloudScriptBuffer.size <= CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD &&
+            cloudScriptBuffer.size < CLOUD_SCRIPT_BUFFER_TARGET
+
+    private suspend fun refillCloudScriptBufferIfNeeded(settings: RadioBulletinSettings) {
+        if (!canUseCloudScriptBatch(settings)) return
+        if (!shouldRefillCloudScriptBuffer(settings)) return
+        while (cloudScriptBuffer.size < CLOUD_SCRIPT_BUFFER_TARGET && !bulletinPrepPaused) {
+            if (newsBulletins.isEmpty()) return
+            val freeSlots = (CLOUD_SCRIPT_BUFFER_TARGET - cloudScriptBuffer.size).coerceAtLeast(0)
+            val batchSize = minOf(CLOUD_SCRIPT_BATCH_SIZE, freeSlots)
+            if (batchSize <= 0) return
+            val candidates = takeUpcomingBaseScripts(batchSize)
+            if (candidates.isEmpty()) return
+            val written = llmGenerationMutex.withLock {
+                bulletinRepository.prewriteCloudScripts(
+                    scripts = candidates,
+                    settings = settings,
+                    radioName = activeRadioName,
+                    limit = batchSize,
+                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                )
+            }
+            if (written.isEmpty()) return
+            cloudScriptBuffer.addAll(written)
+            advanceBulletinIndex(candidates.size)
+            saveCloudScriptBufferManifest()
+            syncBulletinBufferState(statusMessage = null)
+        }
+    }
+
     // Mantem bulletinBuffer com BULLETIN_BUFFER_TARGET itens prontos (roteiro decorado + WAV
     // sintetizado, se a voz local/Gemini estiver ativa) - roda o tempo todo, independente de
     // radio ativa ou nao (pedido do usuario 03/09/2026), e SOBREVIVE a troca de radio (pedido do
@@ -2618,7 +2864,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun refillBulletinBuffer() {
         if (bulletinPrepPaused) return
         if (bulletinPrepJob?.isActive == true) return
-        if (bulletinBuffer.size >= BULLETIN_BUFFER_TARGET) return
+        val settingsAtStart = radioBulletinState.value.settings
+        val needsBulletinAudio = bulletinBuffer.size < BULLETIN_BUFFER_TARGET
+        val needsCloudScripts = shouldRefillCloudScriptBuffer(settingsAtStart)
+        if (!needsBulletinAudio && !needsCloudScripts) return
         if (newsBulletins.isEmpty()) {
             reloadNewsBulletinsIfNeeded()
             return
@@ -2626,6 +2875,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         bulletinPrepJob = viewModelScope.launch {
             try {
                 if (newsBulletins.isEmpty()) ensureNewsBulletinsLoaded()
+                refillCloudScriptBufferIfNeeded(radioBulletinState.value.settings)
+                if (bulletinBuffer.size >= BULLETIN_BUFFER_TARGET) {
+                    syncBulletinBufferState(isPreparing = false, statusMessage = null)
+                    return@launch
+                }
                 while (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused) {
                     if (newsBulletins.isEmpty()) {
                         // RSS falhou ou ainda nao carregou - nada pra preparar agora; desiste
@@ -2647,30 +2901,36 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     // que". CancellationException segue pro finally normalmente (nao e erro).
                     try {
                         val settings = radioBulletinState.value.settings
-                        val index = nextBulletinIndex % newsBulletins.size
-                        val baseScript = newsBulletins[index]
-                        nextBulletinIndex += 1
-                        reloadNewsBulletinsIfCycleComplete()
+                        refillCloudScriptBufferIfNeeded(settings)
                         Log.d(
                             TAG_RADIO_VOICE,
-                            "boletim: preparando index=$index posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled}",
+                            "boletim: preparando posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled} roteirosProntos=${cloudScriptBuffer.size}",
                         )
-                        var usedCloudWriter = false
-                        // Boletim e 100% radio-agnostico (pedido do usuario 09/09/2026, ver
-                        // RadioBulletin.kt buildSystemInstructions) - activeRadioName so entra
-                        // aqui por compatibilidade de assinatura, nunca aparece na fala.
-                        val enhanced = llmGenerationMutex.withLock {
-                            bulletinRepository.enhanceScript(
-                                baseScript, settings, activeRadioName,
-                                onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
-                                onProgressPercent = { percent ->
-                                    syncBulletinBufferState(statusMessage = radioBulletinBufferState.value.statusMessage, progressPercent = percent)
-                                },
-                                onWriterUsed = { usedCloudWriter = it },
-                            )
+                        val (script, scriptFromGemini) = if (canUseCloudScriptBatch(settings) && cloudScriptBuffer.isNotEmpty()) {
+                            val bufferedScript = cloudScriptBuffer.removeFirst()
+                            saveCloudScriptBufferManifest()
+                            bufferedScript.withPhilosophicalCloser() to true
+                        } else {
+                            val index = nextBulletinIndex % newsBulletins.size
+                            val baseScript = newsBulletins[index]
+                            nextBulletinIndex += 1
+                            reloadNewsBulletinsIfCycleComplete()
+                            var usedCloudWriter = false
+                            // Boletim e 100% radio-agnostico (pedido do usuario 09/09/2026, ver
+                            // RadioBulletin.kt buildSystemInstructions) - activeRadioName so entra
+                            // aqui por compatibilidade de assinatura, nunca aparece na fala.
+                            val enhanced = llmGenerationMutex.withLock {
+                                bulletinRepository.enhanceScript(
+                                    baseScript, settings, activeRadioName,
+                                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
+                                    onProgressPercent = { percent ->
+                                        syncBulletinBufferState(statusMessage = radioBulletinBufferState.value.statusMessage, progressPercent = percent)
+                                    },
+                                    onWriterUsed = { usedCloudWriter = it },
+                                )
+                            }
+                            enhanced.withPhilosophicalCloser() to usedCloudWriter
                         }
-                        val script = enhanced.withPhilosophicalCloser()
-                        val scriptFromGemini = usedCloudWriter
                         // coreSynthesisInFlight cobre TODA a janela sensivel (ver comentario na
                         // declaracao do campo) - do inicio da sintese ate o item estar de verdade
                         // registrado em bulletinBuffer logo abaixo. try/finally garante que ele
@@ -2728,7 +2988,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         // causa original do cooldown). Continua normal se caiu pro redator local
                         // Qwen3 (sem nenhuma chave configurada, ou os dois de nuvem falharam nessa
                         // hora) - ver ADR-021.
-                        if (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !usedCloudWriter) {
+                        if (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !scriptFromGemini) {
                             val cooldownStart = System.currentTimeMillis()
                             while (System.currentTimeMillis() - cooldownStart < COOLDOWN_BETWEEN_BULLETINS_MS && !bulletinPrepPaused) {
                                 val remainingS = ((COOLDOWN_BETWEEN_BULLETINS_MS - (System.currentTimeMillis() - cooldownStart)) / 1000)
@@ -2772,7 +3032,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         bulletinPrepJob = null
         bulletinBuffer.forEach { it.file?.delete() }
         bulletinBuffer.clear()
+        cloudScriptBuffer.clear()
         saveCoreBufferManifest()
+        saveCloudScriptBufferManifest()
         syncBulletinBufferState(isPreparing = false, statusMessage = null)
     }
 
@@ -2850,11 +3112,48 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     listOfNotNull(protectedBulletinPlaybackFileName)).toSet()
                 val now = System.currentTimeMillis()
                 coreBufferDir.listFiles { file ->
-                    file.name != CORE_BUFFER_MANIFEST_FILE && file.name !in referenced &&
+                    file.name != CORE_BUFFER_MANIFEST_FILE &&
+                        file.name != CLOUD_SCRIPT_BUFFER_MANIFEST_FILE &&
+                        file.name !in referenced &&
                         (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
                 }?.forEach { it.delete() }
             }
         }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao salvar manifest do buffer em disco", it) }
+    }
+
+    // Guarda em disco o estoque de roteiros Gemini ainda sem audio. Esse buffer nasce antes da
+    // sintese, entao deixar so em memoria seria desperdiçar chamada de API se o Android matar o
+    // processo, alem de impedir auditoria da qualidade do texto gerado. Fica no mesmo filesDir
+    // privado dos boletins prontos, mas em JSON separado do manifest dos .wav.
+    private fun saveCloudScriptBufferManifest() {
+        runCatching {
+            val array = JSONArray()
+            cloudScriptBuffer.forEach { script ->
+                array.put(
+                    JSONObject().apply {
+                        put("title", script.story.title)
+                        put("source", script.story.source)
+                        put("summary", script.story.summary)
+                        put("scriptSource", script.source.name)
+                        put("duration", script.duration.name)
+                        put(
+                            "lines",
+                            JSONArray().apply {
+                                script.lines.forEach { line ->
+                                    put(
+                                        JSONObject().apply {
+                                            put("speaker", line.speaker.name)
+                                            put("text", line.text)
+                                        },
+                                    )
+                                }
+                            },
+                        )
+                    },
+                )
+            }
+            coreBufferDir.resolve(CLOUD_SCRIPT_BUFFER_MANIFEST_FILE).writeText(array.toString())
+        }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao salvar estoque de roteiros Gemini", it) }
     }
 
     // Le o manifest salvo (se existir) e repopula bulletinBuffer - chamado uma vez na abertura do
@@ -2910,6 +3209,49 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao restaurar buffer do disco", it) }
     }
 
+    // Restaura o estoque FIFO de roteiros Gemini salvo antes da sintese. Trunca no alvo atual
+    // para evitar carregar lixo/crescimento de versoes futuras, mas preserva a ordem exata.
+    private fun loadCloudScriptBufferManifest() {
+        runCatching {
+            val manifestFile = coreBufferDir.resolve(CLOUD_SCRIPT_BUFFER_MANIFEST_FILE)
+            if (!manifestFile.exists()) return
+            val array = JSONArray(manifestFile.readText())
+            val restored = (0 until array.length()).mapNotNull { index ->
+                runCatching {
+                    val json = array.getJSONObject(index)
+                    val story = com.pailer.localtune.data.NewsStory(
+                        title = json.getString("title"),
+                        source = json.getString("source"),
+                        summary = json.optString("summary"),
+                    )
+                    val linesJson = json.getJSONArray("lines")
+                    val lines = (0 until linesJson.length()).map { lineIndex ->
+                        val lineJson = linesJson.getJSONObject(lineIndex)
+                        RadioScriptLine(
+                            speaker = RadioSpeaker.valueOf(lineJson.getString("speaker")),
+                            text = lineJson.getString("text"),
+                        )
+                    }
+                    RadioScript(
+                        story = story,
+                        lines = lines,
+                        source = runCatching {
+                            RadioScriptSource.valueOf(json.optString("scriptSource", RadioScriptSource.LocalLlm.name))
+                        }.getOrDefault(RadioScriptSource.LocalLlm),
+                        duration = runCatching {
+                            com.pailer.localtune.data.RadioBulletinDuration.valueOf(
+                                json.optString("duration", com.pailer.localtune.data.RadioBulletinDuration.Normal.name),
+                            )
+                        }.getOrDefault(com.pailer.localtune.data.RadioBulletinDuration.Normal),
+                    )
+                }.getOrNull()
+            }.take(CLOUD_SCRIPT_BUFFER_TARGET)
+            cloudScriptBuffer.clear()
+            cloudScriptBuffer.addAll(restored)
+            Log.d(TAG_RADIO_VOICE, "boletim: restaurados ${cloudScriptBuffer.size}/${array.length()} roteiros Gemini do disco")
+        }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao restaurar estoque de roteiros Gemini", it) }
+    }
+
     private fun syncBulletinBufferState(
         isPreparing: Boolean = radioBulletinBufferState.value.isPreparing,
         statusMessage: String? = radioBulletinBufferState.value.statusMessage,
@@ -2926,6 +3268,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val activeFullGemini = bulletinBuffer.map { (it.scriptFromGemini && it.voiceFromGemini) && it.file?.exists() == true }
         radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
             readyCount = bulletinBuffer.size,
+            scriptReadyCount = cloudScriptBuffer.size,
+            scriptTargetCount = CLOUD_SCRIPT_BUFFER_TARGET,
+            scriptRefillThreshold = CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD,
             isPreparing = isPreparing,
             isPaused = bulletinPrepPaused,
             statusMessage = statusMessage,
@@ -3811,7 +4156,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_RADIO_BULLETIN_TTS_PROVIDER = "radio_bulletin_tts_provider"
         const val KEY_RADIO_BULLETIN_TTS_MODEL = "radio_bulletin_tts_model"
         const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
+        const val RADIO_WRITER_DRIVE_FILE_ID = "1n_wXv28L61dGM0oH0DyhPKbi71VsBe8F"
+        const val RADIO_VOICE_DRIVE_FILE_ID = "1kYRm3Yy4STSGwo_X-mHbuCdiBinnNPco"
+        const val RADIO_WRITER_DOWNLOAD_FILE_NAME = "redator_local.zip"
+        const val RADIO_VOICE_DOWNLOAD_FILE_NAME = "pacote_de_vozes.zip"
+        const val RADIO_WRITER_DOWNLOAD_MAX_BYTES = 3000L * 1024L * 1024L
+        const val RADIO_VOICE_DOWNLOAD_MAX_BYTES = 350L * 1024L * 1024L
         const val CORE_BUFFER_MANIFEST_FILE = "manifest.json"
+        const val CLOUD_SCRIPT_BUFFER_MANIFEST_FILE = "cloud_script_buffer.json"
         // Pausa entre boletins consecutivos do preparo automatico pra deixar o SoC esfriar - ver
         // comentario em refillBulletinBuffer. Status atualiza a cada COOLDOWN_STATUS_TICK_MS pra
         // usuario acompanhar a contagem regressiva.
@@ -3868,6 +4220,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // do boletim ficar 100% radio-agnostico. Buffer UNICO (unificado 10/09/2026, ver
         // comentario em bulletinBuffer) - 10 e o estoque real, nao 10 por "nivel".
         const val BULLETIN_BUFFER_TARGET = 10
+        const val CLOUD_SCRIPT_BATCH_SIZE = 10
+        const val CLOUD_SCRIPT_BUFFER_TARGET = 20
+        const val CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD = 10
 
         // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() (achado ao
         // vivo 10/09/2026) - maior que o pior caso ja observado de uma sintese em andamento (~90s

@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
 import java.util.zip.ZipInputStream
 
 data class RadioVoicePackageStatus(
@@ -70,11 +71,45 @@ class RadioVoicePackageRepository(private val context: Context) {
     }
 
     suspend fun importPackage(uri: Uri): RadioVoicePackageStatus = withContext(Dispatchers.IO) {
+        val status = importPackageFromStream {
+            context.contentResolver.openInputStream(uri) ?: error("Nao consegui abrir o pacote de voz.")
+        }
+
+        // Copia de referencia do .zip original na pasta oficial (se configurada) - ver mesmo
+        // comentario em RadioWriterPackageRepository.importPackage.
+        runCatching {
+            AppFolderRepository(context).copyUriToSubfolder(
+                uri,
+                AppFolderRepository.SUBFOLDER_VOICE,
+                "pacote_de_vozes.zip",
+                "application/zip",
+            )
+        }
+
+        status
+    }
+
+    suspend fun importPackage(file: File): RadioVoicePackageStatus = withContext(Dispatchers.IO) {
+        val status = importPackageFromStream { file.inputStream() }
+
+        runCatching {
+            AppFolderRepository(context).copyFileToSubfolder(
+                file,
+                AppFolderRepository.SUBFOLDER_VOICE,
+                "pacote_de_vozes.zip",
+                "application/zip",
+            )
+        }
+
+        status
+    }
+
+    private fun importPackageFromStream(openStream: () -> InputStream): RadioVoicePackageStatus {
         val tempDir = context.filesDir.resolve(IMPORT_DIR)
         tempDir.deleteRecursively()
         tempDir.mkdirs()
 
-        context.contentResolver.openInputStream(uri)?.use { stream ->
+        openStream().use { stream ->
             ZipInputStream(stream.buffered()).use { zip ->
                 var totalBytes = 0L
                 while (true) {
@@ -101,7 +136,7 @@ class RadioVoicePackageRepository(private val context: Context) {
                     zip.closeEntry()
                 }
             }
-        } ?: error("Nao consegui abrir o pacote de voz.")
+        }
 
         val manifestFile = tempDir.resolve(MANIFEST_FILE)
         if (!manifestFile.exists()) {
@@ -123,18 +158,7 @@ class RadioVoicePackageRepository(private val context: Context) {
         currentDir.resolve(READY_FILE).writeText("ok")
         tempDir.deleteRecursively()
 
-        // Copia de referencia do .zip original na pasta oficial (se configurada) - ver mesmo
-        // comentario em RadioWriterPackageRepository.importPackage.
-        runCatching {
-            AppFolderRepository(context).copyUriToSubfolder(
-                uri,
-                AppFolderRepository.SUBFOLDER_VOICE,
-                "pacote_de_vozes.zip",
-                "application/zip",
-            )
-        }
-
-        parsedConfig.toStatus().copy(isInstalled = true, detail = "Pacote importado com sucesso")
+        return parsedConfig.toStatus().copy(isInstalled = true, detail = "Pacote importado com sucesso")
     }
 
     fun clearPackage(): RadioVoicePackageStatus {

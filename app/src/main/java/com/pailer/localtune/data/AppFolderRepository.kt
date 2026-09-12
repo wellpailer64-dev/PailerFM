@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 
 // Pasta oficial do Pailer FM (pedido do usuario 07/09/2026) - uma unica pasta que o usuario
 // escolhe UMA VEZ (ACTION_OPEN_DOCUMENT_TREE, permissao persistida - nao pede de novo depois),
@@ -81,8 +82,27 @@ class AppFolderRepository(private val context: Context) {
     suspend fun copyUriToSubfolder(uri: Uri, subfolderName: String, fileName: String, mimeType: String): Boolean =
         withContext(Dispatchers.IO) {
             runCatching {
-                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@withContext false
-                writeToSubfolder(subfolderName, fileName, mimeType, bytes)
+                val input = context.contentResolver.openInputStream(uri) ?: return@withContext false
+                copyStreamToSubfolder(
+                    subfolderName = subfolderName,
+                    fileName = fileName,
+                    mimeType = mimeType,
+                ) { output ->
+                    input.use { it.copyTo(output) }
+                }
+            }.getOrDefault(false)
+        }
+
+    suspend fun copyFileToSubfolder(file: File, subfolderName: String, fileName: String, mimeType: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                copyStreamToSubfolder(
+                    subfolderName = subfolderName,
+                    fileName = fileName,
+                    mimeType = mimeType,
+                ) { output ->
+                    file.inputStream().use { it.copyTo(output) }
+                }
             }.getOrDefault(false)
         }
 
@@ -95,6 +115,19 @@ class AppFolderRepository(private val context: Context) {
         val root = rootDocument() ?: return null
         return root.findFile(name)?.takeIf { it.isDirectory }
             ?: runCatching { root.createDirectory(name) }.getOrNull()
+    }
+
+    private fun copyStreamToSubfolder(
+        subfolderName: String,
+        fileName: String,
+        mimeType: String,
+        write: (java.io.OutputStream) -> Unit,
+    ): Boolean {
+        val folder = subfolder(subfolderName) ?: return false
+        folder.findFile(fileName)?.delete()
+        val file = folder.createFile(mimeType, fileName) ?: return false
+        context.contentResolver.openOutputStream(file.uri)?.use(write) ?: return false
+        return true
     }
 
     companion object {

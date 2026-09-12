@@ -236,6 +236,39 @@ class RadioBulletinRepository(context: Context) {
         }.getOrDefault(script)
     }
 
+    suspend fun prewriteCloudScripts(
+        scripts: List<RadioScript>,
+        settings: RadioBulletinSettings,
+        radioName: String,
+        limit: Int,
+        onProgress: (String) -> Unit = {},
+    ): List<RadioScript> {
+        if (
+            settings.mode != RadioBulletinMode.Dialogue ||
+            !settings.preferLocalWriter ||
+            !settings.cloudWriterEnabled ||
+            !geminiWriter.isConfigured()
+        ) return emptyList()
+        val requests = scripts.take(limit).mapIndexed { index, script ->
+            GeminiBatchScriptRequest(
+                id = index,
+                story = script.story,
+                context = RadioScriptContext(radioName = radioName, duration = pickDuration(script.story)),
+            )
+        }
+        if (requests.isEmpty()) return emptyList()
+        onProgress("Escrevendo ${requests.size} roteiros com Gemini...")
+        return runCatching {
+            geminiWriter.writeBatch(requests)
+        }.onSuccess {
+            Log.d(TAG_RADIO_WRITER, "gemini lote gerou ${it.size}/${requests.size} roteiros")
+            if (it.isNotEmpty()) onProgress("${it.size} roteiros prontos para sintetizar.")
+        }.onFailure {
+            Log.w(TAG_RADIO_WRITER, "gemini lote falhou; mantendo preparo individual", it)
+            onProgress("Lote Gemini falhou (${it.message ?: it::class.simpleName}); mantendo preparo individual.")
+        }.getOrDefault(emptyList())
+    }
+
     // Materia rica (resumo longo e/ou com numero/valor concreto pra comentar) rende bate-bola
     // mais longo; manchete seca sem resumo fica curta - nao da pra fingir profundidade que a
     // fonte nao tem.
@@ -250,6 +283,12 @@ class RadioBulletinRepository(context: Context) {
     }
 
 }
+
+private data class GeminiBatchScriptRequest(
+    val id: Int,
+    val story: NewsStory,
+    val context: RadioScriptContext,
+)
 
 // Conteudo de instrucao compartilhado entre o redator local (llama.cpp/Qwen3, formato ChatML,
 // ver OptionalLocalLlmRadioScriptWriter.buildPrompt) e o redator remoto (Gemini, ver
@@ -272,7 +311,9 @@ private fun buildSystemInstructions(): String = """
     ATITUDE da fala dele, não precisa citar jaqueta/moto toda hora. Os dois são GENTE:
     sentem o clima de cada notícia (leve, séria, engraçada, triste, perigosa, absurda) e
     reagem de acordo - nunca no automático, nunca sempre do mesmo jeito matéria após
-    matéria.
+    matéria. Em pauta leve, curiosa, consumo ou cultura pop, Nico não precisa pesar a
+    mão: prefira ironia seca, observação concreta e crítica bem-humorada, sem transformar
+    tudo em tragédia existencial.
     Responda só JSON válido, um array de 6 objetos:
     [{"speaker":"Female","text":"..."},{"speaker":"Male","text":"..."}]
     As instruções abaixo dizem O QUE cada fala deve fazer - NÃO são texto pra repetir.
@@ -307,7 +348,7 @@ private fun buildSystemInstructions(): String = """
     é leve, séria, engraçada, triste, perigosa ou absurda, e reaja de acordo, GERADO NA
     HORA a partir do que ESSA notícia sugere, nunca uma frase genérica que serviria pra
     qualquer matéria. Nem toda matéria merece filosofia: numa notícia leve/boba, um
-    comentário ácido ou uma piada seca encerra melhor que forçar profundidade; numa
+    comentário ácido, uma observação concreta ou uma piada seca encerra melhor que forçar profundidade; numa
     notícia realmente grave (tragédia, violência), nada de piada - reação séria, ainda
     assim com a voz cética/dura do Nico; só puxe pra reflexão existencialista/absurdista
     (pode se inspirar em Camus, Sartre, Nietzsche, Kafka, Beckett ou Cioran, citando o
@@ -331,6 +372,53 @@ private fun buildUserContent(story: NewsStory): String {
         Escreva as 6 falas sobre ESSA matéria ($title) - a piada, a ironia e a reflexão
         do Nico têm que nascer desse assunto específico, nunca do exemplo de trânsito
         mostrado antes.
+    """.trimIndent()
+}
+
+private fun buildBatchSystemInstructions(): String = """
+    Roteirista da Pailer FM. Escreva em português correto, com acentos e pontuação.
+    Fran e Nico fazem um bate-bola curto sobre notícias. Fran tem humor debochado leve,
+    traz informação útil e levanta o astral. Nico é cético, crítico, político e seco,
+    mas sem crueldade gratuita. Em pauta leve, curiosa, consumo ou cultura pop, Nico
+    fecha com ironia seca ou observação concreta, sem forçar tragédia existencial. Os
+    dois reagem ao clima de cada notícia, sem repetir molde entre boletins.
+
+    Você receberá uma lista de matérias com ids fixos. Responda só JSON válido, neste
+    formato:
+    [
+      {"id":0,"lines":[{"speaker":"Female","text":"..."},{"speaker":"Male","text":"..."}]},
+      {"id":1,"lines":[...]}
+    ]
+
+    Para CADA id, escreva 6 falas:
+    1 Female/Fran: abre a notícia direto, variando o jeito de começar.
+    2 Male/Nico: detalhe + leitura crítica.
+    3 Female/Fran: reação com otimismo realista ou humor leve.
+    4 Male/Nico: rebate com outra visão, sarcasmo ou ironia sobre o assunto.
+    5 Male/Nico: fechamento conforme o clima real da notícia, sem frase genérica; use
+    reflexão pesada só quando o assunto realmente pedir.
+    6 Female/Fran: reage ao Nico e faz transição curta, tipo "a gente já volta".
+
+    Máximo 18 palavras nas falas 1 a 4 e 6; máximo 28 palavras na fala 5.
+    Nunca mencione nome de rádio, música, faixa ou artista tocando. Não invente fatos.
+    Não misture notícias entre ids. Não pule ids.
+""".trimIndent()
+
+private fun buildBatchUserContent(requests: List<GeminiBatchScriptRequest>): String {
+    val array = JSONArray().apply {
+        requests.forEach { request ->
+            put(
+                JSONObject()
+                    .put("id", request.id)
+                    .put("source", request.story.source)
+                    .put("title", request.story.title.toRadioSentence().limitWords(22))
+                    .put("summary", request.story.summary.ifBlank { "Sem resumo disponível." }.toRadioSentence().limitWords(55)),
+            )
+        }
+    }
+    return """
+        Escreva um boletim independente para cada matéria abaixo, mantendo o id original:
+        $array
     """.trimIndent()
 }
 
@@ -419,6 +507,21 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         )
     }
 
+    suspend fun writeBatch(requests: List<GeminiBatchScriptRequest>): List<RadioScript> = withContext(Dispatchers.IO) {
+        if (requests.isEmpty()) return@withContext emptyList()
+        val generated = generateWithRetryBatch(buildBatchUserContent(requests))
+        val byId = requests.associateBy { it.id }
+        parseGeneratedScriptBatch(generated, byId).mapNotNull { (id, lines) ->
+            val request = byId[id] ?: return@mapNotNull null
+            RadioScript(
+                story = request.story,
+                source = RadioScriptSource.LocalLlm,
+                lines = lines,
+                duration = request.context.duration,
+            )
+        }.sortedBy { script -> requests.indexOfFirst { it.story == script.story } }
+    }
+
     // O Gemini e SEMPRE a prioridade (pedido explicito do usuario 05/09/2026: "sempre precisamos
     // priorizar a redação do Gemini... se falhar, precisamos tentar mais uma vez") - por isso
     // reentra em QUALQUER falha (rede, timeout, JSON invalido/incompleto do parseGeneratedLines).
@@ -451,12 +554,36 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         error("inalcancavel") // apiKeys nao vazio garante return ou throw no loop acima
     }
 
+    private suspend fun generateWithRetryBatch(userContent: String): String {
+        val systemInstruction = buildBatchSystemInstructions()
+        val apiKeys = settings.apiKeys()
+        if (apiKeys.isEmpty()) error("Gemini sem chave de API configurada")
+        apiKeys.forEachIndexed { index, apiKey ->
+            val result = runCatching {
+                withTimeoutOrNull(GEMINI_BATCH_TIMEOUT_MS) { callGemini(apiKey, systemInstruction, userContent, GEMINI_BATCH_MAX_OUTPUT_TOKENS) }
+                    ?: error("Gemini demorou demais pra responder o lote")
+            }
+            result.onSuccess { return it }
+            val failure = result.exceptionOrNull()!!
+            val isLastKey = index == apiKeys.lastIndex
+            if (isLastKey) throw failure
+            Log.w(TAG_RADIO_WRITER, "gemini lote erro na chave ${index + 1}/${apiKeys.size}, tentando a proxima", failure)
+            delay(GEMINI_RETRY_DELAY_MS)
+        }
+        error("inalcancavel")
+    }
+
     // Chamada sincrona (HttpURLConnection puro, mesmo padrao ja usado em
     // NewsBulletinRepository.fetchFeed - sem OkHttp/Retrofit no projeto) - roda dentro do
     // withContext(Dispatchers.IO) do caller. connectTimeout/readTimeout do proprio
     // HttpURLConnection ja limitam o tempo real mesmo sem suporte a cancelamento cooperativo
     // (mesma ressalva de outras chamadas bloqueantes deste projeto, ver ADR-020 pendencia 2).
-    private fun callGemini(apiKey: String, systemInstruction: String, userContent: String): String {
+    private fun callGemini(
+        apiKey: String,
+        systemInstruction: String,
+        userContent: String,
+        maxOutputTokens: Int = 8192,
+    ): String {
         val connection = (URL("$GEMINI_ENDPOINT?key=$apiKey").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doOutput = true
@@ -486,7 +613,7 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
             // erro 400 "invalid argument" (esquema mudou entre geracoes de modelo, nao
             // confirmado qual o campo certo) - removido; 8192 da folga de sobra tanto pro
             // raciocinio quanto pro JSON final de 6 falas curtas.
-            put("generationConfig", JSONObject().put("temperature", 0.6).put("maxOutputTokens", 8192))
+            put("generationConfig", JSONObject().put("temperature", 0.6).put("maxOutputTokens", maxOutputTokens))
         }
         connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
@@ -555,6 +682,8 @@ private class RemoteGeminiRadioScriptWriter(context: Context) {
         // (refillBulletinBuffer, buffer de ate BULLETIN_BUFFER_TARGET boletins de folga) e nao trava a entrada da
         // radio, entao esperar mais o Gemini custa bem menos que cair pro motor local lento.
         const val GEMINI_TIMEOUT_MS = 120_000L
+        const val GEMINI_BATCH_TIMEOUT_MS = 180_000L
+        const val GEMINI_BATCH_MAX_OUTPUT_TOKENS = 24000
         // Ver generateWithRetry: respiro curto entre uma chave e a proxima (nao entre tentativas
         // na MESMA chave - essa reentrada nao existe mais, ver comentario la).
         const val GEMINI_RETRY_DELAY_MS = 4_000L
@@ -746,6 +875,54 @@ private fun parseGeneratedLines(generated: String): List<RadioScriptLine> = runC
     // coisas distintas). Truncado pra nao inundar o logcat com boletins muito longos.
     Log.w(TAG_RADIO_WRITER, "parse do roteiro falhou (${it::class.simpleName}: ${it.message}); texto bruto gerado: ${generated.take(1500)}")
 }.getOrThrow()
+
+private fun parseGeneratedScriptBatch(
+    generated: String,
+    requestsById: Map<Int, GeminiBatchScriptRequest>,
+): List<Pair<Int, List<RadioScriptLine>>> = runCatching {
+    val jsonText = extractJsonArrayText(generated)
+    val array = JSONArray(jsonText)
+    (0 until array.length()).mapNotNull { index ->
+        val item = array.optJSONObject(index) ?: return@mapNotNull null
+        val id = item.optInt("id", Int.MIN_VALUE)
+        if (id !in requestsById.keys) return@mapNotNull null
+        val linesJson = item.optJSONArray("lines") ?: return@mapNotNull null
+        val lines = parseGeneratedLineArray(linesJson).getOrNull() ?: return@mapNotNull null
+        id to lines
+    }.distinctBy { it.first }
+}.onFailure {
+    Log.w(TAG_RADIO_WRITER, "parse do lote Gemini falhou (${it::class.simpleName}: ${it.message}); texto bruto: ${generated.take(1500)}")
+}.getOrDefault(emptyList())
+
+private fun parseGeneratedLineArray(array: JSONArray): Result<List<RadioScriptLine>> = runCatching {
+    (0 until array.length()).mapNotNull { index ->
+        val item = array.optJSONObject(index) ?: return@mapNotNull null
+        val speaker = when (item.optString("speaker")) {
+            "Female" -> RadioSpeaker.Female
+            "Male" -> RadioSpeaker.Male
+            else -> return@mapNotNull null
+        }
+        val text = item.optString("text").toRadioSentence().ensureFinalPeriod()
+        if (text.isBlank()) null else RadioScriptLine(speaker, text.limitWords(32))
+    }.take(6).takeIf { lines ->
+        lines.size >= 4 && lines.firstOrNull()?.speaker == RadioSpeaker.Female && hasAccentuation(lines)
+    } ?: error("Roteiro inválido no lote")
+}
+
+private fun extractJsonArrayText(generated: String): String {
+    val cleaned = generated
+        .trim()
+        .removePrefix("```json")
+        .removePrefix("```")
+        .removeSuffix("```")
+        .trim()
+    val objectWrapped = runCatching { JSONObject(cleaned) }.getOrNull()
+    objectWrapped?.optJSONArray("bulletins")?.let { return it.toString() }
+    val start = cleaned.indexOf('[')
+    val end = cleaned.lastIndexOf(']')
+    if (start >= 0 && end > start) return cleaned.substring(start, end + 1)
+    error("Gemini não devolveu um array JSON")
+}
 
 // Texto de português corrido deste tamanho praticamente sempre tem pelo menos um caractere
 // acentuado ("não", "é", "está", "notícia"...) - se não tiver nenhum, é sinal de que o

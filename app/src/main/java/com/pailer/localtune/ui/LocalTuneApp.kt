@@ -1022,10 +1022,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onSetRadioBulletinTtsModel = viewModel::setRadioBulletinTtsModel,
             onTestGeminiFlashTtsVoices = viewModel::testGeminiFlashTtsVoices,
             onImportRadioWriterPackage = { writerPackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+            onDownloadRadioWriterPackage = viewModel::downloadRadioWriterPackage,
             onClearRadioWriterPackage = viewModel::clearRadioWriterPackage,
             onSaveGeminiApiKey = viewModel::saveGeminiApiKey,
             onClearGeminiApiKey = viewModel::clearGeminiApiKey,
             onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+            onDownloadRadioVoicePackage = viewModel::downloadRadioVoicePackage,
             onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
             onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
             onTestRadioVoicePackage = viewModel::testRadioVoicePackage,
@@ -1495,10 +1497,12 @@ private fun SettingsDrawer(
     onSetRadioBulletinTtsModel: (GeminiTtsModel) -> Unit,
     onTestGeminiFlashTtsVoices: () -> Unit,
     onImportRadioWriterPackage: () -> Unit,
+    onDownloadRadioWriterPackage: () -> Unit,
     onClearRadioWriterPackage: () -> Unit,
     onSaveGeminiApiKey: (Int, String) -> Unit,
     onClearGeminiApiKey: (Int) -> Unit,
     onImportRadioVoicePackage: () -> Unit,
+    onDownloadRadioVoicePackage: () -> Unit,
     onClearRadioVoicePackage: () -> Unit,
     onSetRadioVoiceEnabled: (Boolean) -> Unit,
     onTestRadioVoicePackage: () -> Unit,
@@ -1639,9 +1643,11 @@ private fun SettingsDrawer(
                             onSetTtsModel = onSetRadioBulletinTtsModel,
                             onTestGeminiVoice = onTestGeminiFlashTtsVoices,
                             onImportWriterPackage = onImportRadioWriterPackage,
+                            onDownloadWriterPackage = onDownloadRadioWriterPackage,
                             onClearWriterPackage = onClearRadioWriterPackage,
                             onOpenGeminiApiKeys = { onPageChange(SettingsPage.GeminiApiKeys) },
                             onImportVoicePackage = onImportRadioVoicePackage,
+                            onDownloadVoicePackage = onDownloadRadioVoicePackage,
                             onClearVoicePackage = onClearRadioVoicePackage,
                             onSetVoiceEnabled = onSetRadioVoiceEnabled,
                             onTestVoicePackage = onTestRadioVoicePackage,
@@ -2061,9 +2067,11 @@ private fun RadioBulletinSettingsPanel(
     onSetTtsModel: (GeminiTtsModel) -> Unit,
     onTestGeminiVoice: () -> Unit,
     onImportWriterPackage: () -> Unit,
+    onDownloadWriterPackage: () -> Unit,
     onClearWriterPackage: () -> Unit,
     onOpenGeminiApiKeys: () -> Unit,
     onImportVoicePackage: () -> Unit,
+    onDownloadVoicePackage: () -> Unit,
     onClearVoicePackage: () -> Unit,
     onSetVoiceEnabled: (Boolean) -> Unit,
     onTestVoicePackage: () -> Unit,
@@ -2148,12 +2156,30 @@ private fun RadioBulletinSettingsPanel(
             )
         }
         Spacer(Modifier.height(10.dp))
+        val writerDownloading = radioBulletins.localWriterImporting &&
+            radioBulletins.localWriterMessage?.contains("Baixando") == true
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (!radioBulletins.localWriterInstalled) {
+                Button(
+                    onClick = onDownloadWriterPackage,
+                    enabled = !radioBulletins.localWriterImporting,
+                ) {
+                    if (writerDownloading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(if (radioBulletins.localWriterImporting) "Baixando..." else "Baixar")
+                }
+            }
             Button(
                 onClick = onImportWriterPackage,
                 enabled = !radioBulletins.localWriterImporting,
             ) {
-                if (radioBulletins.localWriterImporting) {
+                if (radioBulletins.localWriterImporting && !writerDownloading) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(16.dp),
                         strokeWidth = 2.dp,
@@ -2161,7 +2187,7 @@ private fun RadioBulletinSettingsPanel(
                     )
                     Spacer(Modifier.width(8.dp))
                 }
-                Text(if (radioBulletins.localWriterImporting) "Importando..." else "Importar redator")
+                Text(if (radioBulletins.localWriterImporting && !writerDownloading) "Importando..." else "Importar arquivo")
             }
             if (radioBulletins.localWriterInstalled) {
                 TextButton(onClick = onClearWriterPackage) {
@@ -2380,12 +2406,29 @@ private fun RadioBulletinSettingsPanel(
                     )
                 }
                 Spacer(Modifier.height(10.dp))
+                val voiceDownloading = radioVoice.isImporting && radioVoice.message?.contains("Baixando") == true
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!radioVoice.isInstalled) {
+                        Button(
+                            onClick = onDownloadVoicePackage,
+                            enabled = !radioVoice.isImporting && !radioVoice.isTesting,
+                        ) {
+                            if (voiceDownloading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(if (radioVoice.isImporting) "Baixando..." else "Baixar")
+                        }
+                    }
                     Button(
                         onClick = onImportVoicePackage,
                         enabled = !radioVoice.isImporting && !radioVoice.isTesting,
                     ) {
-                        if (radioVoice.isImporting) {
+                        if (radioVoice.isImporting && !voiceDownloading) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(16.dp),
                                 strokeWidth = 2.dp,
@@ -2393,7 +2436,7 @@ private fun RadioBulletinSettingsPanel(
                             )
                             Spacer(Modifier.width(8.dp))
                         }
-                        Text(if (radioVoice.isImporting) "Importando..." else "Importar pacote")
+                        Text(if (radioVoice.isImporting && !voiceDownloading) "Importando..." else "Importar arquivo")
                     }
                     if (radioVoice.isInstalled) {
                         Button(
@@ -2599,6 +2642,7 @@ private fun RadioBulletinBufferStatusCard(
                     )
                     Text(
                         text = "${bulletinBuffer.readyCount}/${bulletinBuffer.targetCount} prontos" +
+                            (if (bulletinBuffer.scriptTargetCount > 0) " · ${bulletinBuffer.scriptReadyCount}/${bulletinBuffer.scriptTargetCount} roteiros" else "") +
                             (if (bulletinBuffer.hasFallback) " · ${bulletinBuffer.fallbackSlots.size} em fallback" else "") +
                             if (bulletinBuffer.isPaused) " · pausado" else "",
                         modifier = Modifier.padding(top = 3.dp),
@@ -2649,6 +2693,31 @@ private fun RadioBulletinBufferStatusCard(
                                 },
                             ),
                     )
+                }
+            }
+            if (bulletinBuffer.scriptTargetCount > 0) {
+                Text(
+                    text = "Roteiros Gemini em estoque",
+                    modifier = Modifier.padding(top = 10.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(
+                    modifier = Modifier.padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    repeat(bulletinBuffer.scriptTargetCount) { slot ->
+                        val filled = slot < bulletinBuffer.scriptReadyCount
+                        Box(
+                            modifier = Modifier
+                                .size(9.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (filled) Color.White.copy(alpha = 0.9f) else Color.White.copy(alpha = 0.13f),
+                                ),
+                        )
+                    }
                 }
             }
             bulletinBuffer.statusMessage?.let { message ->
