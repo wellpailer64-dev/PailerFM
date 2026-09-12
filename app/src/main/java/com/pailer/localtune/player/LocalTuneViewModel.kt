@@ -86,6 +86,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Locale
 import kotlin.coroutines.resume
@@ -924,7 +925,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     fileId = RADIO_WRITER_DRIVE_FILE_ID,
                     fileName = RADIO_WRITER_DOWNLOAD_FILE_NAME,
                     maxBytes = RADIO_WRITER_DOWNLOAD_MAX_BYTES,
+                    progressPrefix = "Baixando redator local",
+                    onProgress = { message ->
+                        radioBulletinState.value = radioBulletinState.value.copy(localWriterMessage = message)
+                    },
                 )
+                withContext(Dispatchers.Main) {
+                    radioBulletinState.value = radioBulletinState.value.copy(
+                        localWriterMessage = "Importando redator local...",
+                    )
+                }
                 writerPackageRepository.importPackage(packageFile).also {
                     packageFile.delete()
                 }
@@ -986,7 +996,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     fileId = RADIO_VOICE_DRIVE_FILE_ID,
                     fileName = RADIO_VOICE_DOWNLOAD_FILE_NAME,
                     maxBytes = RADIO_VOICE_DOWNLOAD_MAX_BYTES,
+                    progressPrefix = "Baixando pacote de voz",
+                    onProgress = { message ->
+                        radioVoiceState.value = radioVoiceState.value.copy(message = message)
+                    },
                 )
+                withContext(Dispatchers.Main) {
+                    radioVoiceState.value = radioVoiceState.value.copy(message = "Importando pacote de voz...")
+                }
                 voicePackageRepository.importPackage(packageFile).also {
                     packageFile.delete()
                 }
@@ -2329,6 +2346,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         fileId: String,
         fileName: String,
         maxBytes: Long,
+        progressPrefix: String,
+        onProgress: suspend (String) -> Unit,
     ): File = withContext(Dispatchers.IO) {
         val destination = getApplication<Application>()
             .cacheDir
@@ -2370,16 +2389,27 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
             val contentType = connection.contentType.orEmpty().lowercase(Locale.ROOT)
             val contentDisposition = connection.getHeaderField("Content-Disposition").orEmpty()
+            Log.d(
+                TAG_RADIO_VOICE,
+                "drive download response file=$fileName code=$responseCode type=$contentType disposition=${contentDisposition.take(80)}",
+            )
             if (contentDisposition.isBlank() && contentType.contains("text/html")) {
                 val html = connection.inputStream.bufferedReader().use { it.readText() }
                 connection.disconnect()
                 val confirmedUrl = findGoogleDriveConfirmedDownloadUrl(html, fileId)
                     ?: error("Google Drive pediu confirmacao e nao liberou o arquivo automaticamente.")
+                Log.d(TAG_RADIO_VOICE, "drive download confirmation resolved file=$fileName")
                 url = URL(url, confirmedUrl)
                 continue
             }
 
+            val expectedBytes = connection.contentLengthLong.takeIf { it > 0L }
             var copied = 0L
+            var lastProgressBytes = 0L
+            var lastProgressAt = 0L
+            withContext(Dispatchers.Main) {
+                onProgress(formatDownloadProgress(progressPrefix, copied, expectedBytes))
+            }
             connection.inputStream.use { input ->
                 destination.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -2392,6 +2422,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             error("Arquivo maior que o esperado.")
                         }
                         output.write(buffer, 0, read)
+                        val now = System.currentTimeMillis()
+                        if (copied - lastProgressBytes >= DOWNLOAD_PROGRESS_STEP_BYTES ||
+                            now - lastProgressAt >= DOWNLOAD_PROGRESS_STEP_MS
+                        ) {
+                            lastProgressBytes = copied
+                            lastProgressAt = now
+                            withContext(Dispatchers.Main) {
+                                onProgress(formatDownloadProgress(progressPrefix, copied, expectedBytes))
+                            }
+                        }
                     }
                 }
             }
@@ -2400,6 +2440,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 destination.delete()
                 error("Download veio vazio.")
             }
+            withContext(Dispatchers.Main) {
+                onProgress(formatDownloadProgress(progressPrefix, copied, expectedBytes))
+            }
+            Log.d(TAG_RADIO_VOICE, "drive download completed file=$fileName bytes=$copied")
             return@withContext destination
         }
 
@@ -2408,23 +2452,87 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun findGoogleDriveConfirmedDownloadUrl(html: String, fileId: String): String? {
+        val normalizedHtml = html
+            .replace("&amp;", "&")
+            .replace("\\u003d", "=")
+            .replace("\\u0026", "&")
+
         val href = Regex("""href="([^"]*(?:/uc\?export=download|drive\.usercontent\.google\.com/download)[^"]*)"""")
-            .find(html)
+            .find(normalizedHtml)
             ?.groupValues
             ?.getOrNull(1)
-            ?.replace("&amp;", "&")
-            ?.replace("\\u003d", "=")
-            ?.replace("\\u0026", "&")
         if (!href.isNullOrBlank()) {
             return if (href.startsWith("http")) href else "https://drive.google.com$href"
         }
 
+        findGoogleDriveDownloadFormUrl(normalizedHtml, fileId)?.let { return it }
+
         val confirm = Regex("""confirm=([0-9A-Za-z_\-]+)""")
-            .find(html)
+            .find(normalizedHtml)
             ?.groupValues
             ?.getOrNull(1)
         return confirm?.let { "https://drive.google.com/uc?export=download&confirm=$it&id=$fileId" }
     }
+
+    private fun findGoogleDriveDownloadFormUrl(html: String, fileId: String): String? {
+        val formOptions = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        val form = Regex(
+            """<form\b[^>]*\bid=["']download-form["'][^>]*>.*?</form>""",
+            formOptions,
+        ).find(html)?.value ?: Regex(
+            """<form\b[^>]*\baction=["'][^"']*(?:drive\.usercontent\.google\.com/download|/download)[^"']*["'][^>]*>.*?</form>""",
+            formOptions,
+        ).find(html)?.value ?: return null
+
+        val action = htmlAttribute(form, "action")
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        val params = linkedMapOf<String, String>()
+        Regex("""<input\b[^>]*>""", RegexOption.IGNORE_CASE)
+            .findAll(form)
+            .forEach { match ->
+                val input = match.value
+                val name = htmlAttribute(input, "name") ?: return@forEach
+                params[name] = htmlAttribute(input, "value").orEmpty()
+            }
+
+        params["id"] = params["id"].takeUnless { it.isNullOrBlank() } ?: fileId
+        params["export"] = params["export"].takeUnless { it.isNullOrBlank() } ?: "download"
+
+        val baseUrl = when {
+            action.startsWith("http", ignoreCase = true) -> action
+            action.startsWith("/") -> "https://drive.usercontent.google.com$action"
+            else -> "https://drive.usercontent.google.com/$action"
+        }
+        val query = params.entries.joinToString("&") { (key, value) ->
+            "${urlEncode(key)}=${urlEncode(value)}"
+        }
+        val separator = if (baseUrl.contains("?")) "&" else "?"
+        return "$baseUrl$separator$query"
+    }
+
+    private fun htmlAttribute(tag: String, name: String): String? =
+        Regex("""\b${Regex.escape(name)}=["']([^"']*)["']""", RegexOption.IGNORE_CASE)
+            .find(tag)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.replace("&amp;", "&")
+
+    private fun urlEncode(value: String): String =
+        URLEncoder.encode(value, Charsets.UTF_8.name())
+
+    private fun formatDownloadProgress(prefix: String, downloadedBytes: Long, totalBytes: Long?): String {
+        val downloaded = formatMegabytes(downloadedBytes)
+        return if (totalBytes != null && totalBytes > 0L) {
+            val remaining = (totalBytes - downloadedBytes).coerceAtLeast(0L)
+            "$prefix: $downloaded de ${formatMegabytes(totalBytes)} (${formatMegabytes(remaining)} faltando)"
+        } else {
+            "$prefix: $downloaded baixados"
+        }
+    }
+
+    private fun formatMegabytes(bytes: Long): String =
+        String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
 
     private fun showToast(message: String) {
         Toast.makeText(getApplication(), message, Toast.LENGTH_SHORT).show()
@@ -4503,6 +4611,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val RADIO_VOICE_DOWNLOAD_FILE_NAME = "pacote_de_vozes.zip"
         const val RADIO_WRITER_DOWNLOAD_MAX_BYTES = 3000L * 1024L * 1024L
         const val RADIO_VOICE_DOWNLOAD_MAX_BYTES = 350L * 1024L * 1024L
+        const val DOWNLOAD_PROGRESS_STEP_BYTES = 2L * 1024L * 1024L
+        const val DOWNLOAD_PROGRESS_STEP_MS = 700L
         const val CORE_BUFFER_MANIFEST_FILE = "manifest.json"
         const val CLOUD_SCRIPT_BUFFER_MANIFEST_FILE = "cloud_script_buffer.json"
         // Pausa entre boletins consecutivos do preparo automatico pra deixar o SoC esfriar - ver
