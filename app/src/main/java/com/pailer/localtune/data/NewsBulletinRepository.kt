@@ -142,13 +142,13 @@ class NewsBulletinRepository(private val context: Context) {
 
     private companion object {
         const val NETWORK_TIMEOUT_MS = 4500
-        const val ITEMS_PER_FEED = 4
-        // 2 por feed - sobe junto com o numero de FEEDS abaixo (11 feeds x 2 = 22) pra cada
-        // categoria continuar garantindo espaco nas 2 primeiras rodadas do round-robin de
-        // interleave() em vez de so as primeiras da lista conseguirem uma 2a materia (pedido do
-        // usuario 04/09/2026, historico; reafirmado 10/09/2026 ao pedir mais variedade - ver
-        // ADR-021).
-        const val NEWS_LIMIT = 22
+        // O estoque combinado pode guardar 10 audios prontos + 20 roteiros Gemini. Com apenas
+        // ~22 materias carregadas, a deduplicacao entre esses buffers ficava matematicamente sem
+        // espaco e acabava escrevendo roteiro para noticia que ja tinha audio pronto. Buscamos uma
+        // janela bem maior por rodada: se faltar noticia nova, a solucao e ampliar fonte/janela,
+        // nao aceitar repeticao silenciosa.
+        const val ITEMS_PER_FEED = 12
+        const val NEWS_LIMIT = 80
         const val SUMMARY_MAX_CHARS = 220
 
         // 11 feeds (10/09/2026, pedido do usuario: "pelo menos 10 variedades... tirando futebol,

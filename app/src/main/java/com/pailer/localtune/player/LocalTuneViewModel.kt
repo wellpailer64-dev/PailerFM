@@ -74,6 +74,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.Normalizer
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.random.Random
@@ -352,6 +353,11 @@ private data class PreparedBulletin(
     val voiceFromGemini: Boolean = false,
 )
 
+private data class BulletinCandidateSelection(
+    val scripts: List<RadioScript>,
+    val inspectedCount: Int,
+)
+
 // Retorno de synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely - o `File?` sozinho ja existia,
 // so nao dizia QUAL motor produziu o audio (Gemini Flash TTS vs motor local), informacao que
 // PreparedBulletin precisam guardar pra bolinha verde/azul da UI.
@@ -393,6 +399,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var newsBulletins: List<RadioScript> = emptyList()
     private var bulletinReloadInFlight = false
     private var nextBulletinIndex = 0
+    private val recentBulletinStoryKeys = ArrayDeque<String>().apply {
+        radioPrefs.getString(KEY_RECENT_BULLETIN_STORY_KEYS, null)
+            ?.lineSequence()
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.take(RECENT_BULLETIN_STORY_KEY_LIMIT)
+            ?.forEach { addLast(it) }
+    }
     private var speakingNews = false
     private var currentNewsHeadline = ""
     private var resumeAfterNews = false
@@ -2805,11 +2819,62 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             settings.cloudWriterEnabled &&
             radioBulletinState.value.geminiConfigured
 
-    private fun takeUpcomingBaseScripts(count: Int): List<RadioScript> {
-        if (newsBulletins.isEmpty()) return emptyList()
-        return (0 until count).map { offset ->
-            newsBulletins[(nextBulletinIndex + offset) % newsBulletins.size]
+    private fun takeUpcomingBaseScriptSelection(count: Int): BulletinCandidateSelection {
+        if (newsBulletins.isEmpty()) return BulletinCandidateSelection(emptyList(), inspectedCount = 0)
+        val reservedKeys = currentReservedBulletinStoryKeys()
+        val selected = mutableListOf<RadioScript>()
+        var inspected = 0
+        while (inspected < newsBulletins.size && selected.size < count) {
+            val candidate = newsBulletins[(nextBulletinIndex + inspected) % newsBulletins.size]
+            val key = candidate.newsReservationKey()
+            if (key.isNotBlank() && key !in reservedKeys) {
+                selected += candidate
+                reservedKeys += key
+            }
+            inspected += 1
         }
+        if (selected.size < count) {
+            Log.d(
+                TAG_RADIO_VOICE,
+                "boletim: lote Gemini selecionou ${selected.size}/$count noticias novas apos inspecionar $inspected/${newsBulletins.size}; recarga RSS deve ampliar a janela",
+            )
+        }
+        return BulletinCandidateSelection(selected, inspected)
+    }
+
+    private fun currentReservedBulletinStoryKeys(): MutableSet<String> {
+        val reserved = recentBulletinStoryKeys.toMutableSet()
+        bulletinBuffer.forEach { item -> item.script.newsReservationKey().takeIf { it.isNotBlank() }?.let(reserved::add) }
+        cloudScriptBuffer.forEach { script -> script.newsReservationKey().takeIf { it.isNotBlank() }?.let(reserved::add) }
+        return reserved
+    }
+
+    private fun RadioScript.newsReservationKey(): String =
+        "${story.source.normalizedBulletinKeyPart()}|${story.title.normalizedBulletinKeyPart()}"
+
+    private fun String.normalizedBulletinKeyPart(): String {
+        val withoutArtifacts = replace(Regex("\\b(?:IMG|SI)_[\\p{Alnum}_-]+\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("\\bgettyimages-[a-z0-9-]+\\b", RegexOption.IGNORE_CASE), " ")
+        val withoutAccents = Normalizer.normalize(withoutArtifacts, Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "")
+        return withoutAccents
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun rememberRecentBulletinStory(script: RadioScript) {
+        val key = script.newsReservationKey()
+        if (key.isBlank()) return
+        while (recentBulletinStoryKeys.remove(key)) Unit
+        recentBulletinStoryKeys.addLast(key)
+        while (recentBulletinStoryKeys.size > RECENT_BULLETIN_STORY_KEY_LIMIT) {
+            recentBulletinStoryKeys.removeFirst()
+        }
+        radioPrefs.edit()
+            .putString(KEY_RECENT_BULLETIN_STORY_KEYS, recentBulletinStoryKeys.joinToString("\n"))
+            .apply()
     }
 
     private fun advanceBulletinIndex(consumed: Int) {
@@ -2832,8 +2897,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val freeSlots = (CLOUD_SCRIPT_BUFFER_TARGET - cloudScriptBuffer.size).coerceAtLeast(0)
             val batchSize = minOf(CLOUD_SCRIPT_BATCH_SIZE, freeSlots)
             if (batchSize <= 0) return
-            val candidates = takeUpcomingBaseScripts(batchSize)
-            if (candidates.isEmpty()) return
+            val selection = takeUpcomingBaseScriptSelection(batchSize)
+            val candidates = selection.scripts
+            if (candidates.isEmpty()) {
+                if (selection.inspectedCount > 0) advanceBulletinIndex(selection.inspectedCount)
+                reloadNewsBulletinsIfNeeded()
+                return
+            }
             val written = llmGenerationMutex.withLock {
                 bulletinRepository.prewriteCloudScripts(
                     scripts = candidates,
@@ -2844,8 +2914,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             if (written.isEmpty()) return
+            written.forEach(::rememberRecentBulletinStory)
             cloudScriptBuffer.addAll(written)
-            advanceBulletinIndex(candidates.size)
+            advanceBulletinIndex(selection.inspectedCount)
             saveCloudScriptBufferManifest()
             syncBulletinBufferState(statusMessage = null)
         }
@@ -2962,6 +3033,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         if (file == null) {
                             Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio; buffer guarda so o roteiro")
                         }
+                        rememberRecentBulletinStory(script)
                         bulletinBuffer.addLast(PreparedBulletin(script, file, scriptFromGemini = scriptFromGemini, voiceFromGemini = voiceFromGemini))
                         // Persiste AGORA que o item esta de verdade no buffer - sem isso, um
                         // processo morto logo depois (comum no Android, app em segundo plano)
@@ -3495,6 +3567,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val readyFile: File?
         if (prepared != null) {
             bulletin = prepared.script
+            rememberRecentBulletinStory(bulletin)
             readyFile = protectedReadyFile?.takeIf { it.exists() && it.length() > LocalRadioVoiceEngine.WAV_HEADER_SIZE }
             Log.d(
                 TAG_RADIO_VOICE,
@@ -3529,6 +3602,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             nextBulletinIndex += 1
             reloadNewsBulletinsIfCycleComplete()
             bulletin = baseBulletin.withPhilosophicalCloser()
+            rememberRecentBulletinStory(bulletin)
             readyFile = null
         }
 
@@ -4156,6 +4230,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_RADIO_BULLETIN_TTS_PROVIDER = "radio_bulletin_tts_provider"
         const val KEY_RADIO_BULLETIN_TTS_MODEL = "radio_bulletin_tts_model"
         const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
+        const val KEY_RECENT_BULLETIN_STORY_KEYS = "recent_bulletin_story_keys"
         const val RADIO_WRITER_DRIVE_FILE_ID = "1n_wXv28L61dGM0oH0DyhPKbi71VsBe8F"
         const val RADIO_VOICE_DRIVE_FILE_ID = "1kYRm3Yy4STSGwo_X-mHbuCdiBinnNPco"
         const val RADIO_WRITER_DOWNLOAD_FILE_NAME = "redator_local.zip"
@@ -4223,6 +4298,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val CLOUD_SCRIPT_BATCH_SIZE = 10
         const val CLOUD_SCRIPT_BUFFER_TARGET = 20
         const val CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD = 10
+        const val RECENT_BULLETIN_STORY_KEY_LIMIT = 80
 
         // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() (achado ao
         // vivo 10/09/2026) - maior que o pior caso ja observado de uma sintese em andamento (~90s
