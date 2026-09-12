@@ -96,6 +96,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -134,6 +135,7 @@ import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
@@ -225,6 +227,8 @@ import com.pailer.localtune.data.capitalizeGenreTag
 import com.pailer.localtune.data.joinGenreTags
 import com.pailer.localtune.data.splitGenreTags
 import com.pailer.localtune.player.LocalTuneViewModel
+import com.pailer.localtune.player.RemoteDeviceEntry
+import com.pailer.localtune.player.RemoteDeviceUiState
 import com.pailer.localtune.player.LyricsUiState
 import com.pailer.localtune.player.AlbumArtworkUiState
 import com.pailer.localtune.player.ArtistPhotoUiState
@@ -739,6 +743,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         viewModel.loadArtistNewsIfNeeded(favoriteArtists)
                     },
                     hasNewNews = hasNewArtistNews,
+                    remoteDeviceState = viewModel.remoteDeviceState.value,
+                    onScanRemote = viewModel::scanForRemoteDevices,
+                    onStopScanRemote = viewModel::stopScanningRemoteDevices,
+                    onConnectRemote = viewModel::connectToRemoteDevice,
+                    onDisconnectRemote = viewModel::disconnectRemote,
                     // Pedido do usuario (10/09/2026): busca só faz sentido em Biblioteca/Rádio -
                     // a aba Início não tem lista pra filtrar, então a barra sumia sem função. Logo
                     // centraliza sozinha quando a busca some (ver LibraryHeader).
@@ -1303,6 +1312,11 @@ private fun LibraryHeader(
     onSettings: () -> Unit,
     onNews: () -> Unit,
     hasNewNews: Boolean,
+    remoteDeviceState: RemoteDeviceUiState,
+    onScanRemote: () -> Unit,
+    onStopScanRemote: () -> Unit,
+    onConnectRemote: (RemoteDeviceEntry) -> Unit,
+    onDisconnectRemote: () -> Unit,
     showSearch: Boolean = true,
 ) {
     Column(
@@ -1360,7 +1374,15 @@ private fun LibraryHeader(
             } else {
                 Spacer(Modifier.weight(1f))
             }
-            Spacer(Modifier.width(6.dp))
+            Spacer(Modifier.width(10.dp))
+            HeaderCastButton(
+                state = remoteDeviceState,
+                onScan = onScanRemote,
+                onStopScan = onStopScanRemote,
+                onConnect = onConnectRemote,
+                onDisconnect = onDisconnectRemote,
+            )
+            Spacer(Modifier.width(14.dp))
             HeaderNewsButton(onNews = onNews, hasNewNews = hasNewNews)
         }
     }
@@ -1418,6 +1440,130 @@ private fun HeaderNewsButton(onNews: () -> Unit, hasNewNews: Boolean, modifier: 
                         .background(PailerRed),
                 )
             }
+        }
+    }
+}
+
+// Botao unico de "transmitir pra TV" - lista Google Cast (Chromecast/Google TV, via MediaRouter
+// direto, ver LocalTuneViewModel.scanForRemoteDevices) e UPnP/DLNA (TVs que nao falam Cast de
+// verdade, ex.: LG webOS testada em 12/09/2026, so via SSDP) juntos no mesmo seletor - pedido do
+// usuario (12/09/2026): "um so icone, as duas funcoes la dentro".
+@Composable
+private fun HeaderCastButton(
+    state: RemoteDeviceUiState,
+    onScan: () -> Unit,
+    onStopScan: () -> Unit,
+    onConnect: (RemoteDeviceEntry) -> Unit,
+    onDisconnect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var showSheet by remember { mutableStateOf(false) }
+    if (Build.VERSION.SDK_INT >= 33) {
+        var hasNearbyPermission by remember {
+            mutableStateOf(
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.NEARBY_WIFI_DEVICES,
+                ) == PackageManager.PERMISSION_GRANTED,
+            )
+        }
+        val nearbyPermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted -> hasNearbyPermission = granted }
+        LaunchedEffect(hasNearbyPermission) {
+            if (!hasNearbyPermission) {
+                nearbyPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }
+    }
+    IconButton(
+        onClick = {
+            showSheet = true
+            onScan()
+        },
+        modifier = modifier.size(30.dp),
+    ) {
+        Icon(
+            Icons.Filled.Cast,
+            contentDescription = "Transmitir pra TV",
+            tint = if (state.connectedLabel != null) PailerRed else Color.White.copy(alpha = 0.92f),
+            modifier = Modifier.size(20.dp),
+        )
+    }
+    if (showSheet) {
+        RemoteDeviceSheet(
+            state = state,
+            onConnect = { entry -> onConnect(entry); showSheet = false },
+            onDisconnect = { onDisconnect(); showSheet = false },
+            onDismiss = {
+                showSheet = false
+                onStopScan()
+            },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RemoteDeviceSheet(
+    state: RemoteDeviceUiState,
+    onConnect: (RemoteDeviceEntry) -> Unit,
+    onDisconnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = PailerSurface,
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Text(
+                    text = "Transmitir para TV",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "Chromecast, Google TV ou TVs UPnP na sua rede Wi-Fi",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            if (state.connectedLabel != null) {
+                ActionSheetRow(
+                    icon = Icons.Filled.Close,
+                    label = "Desconectar de ${state.connectedLabel}",
+                    tint = MaterialTheme.colorScheme.error,
+                    onClick = onDisconnect,
+                )
+                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            }
+            when {
+                state.devices.isEmpty() && state.isScanning -> Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(color = PailerRed)
+                }
+                state.devices.isEmpty() -> Text(
+                    text = "Nenhuma TV encontrada na rede Wi-Fi.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(16.dp),
+                )
+                else -> state.devices.forEach { entry ->
+                    ActionSheetRow(
+                        icon = Icons.Filled.Tv,
+                        label = entry.label,
+                        onClick = { onConnect(entry) },
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
         }
     }
 }

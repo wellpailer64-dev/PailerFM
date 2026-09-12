@@ -25,9 +25,21 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import androidx.mediarouter.media.MediaRouteSelector
+import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.CastMediaControlIntent
+import com.google.android.gms.cast.framework.CastContext
+import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManagerListener
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import com.pailer.localtune.R
+import com.pailer.localtune.cast.CastMediaHttpServer
+import com.pailer.localtune.cast.LocalWifiAddress
+import com.pailer.localtune.dlna.DlnaDevice
+import com.pailer.localtune.dlna.DlnaPlaybackBridge
+import com.pailer.localtune.dlna.SsdpDiscovery
+import com.pailer.localtune.player.cast.CastPlaybackBridge
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.AppFolderRepository
@@ -132,6 +144,24 @@ data class PlayerUiState(
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
     val queueIndex: Int = 0,
     val queueSize: Int = 0,
+)
+
+// Um unico botao/seletor pra "transmitir pra TV" (ver HeaderCastButton em LocalTuneApp.kt) que
+// lista os dois tipos de dispositivo juntos - Google Cast (Chromecast/Google TV) e UPnP/DLNA
+// (TVs que nao falam Cast de verdade, ex.: LG webOS testada em 12/09/2026).
+sealed class RemoteDeviceEntry {
+    abstract val label: String
+
+    data class Cast(val routeId: String, override val label: String) : RemoteDeviceEntry()
+    data class Dlna(val device: DlnaDevice) : RemoteDeviceEntry() {
+        override val label: String get() = device.friendlyName
+    }
+}
+
+data class RemoteDeviceUiState(
+    val isScanning: Boolean = false,
+    val devices: List<RemoteDeviceEntry> = emptyList(),
+    val connectedLabel: String? = null,
 )
 
 // Retorno de LocalTuneViewModel.dislikeCurrentRadioSong() - so preenchido quando a faixa
@@ -383,6 +413,47 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val profilePrefs = application.getSharedPreferences("user_profile", Context.MODE_PRIVATE)
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
+    // Cast pra TV: o controller local (ExoPlayer/MediaController) continua tocando NORMALMENTE
+    // (so mudo) enquanto uma sessao remota (Google Cast OU DLNA/UPnP - ver RemotePlaybackBridge)
+    // estiver conectada - ele continua sendo a unica fonte de verdade de fila/posicao/
+    // proximo-anterior de sempre. remoteBridge so ESPELHA (ver mirrorToRemoteIfNeeded, chamado em
+    // playerListener.onEvents): toda vez que o controller local troca de faixa ou muda play/pause,
+    // manda o mesmo comando pro destino remoto. Isso evita duplicar toda a logica de fila/radio so
+    // pra falar com Cast/DLNA - ver docs/DECISIONS.md ADR-009 (motivo de nao arriscar reescrever o
+    // caminho local de reproducao). DLNA existe porque nem toda "TV com cast" fala o protocolo
+    // Google Cast de verdade (ex.: LG webOS testada em 12/09/2026 so respondia via UPnP).
+    private var remoteHttpServer: CastMediaHttpServer? = null
+    private var remoteBridge: RemotePlaybackBridge? = null
+    private var remoteHttpBaseUrl: String? = null
+    private var remoteMirroredMediaId: String? = null
+    private var remoteMirroredIsPlaying: Boolean? = null
+    var remoteDeviceState = androidx.compose.runtime.mutableStateOf(RemoteDeviceUiState())
+        private set
+    private val mediaRouter: MediaRouter by lazy { MediaRouter.getInstance(getApplication()) }
+    private val castRouteSelector: MediaRouteSelector by lazy {
+        MediaRouteSelector.Builder()
+            .addControlCategory(CastMediaControlIntent.categoryForCast(CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID))
+            .build()
+    }
+    // So atualiza a lista quando o MediaRouter avisa de uma mudanca (rota Cast apareceu/sumiu/
+    // mudou) - a descoberta em si (buscar na rede) e ligada/desligada por scanForRemoteDevices()/
+    // stopScanningRemoteDevices() via CALLBACK_FLAG_REQUEST_DISCOVERY, nao aqui.
+    private val mediaRouterCallback = object : MediaRouter.Callback() {
+        override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) = refreshCastRouteEntries()
+        override fun onRouteRemoved(router: MediaRouter, route: MediaRouter.RouteInfo) = refreshCastRouteEntries()
+        override fun onRouteChanged(router: MediaRouter, route: MediaRouter.RouteInfo) = refreshCastRouteEntries()
+    }
+    private val castSessionManagerListener = object : SessionManagerListener<CastSession> {
+        override fun onSessionStarted(session: CastSession, sessionId: String) = onCastSessionActive(session)
+        override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) = onCastSessionActive(session)
+        override fun onSessionEnding(session: CastSession) = Unit
+        override fun onSessionEnded(session: CastSession, error: Int) = onCastSessionInactive()
+        override fun onSessionSuspended(session: CastSession, reason: Int) = Unit
+        override fun onSessionStarting(session: CastSession) = Unit
+        override fun onSessionStartFailed(session: CastSession, error: Int) = Unit
+        override fun onSessionResuming(session: CastSession, sessionId: String) = Unit
+        override fun onSessionResumeFailed(session: CastSession, error: Int) = Unit
+    }
     private var textToSpeech: TextToSpeech? = null
     private var ttsReady = false
     private var ttsRequested = false
@@ -653,6 +724,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         override fun onEvents(player: Player, events: Player.Events) {
             updatePlayerState(player)
             if (player.isPlaying) recordCurrentSong(player)
+            mirrorToRemoteIfNeeded(player)
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -673,6 +745,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         connectToPlaybackService()
+        runCatching {
+            CastContext.getSharedInstance(application).sessionManager
+                .addSessionManagerListener(castSessionManagerListener, CastSession::class.java)
+        }
         viewModelScope.launch {
             while (true) {
                 controller?.let {
@@ -4092,6 +4168,164 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         startRadioNewsMode(stationName)
     }
 
+    // Conectou/retomou uma sessao de Cast (usuario escolheu uma rota Cast em connectToRemoteDevice,
+    // que chama mediaRouter.selectRoute - isso e o que dispara isso aqui de volta, de forma
+    // assincrona, atraves do SDK do Cast).
+    private fun onCastSessionActive(session: CastSession) {
+        val remoteMediaClient = session.remoteMediaClient ?: return
+        startRemoteSession(CastPlaybackBridge(remoteMediaClient))
+        remoteDeviceState.value = remoteDeviceState.value.copy(
+            connectedLabel = session.castDevice?.friendlyName ?: "TV",
+        )
+    }
+
+    // Sessao de Cast terminou (usuario desconectou ou a TV caiu). So encerra a sessao remota se
+    // quem estiver ativo agora for mesmo essa sessao de Cast - se o usuario ja trocou pra DLNA
+    // entre o Cast conectar e desconectar, endRemoteSession() ja rodou na hora da troca
+    // (startRemoteSession sempre encerra o que tinha antes) e essa notificacao chegando depois
+    // e so um eco tardio do SDK do Cast, nao deve derrubar a sessao DLNA que esta ativa agora.
+    private fun onCastSessionInactive() {
+        if (remoteBridge is CastPlaybackBridge) {
+            endRemoteSession()
+            remoteDeviceState.value = remoteDeviceState.value.copy(connectedLabel = null)
+        }
+    }
+
+    // Chamado quando o botao unico de "transmitir pra TV" (HeaderCastButton) abre o seletor -
+    // liga a descoberta dos dois protocolos ao mesmo tempo: rotas Cast (MediaRouter, atualiza
+    // sozinho via mediaRouterCallback) e um scan SSDP pontual de dispositivos UPnP.
+    fun scanForRemoteDevices() {
+        if (remoteDeviceState.value.isScanning) return
+        mediaRouter.addCallback(castRouteSelector, mediaRouterCallback, MediaRouter.CALLBACK_FLAG_REQUEST_DISCOVERY)
+        remoteDeviceState.value = remoteDeviceState.value.copy(isScanning = true, devices = currentCastRouteEntries())
+        viewModelScope.launch {
+            val dlnaDevices = runCatching { SsdpDiscovery.discover(getApplication()) }.getOrDefault(emptyList())
+            remoteDeviceState.value = remoteDeviceState.value.copy(
+                isScanning = false,
+                devices = currentCastRouteEntries() + dlnaDevices.map { RemoteDeviceEntry.Dlna(it) },
+            )
+        }
+    }
+
+    // Seletor fechou - para de gastar bateria/rede escutando rotas Cast novas (o SSDP ja e
+    // pontual, termina sozinho).
+    fun stopScanningRemoteDevices() {
+        mediaRouter.removeCallback(mediaRouterCallback)
+    }
+
+    private fun currentCastRouteEntries(): List<RemoteDeviceEntry.Cast> =
+        mediaRouter.routes
+            .filter { !it.isDefault && it.matchesSelector(castRouteSelector) }
+            .map { RemoteDeviceEntry.Cast(routeId = it.id, label = it.name) }
+
+    private fun refreshCastRouteEntries() {
+        val dlnaEntries = remoteDeviceState.value.devices.filterIsInstance<RemoteDeviceEntry.Dlna>()
+        remoteDeviceState.value = remoteDeviceState.value.copy(devices = currentCastRouteEntries() + dlnaEntries)
+    }
+
+    fun connectToRemoteDevice(entry: RemoteDeviceEntry) {
+        when (entry) {
+            is RemoteDeviceEntry.Cast -> {
+                val route = mediaRouter.routes.firstOrNull { it.id == entry.routeId } ?: return
+                mediaRouter.selectRoute(route)
+            }
+            is RemoteDeviceEntry.Dlna -> {
+                if (remoteBridge is CastPlaybackBridge) {
+                    runCatching {
+                        CastContext.getSharedInstance(getApplication()).sessionManager.endCurrentSession(true)
+                    }
+                }
+                startRemoteSession(DlnaPlaybackBridge(entry.device.controlUrl))
+                remoteDeviceState.value = remoteDeviceState.value.copy(connectedLabel = entry.device.friendlyName)
+            }
+        }
+    }
+
+    fun disconnectRemote() {
+        if (remoteDeviceState.value.connectedLabel == null) return
+        if (remoteBridge is CastPlaybackBridge) {
+            runCatching { CastContext.getSharedInstance(getApplication()).sessionManager.endCurrentSession(true) }
+        } else {
+            endRemoteSession()
+        }
+        remoteDeviceState.value = remoteDeviceState.value.copy(connectedLabel = null)
+    }
+
+    // Conectou numa TV (Cast OU DLNA, ver acima): silencia o controller local (continua tocando
+    // de verdade, so mudo - ver comentario de remoteHttpServer acima) e sobe o servidor HTTP local
+    // que serve os arquivos de musica (content:// do MediaStore) pra TV alcancar via rede Wi-Fi.
+    // Sempre encerra qualquer sessao remota anterior primeiro (Cast OU DLNA) - so uma de cada vez.
+    private fun startRemoteSession(bridge: RemotePlaybackBridge) {
+        endRemoteSession()
+        val context = getApplication<Application>()
+        val wifiAddress = LocalWifiAddress.find(context)
+        if (wifiAddress == null) {
+            showToast("Conecte o celular numa rede Wi-Fi pra transmitir pra TV.")
+            bridge.release()
+            return
+        }
+        val server = CastMediaHttpServer(context, java.util.UUID.randomUUID().toString())
+        if (!runCatching { server.start() }.isSuccess) {
+            showToast("Nao consegui iniciar o servidor local pra transmitir pra TV.")
+            bridge.release()
+            return
+        }
+        remoteHttpServer = server
+        remoteHttpBaseUrl = "http://${wifiAddress.hostAddress}:${server.listeningPort}"
+        remoteBridge = bridge
+        remoteMirroredMediaId = null
+        remoteMirroredIsPlaying = null
+        controller?.volume = 0f
+        controller?.let { mirrorToRemoteIfNeeded(it) }
+    }
+
+    // Sessao remota terminou (Cast desconectou ou DLNA foi desconectado pelo usuario) - desliga o
+    // servidor local e devolve o audio pro alto-falante do celular de onde a fila/posicao ja
+    // estao (o controller local NUNCA parou de tocar, so estava mudo - ver comentario acima).
+    private fun endRemoteSession() {
+        remoteBridge?.release()
+        remoteBridge = null
+        remoteHttpServer?.stop()
+        remoteHttpServer = null
+        remoteHttpBaseUrl = null
+        remoteMirroredMediaId = null
+        remoteMirroredIsPlaying = null
+        controller?.volume = radioVolume()
+    }
+
+    // So espelha (nunca decide sozinho) - controller local continua sendo a unica fonte de
+    // verdade. Troca de faixa: registra o arquivo no servidor local e manda a TV (Cast ou DLNA)
+    // carregar essa URL. Play/pause: repassa. Ver comentario de remoteHttpServer acima.
+    private fun mirrorToRemoteIfNeeded(player: Player) {
+        val bridge = remoteBridge ?: return
+        val server = remoteHttpServer ?: return
+        val baseUrl = remoteHttpBaseUrl ?: return
+        val mediaId = player.currentMediaItem?.mediaId
+        if (mediaId != remoteMirroredMediaId) {
+            remoteMirroredMediaId = mediaId
+            remoteMirroredIsPlaying = null
+            val mediaItem = player.currentMediaItem
+            val songUri = mediaItem?.localConfiguration?.uri
+            if (mediaItem != null && songUri != null) {
+                val token = server.registerSong(songUri)
+                bridge.playUrl(
+                    url = "$baseUrl${server.pathFor(token)}",
+                    mimeType = getApplication<Application>().contentResolver.getType(songUri) ?: "audio/*",
+                    title = mediaItem.mediaMetadata.title?.toString().orEmpty(),
+                    artist = mediaItem.mediaMetadata.artist?.toString().orEmpty(),
+                    startPositionMs = player.currentPosition.coerceAtLeast(0L),
+                    autoplay = player.isPlaying,
+                )
+                remoteMirroredIsPlaying = player.isPlaying
+            }
+            return
+        }
+        if (player.isPlaying != remoteMirroredIsPlaying) {
+            remoteMirroredIsPlaying = player.isPlaying
+            if (player.isPlaying) bridge.resume() else bridge.pause()
+        }
+    }
+
     private fun updatePlayerState(player: Player) {
         val metadata = player.currentMediaItem?.mediaMetadata
         val duration = player.duration.takeIf { it != C.TIME_UNSET } ?: 0L
@@ -4202,6 +4436,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         favoritePrefs.getStringSet(KEY_FAVORITE_ARTISTS, emptySet())?.toSet() ?: emptySet()
 
     override fun onCleared() {
+        runCatching {
+            CastContext.getSharedInstance(getApplication()).sessionManager
+                .removeSessionManagerListener(castSessionManagerListener, CastSession::class.java)
+        }
+        endRemoteSession()
         controller?.removeListener(playerListener)
         controllerFuture?.let(MediaController::releaseFuture)
         announcementPlayer?.release()

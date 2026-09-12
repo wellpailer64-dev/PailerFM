@@ -1297,3 +1297,96 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   pronto e será usado". Qualquer fallback para TTS Android nesse caminho precisa ser
   uma decisão explícita de produto, não um efeito colateral de limpeza, erro silencioso
   ou arquivo transitório fora do manifest.
+
+## ADR-026 — Cast pra TV (Google Cast + DLNA/UPnP), um único botão
+
+- **Contexto:** pedido do usuário (12/09/2026) de um botão de "transmitir pra TV" igual
+  ao que ele viu em outro app de música. Investigação mostrou que a TV dele (LG webOS)
+  **não fala o protocolo Google Cast** — outro app instalado (Symfonik) só conseguiu
+  conectar nela via **UPnP/DLNA**, um protocolo bem mais antigo e completamente
+  diferente (SSDP multicast pra descoberta, SOAP/AVTransport pra controle). Decisão do
+  usuário: implementar os dois, sob um único ícone (não dois botões separados).
+- **Arquitetura escolhida — espelhar, não reescrever a fila:** `controller` (ExoPlayer/
+  MediaController local) continua tocando NORMALMENTE (só com `volume = 0f`) enquanto
+  uma sessão remota está conectada — ele nunca pausa e continua sendo a única fonte de
+  verdade de fila/posição/próxima-anterior/rádio/boletim, exatamente como sem Cast. Um
+  `RemotePlaybackBridge` (interface comum a `CastPlaybackBridge` e `DlnaPlaybackBridge`)
+  só ESPELHA: a cada `onEvents` do player local, `mirrorToRemoteIfNeeded()` (
+  `LocalTuneViewModel.kt`) detecta troca de faixa ou play/pause e repassa pro destino
+  remoto. Motivo: a lógica de fila/rádio/boletim já é complexa e tem um bug histórico
+  não resolvido (ver ADR-009, "player para sozinho depois de algumas músicas") — reescrever
+  esse caminho pra depender de Cast/DLNA arriscava reintroduzir ou mascarar esse bug.
+  Essa escolha também descartou usar `androidx.media3:media3-cast` (`CastPlayer`), que
+  modela Cast como um `Player`/timeline único e não encaixa no modelo de 2 canais
+  (música + boletim) já existente.
+- **Servidor HTTP local (`cast/CastMediaHttpServer.kt`, NanoHTTPD):** tanto o receptor
+  Cast quanto qualquer renderizador DLNA só sabem tocar mídia de uma URL HTTP — nunca um
+  `content://` do próprio celular. O servidor serve os arquivos de música (`content://`
+  do MediaStore) com suporte a `Range`, numa porta efêmera, com um token aleatório por
+  sessão na própria URL (ofuscação por sessão, não autenticação de verdade). Roda no
+  processo do app (mesmo processo do `MusicPlaybackService`, não precisou de IPC).
+- **Três bugs de rede encontrados só testando no aparelho de verdade** (nenhum aparecia
+  em teoria/compilação — todos silenciosos, sem exceção nenhuma até serem investigados):
+  1. **Tema não-AppCompat quebra o `MediaRouteButton`:** `MediaRouterThemeHelper` calcula
+     contraste usando o atributo `colorPrimary` do **AppCompat** (não `android:colorPrimary`)
+     — como `AppTheme` (`res/values/styles.xml`) herdava de `android:style/Theme.Material.
+     NoActionBar` (tema puro, sem AppCompat), esse atributo nunca existia e resolvia pra
+     `0` (transparente), estourando `IllegalArgumentException` já na construção do botão.
+     Depois disso, o próprio diálogo de seleção de dispositivo (`MediaRouteChooserDialog`)
+     é um `AppCompatDialog` e falha do mesmo jeito ("You need to use a Theme.AppCompat
+     theme") se o tema do app não descender de `Theme.AppCompat`. Resolvido trocando o
+     `parent` de `AppTheme` pra `Theme.AppCompat.NoActionBar` (zero mudança visual — a UI é
+     toda Compose, com seu próprio `MaterialTheme`) e adicionando `colorPrimary`/
+     `android:colorBackground` explícitos. `MainActivity` também precisou virar
+     `FragmentActivity` (em vez de `ComponentActivity` puro) porque esses diálogos exigem
+     suporte a `Fragment`.
+  2. **Wi-Fi + dados móveis ativos ao mesmo tempo:** tanto a URL do servidor HTTP local
+     quanto a descoberta SSDP (`SsdpDiscovery.kt`) precisam sair especificamente pela
+     interface Wi-Fi, nunca pela rede de dados móveis — mas o Android não roteia
+     automaticamente por Wi-Fi só porque ela está conectada, se dados móveis também
+     estiverem ativos. Sem vincular explicitamente o socket à rede Wi-Fi
+     (`Network.bindSocket`, ver `LocalWifiAddress.findWifiNetwork`/
+     `findWifiNetworkInterface`), a descoberta simplesmente não achava nada, **sem
+     nenhum erro** — parecia funcionar (nenhuma exceção) mas nunca recebia resposta.
+  3. **Cleartext HTTP bloqueado por padrão:** UPnP (descrição do dispositivo e comandos
+     SOAP/AVTransport) é inteiramente HTTP puro, nunca HTTPS. A partir do Android 9,
+     `usesCleartextTraffic` é `false` por padrão e qualquer chamada assim falha com
+     `CLEARTEXT communication not permitted`. Resolvido com
+     `android:usesCleartextTraffic="true"` no `<application>` (não afeta o resto do app,
+     que já falava HTTPS com APIs externas). Isso NÃO afeta o servidor HTTP local em si
+     (ele é o lado que RECEBE conexões — a restrição é só sobre chamadas HTTP feitas
+     pelo próprio app).
+- **Descoberta SSDP (`dlna/SsdpDiscovery.kt`):** `MulticastSocket` na porta 1900,
+  vinculado à rede Wi-Fi e à interface de rede Wi-Fi (`joinGroup(SocketAddress,
+  NetworkInterface)`, não só `send()` pro grupo — sem entrar de verdade no grupo
+  multicast, respostas que o dispositivo manda via multicast em vez de unicast nunca
+  chegam). Busca por `ST: ssdp:all` (não um tipo de serviço específico) porque nem todo
+  dispositivo responde a buscas por serviço específico — filtra por AVTransport depois,
+  lendo a descrição XML de cada dispositivo. M-SEARCH é reenviado a cada ~1.2s durante
+  uma janela de 6s (UDP não garante entrega). A busca do XML de descrição de cada
+  dispositivo (`fetchDeviceDescription`, com `HttpURLConnection` + timeout de 2s
+  explícito) acontece **depois** do loop de recebimento, nunca durante — uma primeira
+  versão sem esse timeout travava o recebimento de pacotes seguintes por muito mais que
+  o tempo pretendido quando um dispositivo respondia com uma `LOCATION` lenta/
+  inalcançável (aconteceu com o roteador da casa, que respondeu com um endereço IPv6 que
+  o celular não roteava de verdade).
+- **UI unificada (`HeaderCastButton`/`RemoteDeviceSheet` em `LocalTuneApp.kt`):** um único
+  ícone (pedido explícito do usuário — "um só ícone, as duas funções lá dentro") abre
+  uma bottom sheet que lista rotas Cast (via `androidx.mediarouter.media.MediaRouter`
+  direto, não o `MediaRouteButton` padrão — que só mostra Cast, não dá pra combinar com
+  DLNA) e dispositivos DLNA (SSDP) juntos. `MediaRouter.selectRoute()` numa rota Cast
+  dispara a sessão normalmente, capturada pelo `SessionManagerListener` já existente.
+- **Limitação conhecida, não resolvida:** mesmo com os 3 bugs de rede acima corrigidos
+  (confirmados via `adb logcat` no aparelho: descoberta achou e conectou no PC do usuário
+  via UPnP, e o seletor de Cast abre e busca normalmente), a **TV LG webOS específica do
+  usuário nunca respondeu** à nossa busca SSDP em nenhum teste, embora o app Symfonik
+  ache essa mesma TV sem nenhuma configuração extra nela. Causa raiz não identificada -
+  provavelmente exigiria uma captura de pacotes de verdade (Wireshark na mesma rede) pra
+  diagnosticar com certeza. Decisão do usuário (12/09/2026): aceitar como limitação
+  conhecida por ora em vez de continuar investigando às cegas.
+- **Não mudar sem:** manter o `controller` local como única fonte de verdade (nunca
+  fazer `CastPlaybackBridge`/`DlnaPlaybackBridge` decidir fila/próxima-faixa/rádio por
+  conta própria) — é essa escolha que mantém o Cast/DLNA sem risco pro bug do ADR-009.
+  Se essa TV LG específica (ou outra) precisar ser diagnosticada de verdade, comece por
+  uma captura de pacotes SSDP na mesma rede em vez de tentar mais variações de código às
+  cegas.

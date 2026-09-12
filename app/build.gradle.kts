@@ -140,6 +140,17 @@ dependencies {
     implementation("androidx.media3:media3-session:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
 
+    // Cast pra TV (Chromecast/Google TV) - receptor padrao do Google, sem app de TV proprio.
+    implementation("com.google.android.gms:play-services-cast-framework:21.5.0")
+    implementation("androidx.mediarouter:mediarouter:1.7.0")
+    implementation("org.nanohttpd:nanohttpd:2.3.1")
+    // O dialogo de selecao de dispositivo do Cast (MediaRouteButton/CastButtonFactory) exige uma
+    // FragmentActivity - MainActivity precisou trocar de ComponentActivity puro pra isso.
+    implementation("androidx.fragment:fragment-ktx:1.8.1")
+    // MediaRouteChooserDialog e um AppCompatDialog - exige que o tema do app herde de
+    // Theme.AppCompat (ver AppTheme em styles.xml), senao quebra ao abrir o seletor de Cast.
+    implementation("androidx.appcompat:appcompat:1.7.0")
+
     implementation("io.coil-kt:coil-compose:2.6.0")
     implementation("io.coil-kt:coil-gif:2.6.0")
 

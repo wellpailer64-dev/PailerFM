@@ -1,10 +1,23 @@
 <resources>
-    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+    <!-- Precisou trocar de android:style/Theme.Material.NoActionBar pra Theme.AppCompat.NoActionBar
+         (nao muda nada visualmente - a UI e toda Compose, com seu proprio MaterialTheme) porque o
+         dialogo de selecao de dispositivo do Cast (MediaRouteChooserDialog) e um AppCompatDialog e
+         quebra com "You need to use a Theme.AppCompat theme (or descendant) with this activity" em
+         qualquer outro tema. Usada a variante sem DayNight de proposito - o app e sempre escuro,
+         nao segue o tema claro/escuro do sistema (ver windowLightStatusBar abaixo). -->
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowNoTitle">true</item>
         <item name="android:fontFamily">sans</item>
         <item name="android:windowActionBar">false</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:navigationBarColor">@color/lt_black</item>
         <item name="android:statusBarColor">@color/lt_black</item>
+        <item name="android:colorBackground">@color/lt_black</item>
+        <!-- MediaRouterThemeHelper.getControllerColor calcula contraste contra colorPrimary pra
+             decidir a cor/tema do dialogo e do icone de Cast - preto combina com o header escuro. -->
+        <item name="colorPrimary">@color/lt_black</item>
+        <!-- Cor do icone do MediaRouteButton (botao de Cast) - branco pra combinar com os
+             outros icones do header (sino, menu) sobre o fundo escuro. -->
+        <item name="mediaRouteButtonTint">@android:color/white</item>
     </style>
 </resources>
