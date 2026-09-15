@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Expoe so a pasta usada por buildAlbumZip() (LocalTuneApp.kt) - nada mais do cache/arquivos
+     do app fica acessivel via FileProvider. -->
+<paths>
+    <cache-path name="shared_zips" path="shared_zips/" />
+</paths>

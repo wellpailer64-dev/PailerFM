@@ -36,6 +36,18 @@ em sequência a cada uso (`nextPassagemIndex`/`PASSAGEM_RESOURCES` em
 `LocalTuneViewModel.kt`, `playPassagem()`), volume reduzido em -8dB
 (`PASSAGEM_VOLUME`). Não são por gênero de rádio como as vinhetas acima.
 
+`passagem 3.mp3` foi reprocessada em 15/09/2026 (fonte tocava ~7dB mais baixo que as
+outras duas) — se for regravada, remedir o volume antes de decidir se precisa do mesmo
+tratamento, ver ADR-027 em [docs/DECISIONS.md](../docs/DECISIONS.md).
+
+## Vinhetas de despedida (sair da rádio)
+
+`vinheta_tchauzinho.mp3`/`vinheta_ate_mais.mp3` em `res/raw` (fonte: `tchauzinho_1.mp3`/
+`até mais edited.mp3` aqui) — tocam ao sair de uma rádio pelo botão "Sair da rádio",
+alternando em sequência a cada uso (`nextExitVinhetaIndex`/`EXIT_VINHETA_RESOURCES` em
+`LocalTuneViewModel.kt`, `playExitVinheta()`), volume cheio (1.0, igual à intro). Ver
+ADR-027 em [docs/DECISIONS.md](../docs/DECISIONS.md).
+
 Pra adicionar/trocar uma vinheta: solte o `.wav`/`.mp3` aqui de novo com um nome
 descritivo e avise — eu movo para `res/raw` (nome de arquivo vira minúsculo,
 `snake_case`, sem espaço/acento) e atualizo o mapa `VINHETA_BY_RADIO_KEY` no

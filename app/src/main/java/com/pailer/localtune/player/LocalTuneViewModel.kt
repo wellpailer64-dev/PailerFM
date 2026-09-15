@@ -145,6 +145,9 @@ data class PlayerUiState(
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
     val queueIndex: Int = 0,
     val queueSize: Int = 0,
+    // Aviso "voce ainda esta ai?" do timer de inatividade da radio (ver armSleepTimer/
+    // triggerSleepCheck em LocalTuneViewModel) - true mostra o dialogo em LocalTuneApp.kt.
+    val sleepCheckPending: Boolean = false,
 )
 
 // Um unico botao/seletor pra "transmitir pra TV" (ver HeaderCastButton em LocalTuneApp.kt) que
@@ -493,6 +496,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // Alterna entre as duas passagens curtas (musica > passagem > boletim > passagem > musica) -
     // ver playPassagem(). Incrementa a cada uso, nao reseta entre boletins.
     private var nextPassagemIndex = 0
+    // Alterna entre as vinhetas de despedida (tchauzinho/ate mais) ao sair de uma radio - ver
+    // playExitVinheta()/EXIT_VINHETA_RESOURCES. Incrementa a cada uso, nao reseta entre sessoes.
+    private var nextExitVinhetaIndex = 0
+    // Timer "voce ainda esta ai?" (pedido do usuario 15/09/2026): sleepTimerJob dispara o aviso
+    // depois de SLEEP_TIMER_IDLE_MS (1h30) tocando a mesma sessao de radio; sleepAutoStopJob
+    // conta SLEEP_TIMER_RESPONSE_MS (1min) a partir do aviso e desliga a radio sozinha
+    // (stopRadio()) se ninguem confirmar - motivo: usuario dorme com a radio ligada e ela fica
+    // gastando boletim/sintese de voz a noite toda sem ninguem escutando. Ver armSleepTimer/
+    // triggerSleepCheck/confirmStillListening/cancelSleepTimer.
+    private var sleepTimerJob: Job? = null
+    private var sleepAutoStopJob: Job? = null
+    private var sleepCheckPending = false
     // Guarda de reentrancia de finishNewsBreak(): agora ela dispara a passagem final e so
     // zera speakingNews no fim disso (pra manter o watchdog cobrindo a passagem), entao o
     // guard antigo (`if (!speakingNews) return`) sozinho nao bastava mais - uma segunda
@@ -730,6 +745,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (radioNewsEnabled && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                // Heuristica de afinidade da radio (ADR-028) - lastRecordedMediaId ainda e a
+                // faixa que ACABOU de tocar aqui (recordCurrentSong so atualiza pra faixa nova
+                // no onEvents seguinte, que roda depois deste callback especifico). So conta
+                // faixa que terminou sozinha (reason AUTO) - pular manualmente ou deslikar nao
+                // some pra afinidade.
+                lastRecordedMediaId?.toLongOrNull()?.let(repository::recordRadioPlayThrough)
                 completedRadioSongs += 1
                 val interval = radioBulletinState.value.settings.songsBetweenBulletins.coerceAtLeast(1)
                 if (completedRadioSongs % interval == 0) {
@@ -2790,13 +2811,73 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // "Sair da radio" - ao contrario de so fechar a tela (que deixa a radio tocando em
     // segundo plano, ver openActiveRadio em LocalTuneApp.kt), isso para a reproducao de
     // verdade e esvazia a fila: mediaItemCount some, hasMedia fica false, mini player some.
+    // Toca uma vinheta de despedida por cima (tchauzinho/ate mais, alternando - pedido do
+    // usuario 15/09/2026) antes de esvaziar a fila de verdade.
     fun stopRadio() {
+        val hadRadio = activeRadioName.isNotBlank()
         stopRadioNewsMode()
         playbackSource = ""
-        controller?.apply {
-            stop()
-            clearMediaItems()
+        controller?.pause()
+        if (hadRadio) {
+            playExitVinheta()
+        } else {
+            controller?.apply {
+                stop()
+                clearMediaItems()
+            }
         }
+    }
+
+    private fun playExitVinheta() {
+        val resId = EXIT_VINHETA_RESOURCES[nextExitVinhetaIndex % EXIT_VINHETA_RESOURCES.size]
+        nextExitVinhetaIndex++
+        playVinhetaResource(resId) {
+            controller?.apply {
+                stop()
+                clearMediaItems()
+            }
+        }
+    }
+
+    // (Re)inicia a contagem de SLEEP_TIMER_IDLE_MS do timer "voce ainda esta ai?" - chamado ao
+    // entrar numa radio e de novo sempre que o usuario confirma que continua ouvindo
+    // (confirmStillListening), pra recomecar do zero.
+    private fun armSleepTimer() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = viewModelScope.launch {
+            delay(SLEEP_TIMER_IDLE_MS)
+            triggerSleepCheck()
+        }
+    }
+
+    private fun triggerSleepCheck() {
+        if (activeRadioName.isBlank()) return
+        sleepCheckPending = true
+        controller?.let { updatePlayerState(it) }
+        sleepAutoStopJob = viewModelScope.launch {
+            delay(SLEEP_TIMER_RESPONSE_MS)
+            sleepCheckPending = false
+            stopRadio()
+        }
+    }
+
+    // Botao "Sim" do aviso de inatividade (LocalTuneApp.kt) - cancela o desligamento automatico
+    // pendente e reinicia a contagem de 1h30 do zero.
+    fun confirmStillListening() {
+        if (!sleepCheckPending) return
+        sleepAutoStopJob?.cancel()
+        sleepAutoStopJob = null
+        sleepCheckPending = false
+        controller?.let { updatePlayerState(it) }
+        armSleepTimer()
+    }
+
+    private fun cancelSleepTimer() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        sleepAutoStopJob?.cancel()
+        sleepAutoStopJob = null
+        sleepCheckPending = false
     }
 
     fun skipNext() {
@@ -2861,6 +2942,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         pendingVinheta = false
         activeRadioName = radioName
         playbackSource = "Rádio $radioName"
+        armSleepTimer()
 
         viewModelScope.launch {
             ensureNewsBulletinsLoaded()
@@ -2926,6 +3008,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = ""
+        cancelSleepTimer()
         announcementPlayer?.release()
         announcementPlayer = null
         textToSpeech?.stop()
@@ -4490,6 +4573,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             repeatMode = player.repeatMode,
             queueIndex = player.currentMediaItemIndex + 1,
             queueSize = player.mediaItemCount,
+            sleepCheckPending = sleepCheckPending,
         )
     }
 
@@ -4686,6 +4770,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // um pouco o volume das transicoes").
         const val PASSAGEM_VOLUME = 0.55f
         val PASSAGEM_RESOURCES = listOf(R.raw.passagem_1, R.raw.passagem_2, R.raw.passagem_3)
+        // Vinhetas de despedida ao sair de uma radio (pedido do usuario 15/09/2026) - alternam
+        // em sequencia a cada uso, ver playExitVinheta()/nextExitVinhetaIndex. Tocam no volume
+        // cheio (1.0, igual radio_intro/complemento de genero), nao no volume reduzido das
+        // passagens.
+        val EXIT_VINHETA_RESOURCES = listOf(R.raw.vinheta_tchauzinho, R.raw.vinheta_ate_mais)
+        // Timer "voce ainda esta ai?" (pedido do usuario 15/09/2026) - ver armSleepTimer/
+        // triggerSleepCheck.
+        const val SLEEP_TIMER_IDLE_MS = 90 * 60 * 1000L
+        const val SLEEP_TIMER_RESPONSE_MS = 60 * 1000L
         const val ANNOUNCEMENT_WATCHDOG_TIMEOUT_MS = 90_000L
         // Pedido do usuario (09/09/2026): o boletim pode comecar 5s antes do fim da ultima
         // musica, pra nunca deixar a proxima musica comecar a tocar antes dele (ver

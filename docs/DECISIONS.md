@@ -1403,3 +1403,155 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   Se essa TV LG específica (ou outra) precisar ser diagnosticada de verdade, comece por
   uma captura de pacotes SSDP na mesma rede em vez de tentar mais variações de código às
   cegas.
+
+## ADR-027 — Vinhetas de despedida, volume da passagem 3, e timer "você ainda está aí?"
+
+- **Contexto:** três pedidos do usuário no mesmo dia (15/09/2026): (1) duas vinhetas
+  novas gravadas (`tchauzinho`/`até mais`) para tocar ao sair de uma rádio, simétrico à
+  intro que já existia (ver ADR-011); (2) `passagem_3.mp3` tocando visivelmente mais
+  baixo que `passagem_1`/`passagem_2` (medido: -20.8dB de volume médio contra -13.8dB e
+  -9.4dB — a fonte em si era mais baixa, não um problema no código); (3) a rádio fica
+  ligada a noite toda quando o usuário dorme com ela tocando, gastando boletim/síntese
+  de voz sem ninguém escutando.
+- **Vinhetas de despedida:** arquivos movidos para `res/raw/vinheta_tchauzinho.mp3` e
+  `res/raw/vinheta_ate_mais.mp3` (fonte: `tchauzinho_1.mp3`/`até mais edited.mp3` em
+  `vinhetas/`). `stopRadio()` (botão "Sair da rádio") agora pausa a música, toca uma das
+  duas por cima via `playExitVinheta()` (alterna em sequência, `EXIT_VINHETA_RESOURCES`/
+  `nextExitVinhetaIndex`, mesmo padrão de `PASSAGEM_RESOURCES`) e só então
+  para/esvazia a fila de verdade, no callback de conclusão. Não dispara no caminho
+  "trocar para playlist normal enquanto uma rádio tocava em segundo plano"
+  (`playSongs` com `keepRadioNews = false`) — só no botão explícito, pra não interromper
+  uma música nova que já começou a tocar.
+- **Volume da passagem 3:** re-processada com `ffmpeg` (compressor leve +
+  ganho + limiter, não só um `volume=Xdb` cru — a fonte tinha muito mais dinâmica que
+  as outras duas e um ganho simples ia ou continuar baixa ou cortar os picos) trazendo
+  o volume médio de -20.8dB para -14.5dB, próximo de `passagem_1` (-13.8dB). Arquivo
+  trocado em `res/raw/passagem_3.mp3` E em `vinhetas/passagem 3.mp3` (fonte). Nenhuma
+  mudança em `PASSAGEM_VOLUME` — é o asset que estava desbalanceado, não o multiplicador
+  aplicado em `playPassagem()`, que continua igual pras três.
+- **Timer de inatividade:** `armSleepTimer()` inicia (e `confirmStillListening()`
+  reinicia) uma contagem de `SLEEP_TIMER_IDLE_MS` (1h30) a cada entrada numa rádio
+  (`startRadioNewsMode`). Ao vencer, `triggerSleepCheck()` liga `sleepCheckPending`
+  (novo campo em `PlayerUiState`, mesmo padrão de `isRadioMuted`) — a UI
+  (`LocalTuneApp.kt`) mostra um `AlertDialog` sem `onDismissRequest` (só sai com o botão
+  "Sim", não com toque fora) perguntando "Você ainda está aí?". Sem resposta em
+  `SLEEP_TIMER_RESPONSE_MS` (1min), chama `stopRadio()` sozinho (mesma vinheta de
+  despedida acima). `cancelSleepTimer()` roda dentro de `stopRadioNewsMode()` — cobre
+  tanto a saída manual quanto a troca para playlist normal, sem duplicar a chamada nos
+  dois lugares que já chamavam `stopRadioNewsMode()`.
+- **Não mudar sem:** se o usuário mandar vinhetas de despedida novas, atualizar
+  `EXIT_VINHETA_RESOURCES` E `vinhetas/README.md` juntos (mesma regra do ADR-011). Se a
+  passagem 3 for regravada, remedir o volume antes de decidir se ainda precisa do
+  mesmo processamento (`ffmpeg -af volumedetect`) — o processamento atual foi calibrado
+  pro áudio específico enviado nesse dia, não é um valor universal.
+
+## ADR-028 — Heurística de afinidade da rádio (aprender com o uso, sem ML)
+
+- **Contexto:** usuário perguntou se dava pra fazer o player "aprender" com o uso de
+  forma realmente inteligente. Decisão conjunta: um modelo de ML de verdade não
+  compensa pra um único usuário (sem volume de dados pra treinar algo que não seja
+  overfit no histórico recente) — foi escolhida uma heurística simples por cima do
+  algoritmo de diversidade que já existe (`buildRadioQueue`, ver comentário logo acima
+  dele), não uma reescrita.
+- **Sinais usados (só dois, de propósito — poucos e explicáveis):** (1) favoritar uma
+  faixa (`favoritePrefs`/`KEY_FAVORITE_SONGS`, sinal explícito que já existia); (2) a
+  faixa **terminar de tocar sozinha** numa sessão de rádio (`recordRadioPlayThrough()`
+  em `MusicLibraryRepository.kt`, chamado por
+  `LocalTuneViewModel.playerListener.onMediaItemTransition` quando `reason ==
+  MEDIA_ITEM_TRANSITION_REASON_AUTO` e a rádio está ativa — pular manualmente ou
+  deslikar não soma). Sem sinal negativo implícito novo: deslike (ADR existente) já
+  cobre "nunca mais tocar essa faixa"; não tentamos inferir "não gostou" de skip, porque
+  skip fica desativado durante a rádio (`skipNext`/`skipPrevious` só funcionam fora do
+  modo rádio).
+- **Como o viés entra na fila:** `RadioCandidate` ganhou um campo `affinityBias` (negativo
+  = mais provável de ser escolhido), calculado uma vez por `buildRadioQueue()`
+  (`radioAffinityBias()`: plays cumulativos, com teto de 10, `AFFINITY_PLAY_WEIGHT` cada
+  + `AFFINITY_FAVORITE_BONUS` se favoritada) e somado dentro das fórmulas de pontuação
+  que já existiam (`radioArtistScore`/`pickSongForArtist`). Faixa sem histórico fica em
+  viés 0 (nem penalizada nem favorecida) — senão música nova adicionada nunca teria
+  chance de aparecer. As constantes foram calibradas pra ficar BEM abaixo das
+  penalidades de anti-repetição (200_000/50_000/12_000...) — o viés só desempata entre
+  candidatos que a diversidade por artista/álbum/gênero já deixaria passar, nunca força
+  repetir artista/álbum recente só porque a faixa é favorita.
+- **Onde ainda não se aplica:** só no fluxo genérico (`buildRadioQueue`, usado por rádios
+  de gênero, "Rádio recente" e rádios personalizadas de categoria) — `shuffledRadioSession`
+  (álbum various-artists) e `albumDiverseRadioSession` (rádio de artista único) ainda não
+  usam o viés. Extensão natural se o usuário pedir depois.
+- **Por que não vira lista de "top favoritas" repetitiva:** o viés é só um desempate
+  pequeno, não uma reordenação por rank puro — a escolha ainda sai de um pool aleatório
+  (`randomFromTop`, `RADIO_ARTIST_CHOICE_POOL`/`RADIO_SONG_CHOICE_POOL`) e o teto de 10
+  plays evita crescimento sem limite (uma faixa tocada 200 vezes não vale mais que uma
+  tocada 10 vezes).
+- **Não mudar sem:** se adicionar um sinal negativo implícito de verdade (ex.: detectar
+  skip manual fora da rádio, ou pausar no meio), ele deve reduzir o viés (não excluir a
+  faixa da sessão) — exclusão total é papel do deslike explícito, que já existe e não
+  deve ser duplicado por heurística implícita.
+- **Backup:** a nova `SharedPreferences` (`radio_affinity`) ficou de fora do
+  `BACKED_UP_PREFS_NAMES` (`BackupRepository.kt`) na primeira versão desse ADR - usuário
+  perguntou e corrigido em 15/09/2026, adicionada à lista junto de `favorites`/
+  `playback_history` (mesma categoria: acumulado de uso real do usuário, não cache
+  técnico). Se aparecer outra `SharedPreferences` nova de dado do usuário no futuro,
+  checar essa lista também - não é automático.
+
+## ADR-029 — Rádio padrão "Surprise Me"
+
+- **Contexto:** com a heurística de afinidade do ADR-028 em produção, usuário pediu uma
+  rádio padrão específica ("me surpreenda") que escolhe música pra ele baseada no gosto
+  dele, em vez de ficar implícita dentro das rádios de gênero.
+- **Decisão:** `radiosFrom()` (`MusicLibraryRepository.kt`) ganhou uma
+  `LocalRadio` fixa (`SURPRISE_RADIO_NAME = "Surprise Me"`) com `songs = ` a biblioteca
+  **inteira** (não filtrada por gênero/década como as outras) — o pool grande é
+  proposital, é o que faz o viés de afinidade ter algo de fato pra escolher entre. Ela
+  passa pelo MESMO `buildRadioQueue()`/diversidade por artista de sempre, não é um motor
+  novo; a única diferença real é `radioSessionFrom()` detectar o nome (via
+  `normalizeLookupKey`) e passar `affinityWeight = SURPRISE_AFFINITY_WEIGHT` (4.0) em vez
+  de 1.0 nas outras rádios — o mesmo `radioAffinityBias()` do ADR-028, só escalado. No
+  teto de plays + favorito, o viés escalado chega perto/passa da penalidade de "álbum
+  recente" (12_000), o suficiente pra render notavelmente mais "pra você" que uma rádio
+  comum — mas ainda bem abaixo de "repetir o artista tocado por último" (200_000), que
+  continua intocável.
+- **Capa do card:** em vez de `previewCovers(songs, seed)` aleatório como as outras
+  rádios padrão, ordena por `radioAffinityBias()` e usa as 60 faixas de maior afinidade
+  como pool de capas — reforça visualmente "baseado no seu gosto" mesmo antes de entrar.
+  Sem histórico ainda (conta zerada, nada favoritado), cai de volta pro comportamento de
+  sempre (ordem estável, sem viés real).
+- **Por que não é um motor separado:** cogitado e descartado — reescrever a lógica de
+  fila especificamente pra essa rádio arriscava duplicar toda a diversidade por
+  artista/álbum/gênero que `buildRadioQueue()` já resolve bem (ver ADR-009 sobre o custo
+  de tocar nesse caminho). Parametrizar o peso existente foi a mudança mínima que ainda
+  entrega a diferença pedida.
+- **Não mudar sem:** se o peso 4.0 parecer fraco ou forte demais na prática, ajustar
+  `SURPRISE_AFFINITY_WEIGHT` sozinho é seguro — ele só multiplica `affinityBias`, não
+  muda a fórmula em si nem afeta as outras rádios (que continuam em 1.0, hardcoded no
+  `else` de `radioSessionFrom`).
+
+## ADR-030 — Compartilhar álbum como .zip (preserva a pasta no destinatário)
+
+- **Contexto:** `shareSongs()` (`LocalTuneApp.kt`) já existia e manda as faixas de um
+  álbum via `ACTION_SEND_MULTIPLE` (várias faixas soltas, tocáveis na hora por quem
+  recebe) — escolha deliberada anterior, documentada no comentário da própria função,
+  pra evitar o custo de gerar/copiar um zip e depender do destinatário saber
+  descompactar. Usuário apontou o problema real disso: o WhatsApp (e apps parecidos) do
+  destinatário não recria pasta de álbum nenhuma, só solta os arquivos recebidos juntos
+  na pasta de mídia dele, misturados com tudo mais — quem recebe não fica com "o álbum"
+  organizado.
+- **Decisão:** em vez de substituir `shareSongs()`, o botão de compartilhar em
+  `AlbumDetailScreen` virou um menu (`AlbumShareMenu`, mesmo padrão de
+  `LyricsOverflowMenu`) com as duas opções lado a lado — os dois trade-offs são reais e
+  nenhum vence o outro em todo caso, então a escolha fica com quem está compartilhando
+  na hora, não travada num dos dois.
+- **Como o zip é gerado (`buildAlbumZip`):** roda em `Dispatchers.IO` (zipar arquivos
+  grandes na main thread travaria a UI), escreve em `cacheDir/shared_zips/` (limpo antes
+  de cada zip novo — só 1 por vez, não acumula lixo no cache), com todas as faixas
+  dentro de UMA entrada de pasta nomeada com o título do álbum (`"$album/$faixa"`) — é
+  isso que faz o destinatário ganhar a pasta certinha ao extrair. Nome real do arquivo
+  (com extensão) vem de `MediaStore.Audio.Media.DISPLAY_NAME` via `ContentResolver`,
+  não inventado a partir do título (`LocalSong` não guarda extensão).
+- **FileProvider novo:** um `File` de `cacheDir` não pode ser exposto direto por
+  `content://` pra outro app — precisou de `androidx.core.content.FileProvider`
+  (`AndroidManifest.xml`) + `res/xml/file_paths.xml`, expondo SÓ a subpasta
+  `shared_zips/`, nada mais do app. Primeiro uso de `FileProvider` no projeto.
+- **Não mudar sem:** se o álbum for muito grande (muitas faixas em FLAC, por exemplo),
+  `buildAlbumZip` não tem limite de tamanho nem barra de progresso — só um toast se
+  falhar. Se isso incomodar na prática, adicionar feedback de progresso é a extensão
+  natural, não trocar a abordagem.

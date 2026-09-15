@@ -9,7 +9,9 @@ import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.provider.MediaStore
 import android.util.LruCache
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
@@ -207,6 +209,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.Player
 import com.pailer.localtune.R
@@ -255,12 +258,18 @@ import coil.compose.AsyncImage
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.time.LocalTime
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 // Reestruturado 10/09/2026 (pedido do usuario): eram 6 abas na barra inferior (Inicio,
 // Artistas, Albuns, Musicas, Categorias, Radio) - virou 3 (MainTab), com a Radio em destaque
@@ -1190,6 +1199,23 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     onDismiss = viewModel::dismissLyricsEditor,
                 )
             }
+        }
+
+        // Timer de inatividade da radio (pedido do usuario 15/09/2026, ver ADR-027) - sem
+        // onDismissRequest de proposito, so sai com o botao "Sim" (toque fora nao conta como
+        // "ainda estou aqui"); sem resposta em 1min a radio desliga sozinha.
+        if (player.sleepCheckPending) {
+            AlertDialog(
+                onDismissRequest = {},
+                icon = { Icon(Icons.Filled.PowerSettingsNew, contentDescription = null) },
+                title = { Text("Você ainda está aí?") },
+                text = { Text("A rádio vai desligar automaticamente em 1 minuto se você não responder.") },
+                confirmButton = {
+                    TextButton(onClick = viewModel::confirmStillListening) {
+                        Text("Sim")
+                    }
+                },
+            )
         }
     }
 }
@@ -5451,6 +5477,108 @@ private fun shareSongs(context: Context, songs: List<LocalSong>, subject: String
     context.startActivity(Intent.createChooser(intent, "Compartilhar album"))
 }
 
+// Nome de exibicao real do arquivo (com extensao certa) via MediaStore - LocalSong nao guarda
+// isso, so o Uri. Cai pra um nome generico .mp3 se a consulta falhar (raro, mas contentUri pode
+// ja ter sido apagado do MediaStore entre abrir o album e compartilhar).
+private fun displayFileName(context: Context, song: LocalSong): String {
+    val queried = runCatching {
+        context.contentResolver.query(
+            song.contentUri,
+            arrayOf(MediaStore.Audio.Media.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+    }.getOrNull()
+    return queried?.takeIf { it.isNotBlank() } ?: "${song.title}.mp3"
+}
+
+// Zipa as faixas do album num arquivo unico em cache/shared_zips (limpo antes de cada zip novo -
+// so 1 por vez, pra nao acumular lixo), com todas dentro de uma PASTA com o nome do album no zip -
+// e o que faz o destinatario receber "a pasta do album certinho" ao descompactar, diferente de
+// shareSongs() (ACTION_SEND_MULTIPLE manda as faixas soltas, tocaveis na hora, mas o WhatsApp do
+// destinatario nao recria pasta nenhuma - so joga tudo junto na pasta de midia dele). Publicado via
+// FileProvider (androidx.core, ver AndroidManifest.xml/res/xml/file_paths.xml) porque um File cru
+// de cache nao pode ser exposto por Uri content:// direto pra outro app.
+private suspend fun buildAlbumZip(context: Context, songs: List<LocalSong>, albumTitle: String): Uri? =
+    withContext(Dispatchers.IO) {
+        val dir = File(context.cacheDir, "shared_zips").apply { mkdirs() }
+        dir.listFiles()?.forEach { it.delete() }
+        val safeName = albumTitle.ifBlank { "Album" }.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val zipFile = File(dir, "$safeName.zip")
+        val ok = runCatching {
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zipOut ->
+                val usedNames = mutableSetOf<String>()
+                songs.forEach { song ->
+                    val baseName = displayFileName(context, song)
+                    var entryName = "$safeName/$baseName"
+                    var suffix = 1
+                    while (!usedNames.add(entryName)) {
+                        entryName = "$safeName/${suffix++}_$baseName"
+                    }
+                    context.contentResolver.openInputStream(song.contentUri)?.use { input ->
+                        zipOut.putNextEntry(ZipEntry(entryName))
+                        input.copyTo(zipOut)
+                        zipOut.closeEntry()
+                    }
+                }
+            }
+        }.isSuccess
+        if (!ok) return@withContext null
+        runCatching { FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", zipFile) }.getOrNull()
+    }
+
+// Compartilha o album como .zip (ver buildAlbumZip) - roda no scope da tela (nao viewModelScope,
+// e um efeito colateral de UI pontual) pra nao travar a thread principal zipando arquivos grandes.
+private fun shareAlbumAsZip(context: Context, scope: CoroutineScope, songs: List<LocalSong>, albumTitle: String) {
+    if (songs.isEmpty()) return
+    scope.launch {
+        val uri = buildAlbumZip(context, songs, albumTitle) ?: run {
+            Toast.makeText(context, "Não foi possível gerar o zip do álbum.", Toast.LENGTH_SHORT).show()
+            return@launch
+        }
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, albumTitle)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Compartilhar album (zip)"))
+    }
+}
+
+@Composable
+private fun AlbumShareMenu(songs: List<LocalSong>, albumTitle: String) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(
+            onClick = { expanded = true },
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(PailerGunmetal.copy(alpha = 0.5f)),
+        ) {
+            Icon(
+                Icons.Filled.Share,
+                contentDescription = "Compartilhar album",
+                tint = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text("Enviar faixas separadas") },
+                onClick = { expanded = false; shareSongs(context, songs, albumTitle) },
+            )
+            DropdownMenuItem(
+                text = { Text("Enviar como .zip (mantém a pasta)") },
+                onClick = { expanded = false; shareAlbumAsZip(context, scope, songs, albumTitle) },
+            )
+        }
+    }
+}
+
 @Composable
 private fun AlbumDetailScreen(
     album: LocalAlbum,
@@ -5472,7 +5600,6 @@ private fun AlbumDetailScreen(
     currentlyPlayingSongId: Long? = null,
     listState: LazyListState = rememberLazyListState(),
 ) {
-    val context = LocalContext.current
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -5628,19 +5755,7 @@ private fun AlbumDetailScreen(
                         )
                     }
                     Spacer(Modifier.width(20.dp))
-                    IconButton(
-                        onClick = { shareSongs(context, album.songs, album.title) },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(PailerGunmetal.copy(alpha = 0.5f)),
-                    ) {
-                        Icon(
-                            Icons.Filled.Share,
-                            contentDescription = "Compartilhar album",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
+                    AlbumShareMenu(songs = album.songs, albumTitle = album.title)
                 }
             }
             items(album.songs, key = { it.id }) { song ->
@@ -5898,7 +6013,7 @@ private fun PlaylistsScreen(
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     val radioIsActive = player.activeRadioName.isNotBlank() && player.hasMedia
     LazyVerticalGrid(
-        columns = GridCells.Fixed(if (isLandscape) 4 else 2),
+        columns = GridCells.Fixed(if (isLandscape) 4 else 3),
         state = listState,
         flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(if (isLandscape) 14.dp else 18.dp),

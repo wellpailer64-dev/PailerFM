@@ -91,5 +91,18 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_player_large_info" />
         </receiver>
+
+        <!-- So pra expor o zip de album gerado em cache/shared_zips (buildAlbumZip em
+             LocalTuneApp.kt) como content:// pro app de destino (WhatsApp etc) - ver
+             res/xml/file_paths.xml pro caminho exato exposto. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

@@ -232,6 +232,11 @@ class BackupRepository(private val context: Context) {
             "playback_history",
             "radio_bulletins",
             "user_profile",
+            // Contadores de "faixa terminou de tocar sozinha na radio" (ADR-028/ADR-029,
+            // MusicLibraryRepository.recordRadioPlayThrough) - acumulado de uso real, mesma
+            // categoria de favorites/playback_history acima, não é cache técnico. Sem isso, um
+            // restore de backup apagaria semanas de aprendizado da "Surprise Me"/afinidade.
+            "radio_affinity",
         )
     }
 }

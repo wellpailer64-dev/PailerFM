@@ -30,6 +30,14 @@ import kotlin.random.Random
 
 class MusicLibraryRepository(private val context: Context) {
     private val metadataPrefs = context.getSharedPreferences("metadata_overrides", Context.MODE_PRIVATE)
+    // So LEITURA aqui (quem grava e sempre LocalTuneViewModel, via toggleCurrentSongFavorite) -
+    // mesmo arquivo/chave de favoritePrefs/KEY_FAVORITE_SONGS no ViewModel, duplicado de proposito
+    // pra nao criar dependencia de data -> player. Usado por radioAffinityBias() abaixo.
+    private val favoritePrefs = context.getSharedPreferences("favorites", Context.MODE_PRIVATE)
+    // Contagem de "faixa terminou de tocar sozinha numa sessao de radio", ver
+    // recordRadioPlayThrough() - a heuristica de afinidade (ADR-028) usa isso + favoritos pra
+    // enviesar buildRadioQueue() a favor do que voce mais escuta.
+    private val radioAffinityPrefs = context.getSharedPreferences("radio_affinity", Context.MODE_PRIVATE)
 
     init {
         if (metadataPrefs.getInt(KEY_METADATA_SCHEMA_VERSION, 0) < METADATA_SCHEMA_VERSION) {
@@ -263,6 +271,20 @@ class MusicLibraryRepository(private val context: Context) {
         val grungeRadio = radioFromProfile(songs, RADIO_PROFILES.first { it.name == "Grunge" })
         val anos2000Radio = radioFromProfile(songs, RADIO_PROFILES.first { it.name == "Anos 2000" })
         val customRadios = customRadiosFrom(songs)
+        // "Surprise Me" (ADR-028): radio padrao sobre a biblioteca INTEIRA (nao filtrada por
+        // genero/decada como as outras) - o que a diferencia e radioSessionFrom() aplicar
+        // SURPRISE_AFFINITY_WEIGHT (bem mais forte que o vies sutil das radios normais) na hora
+        // de montar a sessao. Capa do card usa as faixas de maior afinidade (nao aleatorio),
+        // pra reforcar visualmente "baseado no seu gosto" mesmo antes de entrar.
+        val favoriteIds = favoriteSongIdsForAffinity()
+        val playThroughCounts = loadRadioPlayThroughCounts()
+        val topAffinitySongs = songs.sortedBy { radioAffinityBias(it.id, favoriteIds, playThroughCounts) }.take(60)
+        val surpriseRadio = LocalRadio(
+            name = SURPRISE_RADIO_NAME,
+            description = "Escolhida pelo seu gosto",
+            songs = songs,
+            coverSongs = previewCovers(topAffinitySongs.ifEmpty { songs }, "surprise"),
+        )
 
         val fallback = LocalRadio(
             name = "Radio recente",
@@ -272,7 +294,7 @@ class MusicLibraryRepository(private val context: Context) {
         )
 
         val hidden = hiddenRadioKeys()
-        return (customRadios + listOfNotNull(grungeRadio, anos2000Radio) + genreRadios + fallback)
+        return (listOf(surpriseRadio) + customRadios + listOfNotNull(grungeRadio, anos2000Radio) + genreRadios + fallback)
             .distinctBy { normalizeLookupKey(it.name) }
             .filterNot { normalizeLookupKey(it.name) in hidden }
     }
@@ -362,6 +384,44 @@ class MusicLibraryRepository(private val context: Context) {
         metadataPrefs.edit()
             .putStringSet(KEY_RADIO_DISLIKED_SONGS, (radioDislikedSongIds() - songId).map { it.toString() }.toSet())
             .apply()
+    }
+
+    // --- Afinidade da radio (pedido do usuario 15/09/2026, ver ADR-028): heuristica simples de
+    // "aprender com o uso" sem ML de verdade. Chamado por LocalTuneViewModel.playerListener
+    // (onMediaItemTransition, reason AUTO, so quando radioNewsEnabled) a cada vez que uma faixa
+    // termina de tocar sozinha numa sessao de radio - musica pulada manualmente ou deslikada
+    // nao soma aqui. Usado por buildRadioQueue() abaixo pra enviesar a favor do que voce mais
+    // escuta, junto com favoritos (favoritePrefs, so leitura).
+    fun recordRadioPlayThrough(songId: Long) {
+        val counts = loadRadioPlayThroughCounts().toMutableMap()
+        counts[songId] = (counts[songId] ?: 0) + 1
+        val json = JSONObject()
+        counts.forEach { (id, count) -> json.put(id.toString(), count) }
+        radioAffinityPrefs.edit().putString(KEY_RADIO_PLAY_THROUGH_COUNTS, json.toString()).apply()
+    }
+
+    private fun loadRadioPlayThroughCounts(): Map<Long, Int> {
+        val json = radioAffinityPrefs.getString(KEY_RADIO_PLAY_THROUGH_COUNTS, null) ?: return emptyMap()
+        return runCatching {
+            val obj = JSONObject(json)
+            obj.keys().asSequence().mapNotNull { key -> key.toLongOrNull()?.let { it to obj.optInt(key, 0) } }.toMap()
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun favoriteSongIdsForAffinity(): Set<Long> =
+        favoritePrefs.getStringSet(KEY_FAVORITE_SONGS_SHARED, emptySet())
+            ?.mapNotNull { it.toLongOrNull() }?.toSet() ?: emptySet()
+
+    // Vies (negativo = preferido, ver uso em radioArtistScore/pickSongForArtist) pequeno o
+    // bastante pra so desempatar entre candidatos que a diversidade por artista/album/genero ja
+    // deixaria passar - nunca maior que as penalidades de repeticao (12_000+) que garantem a
+    // diversidade da sessao. Faixa sem historico (recem-adicionada, nunca tocada) fica em 0, no
+    // meio do pelotao - nao penalizada so por falta de dado, senao a radio nunca "descobriria"
+    // musica nova.
+    private fun radioAffinityBias(songId: Long, favoriteIds: Set<Long>, playThroughCounts: Map<Long, Int>): Int {
+        val plays = (playThroughCounts[songId] ?: 0).coerceAtMost(AFFINITY_PLAY_CAP)
+        val favoriteBonus = if (songId in favoriteIds) AFFINITY_FAVORITE_BONUS else 0
+        return -(plays * AFFINITY_PLAY_WEIGHT) - favoriteBonus
     }
 
     // --- Radios personalizadas (a partir de album/artista) ---
@@ -602,10 +662,19 @@ class MusicLibraryRepository(private val context: Context) {
             ?.split(",")
             ?.mapNotNull { it.toLongOrNull() }
             .orEmpty()
+        // "Surprise Me" usa um vies de afinidade bem mais forte que as outras radios (ver
+        // ADR-028) - e a unica diferenca de verdade entre ela e uma radio generica sobre a
+        // biblioteca inteira.
+        val affinityWeight = if (normalizeLookupKey(radio.name) == normalizeLookupKey(SURPRISE_RADIO_NAME)) {
+            SURPRISE_AFFINITY_WEIGHT
+        } else {
+            1.0
+        }
         val attempts = (0 until RADIO_SESSION_ATTEMPTS).map { attempt ->
             buildRadioQueue(
                 radio.songs,
                 "${radio.name}:${System.nanoTime()}:${Random.nextLong()}:$attempt",
+                affinityWeight = affinityWeight,
             ).take(RADIO_LIMIT)
         }.filter { it.isNotEmpty() }
         val session = if (previousIds.isEmpty()) {
@@ -1250,8 +1319,11 @@ class MusicLibraryRepository(private val context: Context) {
         }.sum()
     }
 
-    private fun buildRadioQueue(songs: List<LocalSong>, seed: String): List<LocalSong> {
+    private fun buildRadioQueue(songs: List<LocalSong>, seed: String, affinityWeight: Double = 1.0): List<LocalSong> {
         val random = Random(stableHash(seed))
+        // Carregado uma vez so (nao por candidato) - ver radioAffinityBias().
+        val favoriteIds = favoriteSongIdsForAffinity()
+        val playThroughCounts = loadRadioPlayThroughCounts()
         val candidates = songs
             .distinctBy { it.id }
             .map { song ->
@@ -1264,6 +1336,10 @@ class MusicLibraryRepository(private val context: Context) {
                     // (heuristico de diversidade abaixo) - uma so chave representativa basta,
                     // nao precisa das N categorias de genreEntriesFor (ver dynamicGenreRadios).
                     genreKey = genreEntriesFor(song).firstOrNull()?.first ?: "sem genero",
+                    // affinityWeight > 1 (so "Surprise Me", ver radioSessionFrom) amplifica o
+                    // vies sem mudar o sinal nem o teto de plays - continua o mesmo
+                    // radioAffinityBias(), so escalado.
+                    affinityBias = (radioAffinityBias(song.id, favoriteIds, playThroughCounts) * affinityWeight).toInt(),
                 )
             }
 
@@ -1378,6 +1454,7 @@ class MusicLibraryRepository(private val context: Context) {
             (if (candidate.albumKey in recentAlbums) 12_000 else 0) +
             (if (previous?.genreKey == candidate.genreKey) 4_000 else 0) +
             (if (candidate.genreKey in recentGenres) 1_500 else 0) +
+            candidate.affinityBias +
             (stableHash("$seed:$artist:${queue.size}") % 1_000)
     }
 
@@ -1395,6 +1472,7 @@ class MusicLibraryRepository(private val context: Context) {
                 (if (candidate.albumKey in recentAlbums) 10_000 else 0) +
                 (if (previous?.genreKey == candidate.genreKey) 3_000 else 0) +
                 (if (candidate.genreKey in recentGenres) 1_000 else 0) +
+                candidate.affinityBias +
                 (stableHash("$seed:${queue.size}:${candidate.song.id}") % 1_000)
         }.randomFromTop(Random(stableHash("$seed:pick:${queue.size}")), RADIO_SONG_CHOICE_POOL) ?: candidates.first()
     }
@@ -1594,6 +1672,8 @@ class MusicLibraryRepository(private val context: Context) {
         val artistKeys: Set<String>,
         val albumKey: String,
         val genreKey: String,
+        // Ver radioAffinityBias() - negativo = mais provavel de ser escolhido.
+        val affinityBias: Int,
     )
 
     private data class RadioProfile(
@@ -1673,6 +1753,21 @@ class MusicLibraryRepository(private val context: Context) {
         const val KEY_HIDDEN_ARTISTS = "hidden_artist_keys"
         const val KEY_HIDDEN_ALBUMS = "hidden_album_keys"
         const val KEY_RADIO_DISLIKED_SONGS = "radio_disliked_song_ids"
+        const val KEY_RADIO_PLAY_THROUGH_COUNTS = "radio_play_through_counts"
+        // Mesma chave de KEY_FAVORITE_SONGS em LocalTuneViewModel - ver comentario em
+        // favoritePrefs no topo da classe (duplicado de proposito).
+        const val KEY_FAVORITE_SONGS_SHARED = "favorite_song_ids"
+        // Vies maximo por play e ate quantos plays contam (10 plays = vies maximo) - ver
+        // radioAffinityBias(). Favorito vale ~13 plays de vies.
+        const val AFFINITY_PLAY_WEIGHT = 300
+        const val AFFINITY_PLAY_CAP = 10
+        const val AFFINITY_FAVORITE_BONUS = 4_000
+        // Radio padrao "Surprise Me" (ADR-028/ADR-029) - mesmo motor de buildRadioQueue(), so com
+        // o vies de afinidade multiplicado por isso (4x: no teto de plays + favorito, o vies
+        // chega perto/acima da penalidade de "album recente" (12_000), o suficiente pra soar
+        // "escolhida pelo seu gosto" sem furar as penalidades de repetir artista, que sao maiores).
+        const val SURPRISE_RADIO_NAME = "Surprise Me"
+        const val SURPRISE_AFFINITY_WEIGHT = 4.0
         const val ARTWORK_CANDIDATE_LIMIT = 10
         const val METADATA_SCHEMA_VERSION = 2
         const val RADIO_LIMIT = 30
