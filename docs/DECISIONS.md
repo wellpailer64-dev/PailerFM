@@ -1179,6 +1179,25 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   (ADR-020: ler/escrever Compose `State` fora da Main na construção do VM derruba o app).
   Se um dia a letra for gravável na tag, é ação manual explícita com confirmação
   (ADR-008), reusando o fluxo de `MediaStore.createWriteRequest` que o tag writer já tem.
+- **Atualização (15/09/2026, busca automática ao arrastar + 2º provedor):** o botão
+  "Buscar online" saiu da UI. Arrastar até a página da letra já é o pedido implícito de
+  vê-la, então um `LaunchedEffect(pagerState.currentPage, ...)` em `FullPlayer` dispara
+  `onFetchLyrics()` sozinho assim que a página 1 abre com `lyrics.lyrics.isEmpty` (e
+  `lyrics.message == null`, pra não repetir a tentativa depois de um miss já registrado
+  na mesma música). O botão "Colar letra" só aparece se a busca falhar. O menu de 3
+  pontos mantém "Buscar letra online" como re-tentativa manual (ex.: depois de editar a
+  letra ou trocar de faixa sem sair da página). `LyricsRepository.fetchOnline` agora
+  tenta dois provedores em cascata: **LRCLIB** primeiro (como antes, pode vir
+  sincronizada) e, se não achar, **lyrics.ovh** (`api.lyrics.ovh`, público, sem chave,
+  mesmo padrão `HttpURLConnection`/`org.json` — mas só devolve texto puro, nunca LRC
+  sincronizado). Novo `LyricsSource.LYRICS_OVH` no enum (`data/Lyrics.kt`) pra rotular a
+  fonte na UI, igual `LRCLIB`.
+- **Não mudar sem (atualização):** a rede ainda só entra quando a UI pede (agora via
+  gesto, não mais só por botão) — o auto-fetch continua condicionado a
+  `lyrics.lyrics.isEmpty`, nunca sobrescreve letra já carregada (tag/manual/cache) só por
+  reabrir a página. `lyrics.message` funciona como trava de "já tentei e falhou nesta
+  música" — se o auto-retry for reativado no futuro, tem que continuar respeitando essa
+  trava ou vira busca em loop a cada troca de página.
 
 ## ADR-024 — Buffer de boletins unificado (fim dos "2 níveis")
 
@@ -1555,3 +1574,49 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   `buildAlbumZip` não tem limite de tamanho nem barra de progresso — só um toast se
   falhar. Se isso incomodar na prática, adicionar feedback de progresso é a extensão
   natural, não trocar a abordagem.
+
+## ADR-031 — Play/pause do card "Continuar ouvindo", label transiente e gesto na Biblioteca
+
+- **Contexto:** três pedidos de UI do usuário na mesma sessão (15/09/2026):
+  1. Na Home, o botão de play desenhado no centro do disco (`HomePlaybackArtwork`) não
+     tinha clique próprio — o clique caía no `clickable` do card inteiro, que abre o
+     player em tela cheia em vez de retomar a música pausada ali mesmo.
+  2. O rótulo acima do disco ("Continuar ouvindo" / "Tocando agora") era estático;
+     pedido era "Tocando agora" entrar com animação, ficar 3s e recolher/sumir, mantendo
+     "Continuar ouvindo" fixo enquanto pausado.
+  3. Na Biblioteca, a troca entre as 4 sessões (Artistas/Álbuns/Músicas/Categorias) só
+     acontecia pelos botões do topo — pedido era arrastar pro lado também funcionar,
+     leve, com animação se vier de graça.
+- **Decisão:**
+  1. **Play/pause do disco:** `HomePlaybackArtwork` ganhou parâmetro `onPlayPauseClick`,
+     aplicado só no `Box` do ícone de play (`Modifier.clickable`) — como o `clickable`
+     filho consome o toque antes do pai (comportamento padrão do Compose, mesmo
+     mecanismo de um botão de excluir dentro de uma linha clicável), o resto do card
+     continua abrindo o player normalmente. `ContinueListeningCard`/
+     `ContinueListeningLandscapeCard` só repassam o callback. Na chamada
+     (`HomeScreen`/`LocalTuneApp`), o callback é `onTogglePlayPause` (→
+     `viewModel::togglePlayPause`) quando a mídia tocando é a mesma do card
+     (`isCurrentMedia`), ou o mesmo `onContinue` de sempre quando é uma música parada
+     ainda não carregada no player (aí "tocar" e "continuar" são a mesma ação).
+  2. **Label transiente:** `PlaybackStatusTitle` (novo composable) substitui a chamada
+     direta a `SectionTitle`. Um `LaunchedEffect(isPlaying)` mantém `visible = true`
+     sempre que `isPlaying == false` (texto fixo) e, quando vira `true`, agenda
+     `delay(3_000)` antes de `visible = false`. `AnimatedVisibility` com
+     `fadeIn() + expandVertically()` / `fadeOut() + shrinkVertically()` faz a entrada e o
+     recolhimento.
+  3. **Gesto na Biblioteca:** a sessão ativa (`Column`/`when` fixo) virou
+     `HorizontalPager(pageCount = { LibrarySection.entries.size })` dentro de
+     `LibraryShell` (`@OptIn(ExperimentalFoundationApi::class)`, mesmo padrão já usado
+     no pager capa⇄letra do ADR-023). Sincronia nos dois sentidos com os botões do topo:
+     `LaunchedEffect(pagerState.currentPage)` atualiza `librarySection`;
+     `LaunchedEffect(librarySection)` chama `animateScrollToPage` quando o valor muda por
+     fora (clique no botão) e diverge da página atual do pager.
+- **Motivo:** os três pedidos são polimento de UI que reaproveita padrões já existentes
+  no projeto (`clickable` aninhado, `AnimatedVisibility`, `HorizontalPager` já usado no
+  player) — nenhum exigiu estado novo no `ViewModel` nem mudança de arquitetura.
+- **Não mudar sem:** o `onPlayPauseClick` só existe no `Box` do ícone (64.dp, centralizado)
+  — se o ícone for redesenhado pra ocupar mais área do card, o `clickable` precisa
+  acompanhar, senão o card inteiro volta a "roubar" o toque do botão de play. O
+  auto-scroll do pager da Biblioteca compara `pagerState.currentPage != librarySection.ordinal`
+  antes de chamar `animateScrollToPage` — tirar essa checagem faz o pager brigar consigo
+  mesmo (`LaunchedEffect` dos dois lados reagindo em loop) toda vez que o usuário arrasta.

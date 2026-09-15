@@ -97,23 +97,42 @@ class LyricsRepository(private val context: Context) {
         }
     }
 
-    // --- Busca online (LRCLIB, publico, sem chave de API) ---
+    // --- Busca online (LRCLIB primeiro, lyrics.ovh como 2a tentativa se a 1a nao achar - ambos
+    // publicos, sem chave de API) ---
 
-    // Devolve null em miss / sem internet / erro. Hit => grava <id>.lrc (prefere syncedLyrics) +
-    // index(source = LRCLIB). Mesmo padrao HttpURLConnection + org.json das outras integracoes
+    // Devolve null so se as 2 tentativas falharem (miss / sem internet / erro). Hit => grava
+    // <id>.lrc (LRCLIB prefere syncedLyrics; lyrics.ovh so tem texto puro, nunca sincroniza) +
+    // index(source). Mesmo padrao HttpURLConnection + org.json das outras integracoes
     // (NewsBulletinRepository, AlbumGenreSuggestionRepository, GeminiFlashTtsEngine).
     suspend fun fetchOnline(song: LocalSong): Lyrics? = withContext(Dispatchers.IO) {
-        runCatching {
-            val body = lrclibGet(song) ?: lrclibSearchBestMatch(song) ?: return@runCatching null
+        fetchFromLrclib(song) ?: fetchFromLyricsOvh(song)
+    }
 
-            val synced = body.optString("syncedLyrics").takeIf { it.isNotBlank() && it != "null" }
-            val plain = body.optString("plainLyrics").takeIf { it.isNotBlank() && it != "null" }
-            val chosen = synced ?: plain ?: return@runCatching null
-            val providerId = body.optLong("id", 0L).takeIf { it > 0L }?.let { "lrclib:$it" }
+    private suspend fun fetchFromLrclib(song: LocalSong): Lyrics? = runCatching {
+        val body = lrclibGet(song) ?: lrclibSearchBestMatch(song) ?: return@runCatching null
 
-            writeFile(song, chosen, LyricsSource.LRCLIB, providerId)
-            parseInto(song.id, chosen, LyricsSource.LRCLIB)
-        }.getOrNull()
+        val synced = body.optString("syncedLyrics").takeIf { it.isNotBlank() && it != "null" }
+        val plain = body.optString("plainLyrics").takeIf { it.isNotBlank() && it != "null" }
+        val chosen = synced ?: plain ?: return@runCatching null
+        val providerId = body.optLong("id", 0L).takeIf { it > 0L }?.let { "lrclib:$it" }
+
+        writeFile(song, chosen, LyricsSource.LRCLIB, providerId)
+        parseInto(song.id, chosen, LyricsSource.LRCLIB)
+    }.getOrNull()
+
+    private suspend fun fetchFromLyricsOvh(song: LocalSong): Lyrics? = runCatching {
+        val text = lyricsOvhGet(song) ?: return@runCatching null
+        writeFile(song, text, LyricsSource.LYRICS_OVH, provider = "lyrics.ovh")
+        parseInto(song.id, text, LyricsSource.LYRICS_OVH)
+    }.getOrNull()
+
+    private fun lyricsOvhGet(song: LocalSong): String? {
+        // lyrics.ovh usa artista/titulo como segmentos de path, nao query string - "+" do
+        // URLEncoder pra espaco nao e valido ai, precisa virar %20.
+        val artist = enc(primaryArtist(song.artist)).replace("+", "%20")
+        val title = enc(song.title).replace("+", "%20")
+        val json = httpJsonObject("$LYRICS_OVH_BASE/v1/$artist/$title") ?: return null
+        return json.optString("lyrics").takeIf { it.isNotBlank() }?.trim()
     }
 
     private fun lrclibGet(song: LocalSong): JSONObject? {
@@ -283,6 +302,7 @@ class LyricsRepository(private val context: Context) {
         const val DIR_NAME = "lyrics"
         const val INDEX_FILE = "index.json"
         const val LRCLIB_BASE = "https://lrclib.net"
+        const val LYRICS_OVH_BASE = "https://api.lyrics.ovh"
         const val NETWORK_TIMEOUT_MS = 8_000
         const val USER_AGENT = "PailerFM/0.1 (app pessoal de musica local)"
         // Mesmo conjunto de MusicLibraryRepository.SUPPORTED_TAG_EXTENSIONS (companion privado la).

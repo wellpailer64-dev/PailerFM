@@ -32,8 +32,10 @@ import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Canvas
@@ -416,6 +418,7 @@ private fun PermissionGate(onGrant: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(MainTab.Home) }
@@ -618,6 +621,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val openedArtistAlbums = remember(selectedArtist) {
         selectedArtist?.let { viewModel.albums(it.songs) } ?: emptyList()
     }
+    // "Mais desse artista" no fim da tela de album (pedido do usuario 15/09/2026) - so pra
+    // album de um unico artista (isVariousArtists=false), buscando pelas faixas com o mesmo
+    // artist EXATO (album.artist ja e o valor cru da tag quando nao e various-artists, sem
+    // precisar da normalizacao de primaryArtistKey que so existe dentro do repository).
+    val openedAlbumOtherAlbums = remember(selectedAlbum) {
+        val current = selectedAlbum
+        if (current == null || current.isVariousArtists) {
+            emptyList()
+        } else {
+            viewModel.albums(songs.filter { it.artist == current.artist }).filterNot { it.key == current.key }
+        }
+    }
     val openedGenreArtists = remember(selectedGenre) {
         selectedGenre?.let { viewModel.artists(it.songs) } ?: emptyList()
     }
@@ -800,6 +815,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onApplyArtwork = requestApplyArtwork,
                         currentlyPlayingSongId = player.songId,
                         listState = albumDetailListState,
+                        otherArtistAlbums = openedAlbumOtherAlbums,
+                        onOpenAlbum = { selectedAlbum = it },
                     )
                     openedArtist != null -> ArtistDetailScreen(
                         artist = openedArtist,
@@ -918,6 +935,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             player = player,
                             lyrics = lyrics,
                             onContinue = { viewModel.continuePlayback(songs) },
+                            onTogglePlayPause = viewModel::togglePlayPause,
                             onOpenAlbum = { selectedAlbum = it },
                             onOpenRadio = {
                                 radioSession = emptyList()
@@ -944,40 +962,60 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             selected = librarySection,
                             onSelect = { librarySection = it },
                         )
-                        when (librarySection) {
-                            LibrarySection.Artists -> ArtistsScreen(
-                                artists = artists,
-                                onOpenArtist = { selectedArtist = it },
-                                onLongPressArtist = { artistActionsTarget = it },
-                                photoUriFor = viewModel::artistPhotoUri,
-                                scrollState = artistsScrollState,
-                            )
-                            LibrarySection.Albums -> AlbumsScreen(
-                                albums = albums,
-                                onOpenAlbum = { selectedAlbum = it },
-                                onLongPressAlbum = { albumActionsTarget = it },
-                                scrollState = albumsScrollState,
-                            )
-                            LibrarySection.Songs -> SongsScreen(
-                                songs = songs,
-                                isSongFavorite = viewModel::isSongFavorite,
-                                onToggleSongFavorite = viewModel::toggleSongFavorite,
-                                onPlay = { index -> viewModel.playSongs(songs, index, source = "Músicas") },
-                                onDeleteSong = { pendingDeleteSong = it },
-                                listState = songsListState,
-                            )
-                            LibrarySection.Genres -> PlaylistsScreen(
-                                radios = genreRadios,
-                                player = player,
-                                lyrics = lyrics,
-                                onOpenRadio = {
-                                    radioSession = emptyList()
-                                    selectedGenre = it
-                                },
-                                onOpenPlayer = openActiveRadio,
-                                showGifBanner = false,
-                                listState = genresListState,
-                            )
+                        // Navegacao por gesto entre as sessoes da biblioteca (arrastar pro lado
+                        // avanca/volta) - pedido do usuario 15/09/2026. HorizontalPager ja cuida
+                        // da animacao leve e mantem sincronia nos 2 sentidos com os botoes acima.
+                        val libraryPagerState = rememberPagerState(
+                            initialPage = librarySection.ordinal,
+                            pageCount = { LibrarySection.entries.size },
+                        )
+                        LaunchedEffect(libraryPagerState.currentPage) {
+                            librarySection = LibrarySection.entries[libraryPagerState.currentPage]
+                        }
+                        LaunchedEffect(librarySection) {
+                            if (libraryPagerState.currentPage != librarySection.ordinal) {
+                                libraryPagerState.animateScrollToPage(librarySection.ordinal)
+                            }
+                        }
+                        HorizontalPager(
+                            state = libraryPagerState,
+                            modifier = Modifier.fillMaxSize(),
+                        ) { page ->
+                            when (LibrarySection.entries[page]) {
+                                LibrarySection.Artists -> ArtistsScreen(
+                                    artists = artists,
+                                    onOpenArtist = { selectedArtist = it },
+                                    onLongPressArtist = { artistActionsTarget = it },
+                                    photoUriFor = viewModel::artistPhotoUri,
+                                    scrollState = artistsScrollState,
+                                )
+                                LibrarySection.Albums -> AlbumsScreen(
+                                    albums = albums,
+                                    onOpenAlbum = { selectedAlbum = it },
+                                    onLongPressAlbum = { albumActionsTarget = it },
+                                    scrollState = albumsScrollState,
+                                )
+                                LibrarySection.Songs -> SongsScreen(
+                                    songs = songs,
+                                    isSongFavorite = viewModel::isSongFavorite,
+                                    onToggleSongFavorite = viewModel::toggleSongFavorite,
+                                    onPlay = { index -> viewModel.playSongs(songs, index, source = "Músicas") },
+                                    onDeleteSong = { pendingDeleteSong = it },
+                                    listState = songsListState,
+                                )
+                                LibrarySection.Genres -> PlaylistsScreen(
+                                    radios = genreRadios,
+                                    player = player,
+                                    lyrics = lyrics,
+                                    onOpenRadio = {
+                                        radioSession = emptyList()
+                                        selectedGenre = it
+                                    },
+                                    onOpenPlayer = openActiveRadio,
+                                    showGifBanner = false,
+                                    listState = genresListState,
+                                )
+                            }
                         }
                     }
                 }
@@ -4181,6 +4219,7 @@ private fun HomeScreen(
     player: PlayerUiState,
     lyrics: LyricsUiState = LyricsUiState(),
     onContinue: () -> Unit,
+    onTogglePlayPause: () -> Unit,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenCurrentPlayer: () -> Unit,
@@ -4251,6 +4290,7 @@ private fun HomeScreen(
                     isPlaying = player.hasMedia && player.isPlaying,
                     lyrics = if (homePlaybackContent.isCurrentMedia) lyrics else LyricsUiState(),
                     onClick = if (homePlaybackContent.isCurrentMedia) onOpenCurrentPlayer else onContinue,
+                    onPlayPauseClick = if (homePlaybackContent.isCurrentMedia) onTogglePlayPause else onContinue,
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
                 )
             }
@@ -4763,6 +4803,15 @@ private fun ArtistDetailScreen(
     val displayEmbeddedSource = if (photoOverrideUri != null) null else artworkSong?.contentUri
     var showEditor by rememberSaveable(artist.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(artist.key) { mutableStateOf(false) }
+    // Mais novo primeiro (pedido do usuario 15/09/2026) - album sem ano tageado (0) sempre por
+    // ultimo, nunca misturado como se fosse o mais antigo de verdade.
+    val sortedAlbums = remember(albums) {
+        albums.sortedWith(
+            compareByDescending<LocalAlbum> { it.year > 0 }
+                .thenByDescending { it.year }
+                .thenBy { it.title.lowercase() },
+        )
+    }
     Box(Modifier.fillMaxSize()) {
         AlbumArtBackdrop(uri = displayUri, embeddedSourceUri = displayEmbeddedSource)
         LazyVerticalGrid(
@@ -4898,8 +4947,12 @@ private fun ArtistDetailScreen(
             item(span = { GridItemSpan(maxLineSpan) }) {
                 SectionTitle("Albuns")
             }
-            gridItems(albums, key = { it.key }) { album ->
-                AlbumGridCard(album = album, onClick = { onOpenAlbum(album) })
+            gridItems(sortedAlbums, key = { it.key }) { album ->
+                AlbumGridCard(
+                    album = album,
+                    onClick = { onOpenAlbum(album) },
+                    subtitle = album.year.takeIf { it > 0 }?.toString(),
+                )
             }
         }
 
@@ -5599,6 +5652,11 @@ private fun AlbumDetailScreen(
     onApplyArtwork: (LocalAlbum) -> Unit = {},
     currentlyPlayingSongId: Long? = null,
     listState: LazyListState = rememberLazyListState(),
+    // "Mais desse artista" (pedido do usuario 15/09/2026) - outros albuns do MESMO artista,
+    // pra navegar sem voltar pra tela do artista. Vazio pra albuns "various artists" (nao ha
+    // "o artista" desse album pra buscar mais coisas dele).
+    otherArtistAlbums: List<LocalAlbum> = emptyList(),
+    onOpenAlbum: (LocalAlbum) -> Unit = {},
 ) {
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
@@ -5672,7 +5730,7 @@ private fun AlbumDetailScreen(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            "${album.songs.size} faixas",
+                            if (album.year > 0) "${album.songs.size} faixas • ${album.year}" else "${album.songs.size} faixas",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -5770,6 +5828,30 @@ private fun AlbumDetailScreen(
                         isPlaying = song.id == currentlyPlayingSongId,
                         showArtwork = album.isVariousArtists,
                     )
+                }
+            }
+            if (otherArtistAlbums.isNotEmpty()) {
+                item {
+                    Spacer(Modifier.height(6.dp))
+                    Box(Modifier.padding(horizontal = 18.dp)) {
+                        SectionTitle("Mais desse artista")
+                    }
+                }
+                item {
+                    LazyRow(
+                        flingBehavior = rememberSoftFlingBehavior(),
+                        contentPadding = PaddingValues(horizontal = 18.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        items(otherArtistAlbums, key = { it.key }) { other ->
+                            AlbumGridCard(
+                                album = other,
+                                onClick = { onOpenAlbum(other) },
+                                subtitle = other.year.takeIf { it > 0 }?.toString(),
+                                modifier = Modifier.width(120.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -6730,10 +6812,16 @@ private fun AlbumGridCard(
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
     compact: Boolean = false,
+    // Segunda linha do card - artista por padrao (telas com albuns de varios artistas
+    // misturados), sobrescrito com o ano em ArtistDetailScreen (artista ja e o contexto ali,
+    // mostrar de novo seria redundante).
+    subtitle: String? = album.artist,
+    // fillMaxWidth por padrao (grid) - "Mais desse artista" (AlbumDetailScreen) passa uma
+    // largura fixa pra caber numa LazyRow horizontal.
+    modifier: Modifier = Modifier.fillMaxWidth(),
 ) {
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
@@ -6762,9 +6850,9 @@ private fun AlbumGridCard(
             fontWeight = FontWeight.Normal,
             style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
         )
-        if (!compact) {
+        if (!compact && !subtitle.isNullOrBlank()) {
             Text(
-                album.artist,
+                subtitle,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -7552,18 +7640,20 @@ private fun ContinueListeningCard(
     isPlaying: Boolean,
     lyrics: LyricsUiState = LyricsUiState(),
     onClick: () -> Unit,
+    onPlayPauseClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     Column(modifier = modifier.fillMaxWidth()) {
-        SectionTitle(if (isPlaying) "Tocando agora" else "Continuar ouvindo")
+        PlaybackStatusTitle(isPlaying = isPlaying)
         if (isLandscape) {
             ContinueListeningLandscapeCard(
                 content = content,
                 isPlaying = isPlaying,
                 lyrics = lyrics,
                 onClick = onClick,
+                onPlayPauseClick = onPlayPauseClick,
             )
             return@Column
         }
@@ -7577,6 +7667,7 @@ private fun ContinueListeningCard(
                 content = content,
                 isPlaying = isPlaying,
                 lyrics = lyrics,
+                onPlayPauseClick = onPlayPauseClick,
                 modifier = Modifier.fillMaxWidth().aspectRatio(1f),
             )
             Spacer(Modifier.height(10.dp))
@@ -7616,6 +7707,7 @@ private fun ContinueListeningLandscapeCard(
     isPlaying: Boolean,
     lyrics: LyricsUiState,
     onClick: () -> Unit,
+    onPlayPauseClick: () -> Unit,
 ) {
     val configuration = LocalConfiguration.current
     val compactLandscape = configuration.screenHeightDp < 420
@@ -7641,6 +7733,7 @@ private fun ContinueListeningLandscapeCard(
                 content = content,
                 isPlaying = isPlaying,
                 lyrics = lyrics,
+                onPlayPauseClick = onPlayPauseClick,
                 modifier = Modifier.size(artworkSize),
             )
         }
@@ -7699,6 +7792,7 @@ private fun HomePlaybackArtwork(
     content: HomePlaybackCardContent,
     isPlaying: Boolean,
     lyrics: LyricsUiState,
+    onPlayPauseClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier) {
@@ -7723,7 +7817,8 @@ private fun HomePlaybackArtwork(
                     .align(Alignment.Center)
                     .size(64.dp)
                     .clip(CircleShape)
-                    .background(PailerCharcoal.copy(alpha = 0.75f)),
+                    .background(PailerCharcoal.copy(alpha = 0.75f))
+                    .clickable(onClick = onPlayPauseClick),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -8205,6 +8300,23 @@ private fun FullPlayer(
                 // Travado na MESMA caixa fillMaxWidth().aspectRatio(1f) que a capa ocupava, entao
                 // titulo/seek/controles/"Mais de <album>" ficam na posicao exata de sempre.
                 val pagerState = rememberPagerState(pageCount = { 2 })
+                // Arrastar ate a pagina da letra ja e um pedido implicito de ve-la - dispara a
+                // busca online sozinho quando chega la sem letra carregada ainda, sem precisar de
+                // botao "Buscar online" (pedido do usuario 15/09/2026). So tenta 1 vez por musica:
+                // se falhar, lyrics.message fica preenchido e trava o auto-retry ate trocar de
+                // faixa (ai o ViewModel reresenta o estado e message volta a null).
+                LaunchedEffect(pagerState.currentPage, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.isEmpty, lyrics.message) {
+                    if (pagerState.currentPage == 1 &&
+                        player.songId != null &&
+                        lyrics.songId == player.songId &&
+                        !lyrics.isLoading &&
+                        !lyrics.isFetching &&
+                        lyrics.lyrics.isEmpty &&
+                        lyrics.message == null
+                    ) {
+                        onFetchLyrics()
+                    }
+                }
                 HorizontalPager(
                     state = pagerState,
                     modifier = Modifier
@@ -8225,7 +8337,6 @@ private fun FullPlayer(
                         LyricsPage(
                             lyrics = lyrics,
                             positionMs = player.positionMs,
-                            onFetch = onFetchLyrics,
                             onEdit = onEditLyrics,
                             modifier = Modifier
                                 .fillMaxSize()
@@ -8447,15 +8558,15 @@ private fun LyricsOverflowMenu(
     }
 }
 
-// Pagina de letra do player (arrasta pro lado a partir da capa). Estados: carregando / vazio
-// (com botoes buscar/colar) / buscando / com letra sincronizada (destaca e rola a linha atual
+// Pagina de letra do player (arrasta pro lado a partir da capa). Estados: carregando / vazio (a
+// busca online ja disparou sozinha ao chegar aqui - so mostra "Colar letra" se ela falhar, ver o
+// LaunchedEffect em FullPlayer) / buscando / com letra sincronizada (destaca e rola a linha atual
 // usando player.positionMs, que ja pulsa pelo polling existente - sem timer novo) / letra sem
 // sincronia (texto rolavel).
 @Composable
 private fun LyricsPage(
     lyrics: LyricsUiState,
     positionMs: Long,
-    onFetch: () -> Unit,
     onEdit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -8483,10 +8594,7 @@ private fun LyricsPage(
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onFetch) { Text("Buscar online") }
-                    OutlinedButton(onClick = onEdit) { Text("Colar letra") }
-                }
+                Button(onClick = onEdit) { Text("Colar letra") }
             }
 
             else -> {
@@ -8542,6 +8650,7 @@ private fun LyricsPage(
                                 LyricsSource.EMBEDDED -> "Letra do arquivo"
                                 LyricsSource.MANUAL -> "Colada por você"
                                 LyricsSource.LRCLIB -> "LRCLIB"
+                                LyricsSource.LYRICS_OVH -> "lyrics.ovh"
                                 LyricsSource.NONE -> ""
                             },
                             modifier = Modifier.weight(1f),
@@ -9040,6 +9149,30 @@ private fun ArtistAvatar(name: String) {
             fontWeight = FontWeight.Black,
             color = MaterialTheme.colorScheme.primary,
         )
+    }
+}
+
+@Composable
+private fun PlaybackStatusTitle(isPlaying: Boolean, modifier: Modifier = Modifier) {
+    // "Continuar ouvindo" fica fixo enquanto pausado. Ao dar play, "Tocando agora" entra com
+    // animação, fica 3s e recolhe (some) - pedido do usuario 15/09/2026.
+    var visible by remember { mutableStateOf(true) }
+    LaunchedEffect(isPlaying) {
+        if (isPlaying) {
+            visible = true
+            delay(3_000)
+            visible = false
+        } else {
+            visible = true
+        }
+    }
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
+        modifier = modifier,
+    ) {
+        SectionTitle(if (isPlaying) "Tocando agora" else "Continuar ouvindo")
     }
 }
 

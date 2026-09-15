@@ -7,7 +7,7 @@ package com.pailer.localtune.data
 // A letra NAO e gravada nos arquivos de audio do usuario (ADR-008): mora so em
 // filesDir/lyrics/<songId>.lrc + index.json (ver LyricsRepository) e entra no backup.
 
-enum class LyricsSource { NONE, EMBEDDED, MANUAL, LRCLIB }
+enum class LyricsSource { NONE, EMBEDDED, MANUAL, LRCLIB, LYRICS_OVH }
 
 data class LyricsLine(
     // null = linha sem marca de tempo (texto puro, ou linha solta de um LRC misto)
