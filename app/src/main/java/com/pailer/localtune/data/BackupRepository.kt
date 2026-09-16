@@ -43,6 +43,16 @@ class BackupRepository(private val context: Context) {
 
     fun lastBackupAt(): Long = backupSettingsPrefs.getLong(KEY_LAST_BACKUP_AT, 0L)
 
+    // Prompt de "restaurar backup?" no primeiro uso com a biblioteca vazia de favoritos/historico
+    // (ver LocalTuneViewModel.maybeOfferFreshRestore) - pedido do usuario 15/09/2026 pra reduzir o
+    // atrito de reinstalar (ex.: ao unificar a chave de assinatura de release). So dispara 1 vez
+    // por instalacao, nunca mais de novo depois (evita incomodar quem realmente comecou do zero).
+    fun hasOfferedFreshRestorePrompt(): Boolean = backupSettingsPrefs.getBoolean(KEY_FRESH_RESTORE_PROMPT_SHOWN, false)
+
+    fun markFreshRestorePromptOffered() {
+        backupSettingsPrefs.edit().putBoolean(KEY_FRESH_RESTORE_PROMPT_SHOWN, true).apply()
+    }
+
     // Uri de SAF (Storage Access Framework) so continua valida entre reaberturas do app/reboots
     // se a permissao for tornada "persistente" explicitamente - sem isso, some depois que o
     // processo que abriu o seletor de arquivos morre.
@@ -216,6 +226,7 @@ class BackupRepository(private val context: Context) {
         private const val BACKUP_SCHEMA_VERSION = 4
         private const val KEY_BACKUP_URI = "backup_uri"
         private const val KEY_LAST_BACKUP_AT = "last_backup_at"
+        private const val KEY_FRESH_RESTORE_PROMPT_SHOWN = "fresh_restore_prompt_shown"
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_CREATED_AT = "createdAt"
         private const val KEY_PREFS = "prefs"

@@ -567,6 +567,38 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         uri?.let(viewModel::chooseAppFolder)
     }
     val library = viewModel.libraryState.value
+    // Oferece restaurar backup na primeira vez que a biblioteca carrega vazia de
+    // favoritos/historico (ver maybeOfferFreshRestore) - so dispara 1 vez por instalacao.
+    LaunchedEffect(library.hasLoaded) {
+        if (library.hasLoaded) viewModel.maybeOfferFreshRestore()
+    }
+    if (viewModel.showFreshRestorePrompt.value) {
+        AlertDialog(
+            onDismissRequest = viewModel::dismissFreshRestorePrompt,
+            icon = { Icon(Icons.Filled.CloudUpload, contentDescription = null) },
+            title = { Text("Já tem um backup?") },
+            text = {
+                Text(
+                    "Se você já usou o Pailer FM antes (favoritos, histórico, correções de " +
+                        "álbum/artista, fotos), pode restaurar tudo agora de um arquivo de backup " +
+                        "antes de continuar.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.dismissFreshRestorePrompt()
+                    backupRestoreLauncher.launch(arrayOf("application/json", "*/*"))
+                }) {
+                    Text("Restaurar backup")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::dismissFreshRestorePrompt) {
+                    Text("Começar do zero")
+                }
+            },
+        )
+    }
     val content = viewModel.libraryContentState.value
     val player = viewModel.playerState.value
     // Reaparece na hora quando uma midia comeca a tocar (hasMedia false->true) e reinicia a

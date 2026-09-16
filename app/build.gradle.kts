@@ -5,11 +5,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// keystore.properties + keystore/pailer-release.jks (fora do git, ver .gitignore) ficam
-// prontos pra uma assinatura de release "de verdade" no dia que fizer sentido publicar
-// (ex.: Play Store). Ate la, a build release assina com a mesma chave de debug (ver
-// buildTypes.release abaixo) de proposito, pra instalar por cima da build debug ja em
-// uso sem pedir desinstalar e perder dados locais. Ver docs/RELEASE.md.
+// keystore.properties + keystore/pailer-release.jks (fora do git, ver .gitignore) - chave de
+// release dedicada, usada pela build release tanto local quanto no CI (ver buildTypes.release
+// abaixo e ADR-032 em docs/DECISIONS.md). Ate 15/09/2026 a build local assinava com a chave de
+// debug de proposito (ADR-012) pra nunca pedir desinstalar no aparelho de teste - mas isso deixava
+// a build local com uma assinatura DIFERENTE da que o CI publica (push/tag na master, ver
+// build-apk.yml), entao quem recebia um APK de um lado e depois do outro (ex.: um amigo pra quem o
+// app e distribuido) caia em "nao consegue atualizar, precisa desinstalar" toda vez. ADR-032
+// unificou as duas em uma so - custo de UM desinstalar na migracao, resolvido depois disso.
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
@@ -81,13 +84,13 @@ android {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
-            // Local (keystore.properties nao existe na maquina de qualquer dev que nao seja
-            // a que gerou a chave): chave de debug de proposito — ver comentario no topo do
-            // arquivo, instalar por cima da build debug sem perder dados locais. CI (secrets
-            // do repo, so fora de pull_request - ver build-apk.yml) assina de verdade com a
-            // chave de release, pra release/tag publicado sair assinado com a chave que os
-            // aparelhos ja confiam.
-            signingConfig = if (hasCiSigningConfig) {
+            // Chave de release dedicada sempre que uma fonte dela existir - local
+            // (keystore.properties, so na maquina que tem o arquivo) OU CI (secrets do repo,
+            // so fora de pull_request - ver build-apk.yml). So cai pra "debug" quando NENHUMA
+            // das duas existe (ex.: clonando o repo sem keystore.properties nem secrets) - ver
+            // ADR-032 em docs/DECISIONS.md pro porque de unificar em vez de manter a build local
+            // na chave de debug (ADR-012, superada).
+            signingConfig = if (keystorePropertiesFile.exists() || hasCiSigningConfig) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")

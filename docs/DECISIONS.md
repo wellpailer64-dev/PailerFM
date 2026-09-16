@@ -1620,3 +1620,51 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   auto-scroll do pager da Biblioteca compara `pagerState.currentPage != librarySection.ordinal`
   antes de chamar `animateScrollToPage` — tirar essa checagem faz o pager brigar consigo
   mesmo (`LaunchedEffect` dos dois lados reagindo em loop) toda vez que o usuário arrasta.
+
+## ADR-032 — Build release local passa a assinar com a chave de release dedicada (supera ADR-012)
+
+- **Contexto:** o app é enviado pra um amigo instalar (não só o próprio aparelho do
+  usuário). ADR-012 fixou a build release local assinando com a chave de debug de
+  propósito, pra nunca precisar desinstalar no APARELHO DE TESTE do usuário. Só que o
+  CI (`.github/workflows/build-apk.yml`) assina os builds de push/tag na `master` com a
+  chave de release DEDICADA (`keystore/pailer-release.jks`, via secret
+  `RELEASE_KEYSTORE_BASE64`) e publica um GitHub Release automático a cada merge. Ou
+  seja, `dist/PailerFM.apk` (copiado de um build local) e o APK do GitHub Release nunca
+  tiveram a mesma assinatura — se o amigo instalou uma vez de um lado e depois recebe um
+  APK do outro lado, o Android recusa "atualizar por cima" (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`,
+  identidades de assinatura diferentes) e exige desinstalar, perdendo os dados locais dele.
+  Usuário perguntou por que isso acontecia (15/09/2026) e, depois de confirmar que o
+  backup (ADR relacionado: ver `BackupRepository`) já cobre favoritos/histórico/overrides/
+  fotos/letras e que o prompt de restauração no primeiro uso (ver abaixo) funciona de
+  ponta a ponta, pediu pra unificar as chaves em vez de manter as duas.
+- **Decisão:** `app/build.gradle.kts`, `buildTypes.release.signingConfig` passa a usar
+  `signingConfigs.getByName("release")` (chave dedicada, criada a partir de
+  `keystore.properties` local OU das env vars de CI) sempre que uma das duas fontes
+  existir — só cai pra `signingConfigs.getByName("debug")` quando NENHUMA delas está
+  configurada (ex.: CI rodando um `pull_request`, ou alguém clonando o repo sem
+  `keystore.properties` nem secrets). Como `keystore.properties` +
+  `../keystore/pailer-release.jks` já existiam prontos e sem uso (ADR-012), a mudança é
+  só essa condição — nenhum arquivo de chave novo precisou ser criado.
+- **Efeito colateral aceito (avisado antes, ver ADR-012):** no primeiro `adb install`
+  release depois dessa mudança, tanto o aparelho de teste do usuário quanto o do amigo
+  precisam desinstalar o app antes de instalar por cima (a assinatura mudou de debug pra
+  release dedicada) — perde favoritos/histórico/overrides/pacote de voz TTS locais UMA
+  VEZ. Depois disso, toda build futura (local OU CI) sai com a MESMA assinatura pra
+  sempre, resolvendo o problema de vez.
+- **Rede de segurança pro efeito colateral:** `LocalTuneViewModel.maybeOfferFreshRestore()` +
+  `BackupRepository.hasOfferedFreshRestorePrompt()`/`markFreshRestorePromptOffered()` —
+  na primeira abertura com a biblioteca carregada e ZERO histórico/favoritos/perfil (sinal
+  de instalação nova), a Home mostra um diálogo "Já tem um backup?" com botão "Restaurar
+  backup" (abre o mesmo seletor de arquivo do fluxo manual em Configurações) antes do
+  usuário nem perceber que perdeu algo. Só oferece 1 vez por instalação (nunca mais
+  depois, pra não incomodar quem realmente começou do zero). Testado ao vivo 15/09/2026:
+  desinstalar + reinstalar mostrou o diálogo sozinho, e restaurar de um backup real
+  trouxe de volta favoritos/histórico corretamente.
+- **Motivo:** distribuir pra terceiros (não só o próprio aparelho de teste) exige uma
+  assinatura estável — ter DUAS chaves diferentes pro "mesmo" APK é uma armadilha
+  recorrente (aconteceu de novo), e agora que o backup cobre a recuperação, o custo do
+  ADR-012 (nunca desinstalar) deixou de valer mais que o problema que ele causava.
+- **Não mudar sem avisar antes:** voltar a usar `signingConfigs.getByName("debug")`
+  incondicionalmente désfaz a unificação e faz a mesma armadilha (dist/PailerFM.apk vs.
+  GitHub Release com assinaturas diferentes) acontecer de novo na próxima vez que os dois
+  caminhos forem usados pro mesmo destinatário.

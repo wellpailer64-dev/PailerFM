@@ -1927,6 +1927,33 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Prompt de "restaurar backup?" na primeira abertura com a biblioteca vazia de favoritos/
+    // historico/perfil (pedido do usuario 15/09/2026, pra reduzir o atrito de reinstalar - ex.:
+    // ao unificar a chave de assinatura de release). Chamado uma vez quando a library termina de
+    // carregar (ver LaunchedEffect(library.hasLoaded) em LocalTuneApp.kt) - hasOfferedFreshRestorePrompt
+    // garante que so acontece 1 vez por instalacao, nunca mais depois (nem incomoda quem comecou
+    // do zero de verdade, nem fica reaparecendo pra sempre).
+    var showFreshRestorePrompt = androidx.compose.runtime.mutableStateOf(false)
+        private set
+
+    fun maybeOfferFreshRestore() {
+        if (backupRepository.hasOfferedFreshRestorePrompt()) return
+        val lib = libraryState.value
+        val looksFresh = lib.historyIds.isEmpty() &&
+            lib.favoriteAlbumKeys.isEmpty() &&
+            lib.favoriteSongIds.isEmpty() &&
+            lib.favoriteArtistKeys.isEmpty() &&
+            lib.lastSongId == null
+        if (looksFresh) {
+            showFreshRestorePrompt.value = true
+        }
+        backupRepository.markFreshRestorePromptOffered()
+    }
+
+    fun dismissFreshRestorePrompt() {
+        showFreshRestorePrompt.value = false
+    }
+
     fun openArtworkSearch(album: LocalAlbum) {
         pendingArtworkBytes = null
         albumArtworkState.value = albumArtworkState.value.copy(
