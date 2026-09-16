@@ -41,6 +41,13 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
+        // Tag da release do GitHub que gerou ESSE build (ver build-apk.yml, "Calcula tag da
+        // build" - roda ANTES do assembleRelease e passa por essa env var) - e o que
+        // UpdateCheckRepository compara contra a ultima release publicada pra saber se tem
+        // atualizacao disponivel. "local-dev" (builds locais, sem CI) desliga a checagem sozinho -
+        // ver LocalTuneViewModel.checkForUpdate.
+        buildConfigField("String", "RELEASE_TAG", "\"${System.getenv("APP_RELEASE_TAG") ?: "local-dev"}\"")
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -100,6 +107,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

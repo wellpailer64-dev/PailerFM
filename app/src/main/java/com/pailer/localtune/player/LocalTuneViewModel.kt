@@ -70,6 +70,8 @@ import com.pailer.localtune.data.RadioScriptSource
 import com.pailer.localtune.data.RadioSpeaker
 import com.pailer.localtune.data.RadioVoicePackageRepository
 import com.pailer.localtune.data.RadioWriterPackageRepository
+import com.pailer.localtune.data.LatestReleaseInfo
+import com.pailer.localtune.data.UpdateCheckRepository
 import com.pailer.localtune.data.withPhilosophicalCloser
 import org.json.JSONArray
 import org.json.JSONObject
@@ -248,6 +250,20 @@ data class BackupUiState(
     val message: String? = null,
 )
 
+// Auto-atualizacao fora da Play Store (pedido do usuario 15/09/2026, ver UpdateCheckRepository) -
+// popup "Nova versao disponivel" ao abrir o app, com download + instalacao direto de dentro dele
+// (nao so um link pro navegador). downloadedApkFile preenchido = pronto pra abrir o instalador
+// (ver LocalTuneApp.kt, precisa de Context/FileProvider que o ViewModel nao tem acesso direto).
+data class UpdateUiState(
+    val isChecking: Boolean = false,
+    val latestRelease: LatestReleaseInfo? = null,
+    val isDownloading: Boolean = false,
+    val downloadProgress: Float = 0f,
+    val downloadedApkFile: File? = null,
+    val dismissed: Boolean = false,
+    val message: String? = null,
+)
+
 // Pasta oficial do Pailer FM (ver AppFolderRepository) - onde o app organiza Backup, Logs,
 // Redator Local e Pacote de Vozes. folderName nulo = usuario ainda nao escolheu nenhuma.
 data class AppFolderUiState(
@@ -411,6 +427,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely/testGeminiFlashTtsVoices abaixo.
     private val geminiFlashTtsEngine = GeminiFlashTtsEngine(application)
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
+    private val updateCheckRepository = UpdateCheckRepository(application)
     private val lyricsRepository = LyricsRepository(application)
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
@@ -638,6 +655,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             lastBackupAtMillis = backupRepository.lastBackupAt(),
         ),
     )
+        private set
+
+    var updateState = androidx.compose.runtime.mutableStateOf(UpdateUiState())
         private set
 
     var appFolderState = androidx.compose.runtime.mutableStateOf(
@@ -1952,6 +1972,48 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun dismissFreshRestorePrompt() {
         showFreshRestorePrompt.value = false
+    }
+
+    // --- Auto-atualizacao fora da Play Store (pedido do usuario 15/09/2026, ver
+    // UpdateCheckRepository/docs sobre build-apk.yml) ---
+
+    // Chamado uma vez na abertura do app (ver LaunchedEffect em LocalTuneApp.kt). Silencioso em
+    // build local (BuildConfig.RELEASE_TAG == "local-dev", ver isNewerThanCurrent) e em qualquer
+    // falha de rede - checagem de atualizacao nunca deve incomodar nem travar o uso normal do app.
+    fun checkForUpdate() {
+        if (updateState.value.isChecking || updateState.value.latestRelease != null) return
+        updateState.value = updateState.value.copy(isChecking = true)
+        viewModelScope.launch {
+            val release = runCatching { updateCheckRepository.fetchLatestRelease() }.getOrNull()
+            val hasUpdate = release != null && updateCheckRepository.isNewerThanCurrent(release.tagName)
+            updateState.value = updateState.value.copy(
+                isChecking = false,
+                latestRelease = if (hasUpdate) release else null,
+            )
+        }
+    }
+
+    fun dismissUpdatePrompt() {
+        updateState.value = updateState.value.copy(dismissed = true)
+    }
+
+    // Baixa o APK da release (streaming, com progresso - ver UpdateCheckRepository.downloadApk) e
+    // deixa pronto em downloadedApkFile; quem abre o instalador de verdade e a UI
+    // (LocalTuneApp.kt), que tem o Context/FileProvider pra montar o content:// URI.
+    fun downloadUpdate() {
+        val release = updateState.value.latestRelease ?: return
+        if (updateState.value.isDownloading) return
+        updateState.value = updateState.value.copy(isDownloading = true, downloadProgress = 0f, message = null)
+        viewModelScope.launch {
+            val file = updateCheckRepository.downloadApk(release.apkDownloadUrl) { progress ->
+                updateState.value = updateState.value.copy(downloadProgress = progress)
+            }
+            updateState.value = updateState.value.copy(
+                isDownloading = false,
+                downloadedApkFile = file,
+                message = if (file == null) "Não consegui baixar a atualização. Tenta de novo." else null,
+            )
+        }
     }
 
     fun openArtworkSearch(album: LocalAlbum) {

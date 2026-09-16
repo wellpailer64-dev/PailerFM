@@ -1668,3 +1668,57 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   incondicionalmente désfaz a unificação e faz a mesma armadilha (dist/PailerFM.apk vs.
   GitHub Release com assinaturas diferentes) acontecer de novo na próxima vez que os dois
   caminhos forem usados pro mesmo destinatário.
+
+## ADR-033 — Auto-atualização in-app (código pronto, ATIVAÇÃO PENDENTE — repo precisa virar público)
+
+- **Contexto:** usuário pediu (15/09/2026) pra quem já tem o app instalado receber um popup
+  de "nova versão disponível" e atualizar direto pelo app (baixa + abre o instalador
+  sozinho), em vez de precisar mandar o APK manualmente pelo WhatsApp toda vez que uma
+  build nova sai no GitHub.
+- **Decisão (implementação):**
+  - `app/build.gradle.kts`: `buildConfigField("String", "RELEASE_TAG", ...)` lido de
+    `System.getenv("APP_RELEASE_TAG")` (ou `"local-dev"` localmente) - a tag da release do
+    GitHub que gerou ESSE build especificamente.
+  - `.github/workflows/build-apk.yml`: o passo "Calcula tag da build" foi movido pra ANTES
+    do `assembleRelease` (antes rodava só depois, só pro nome do Release) e agora tanto
+    alimenta `APP_RELEASE_TAG` do build quanto o `tag_name` do Release publicado depois -
+    as duas sempre a MESMA string, senão a comparação no app nunca bateria.
+  - `UpdateCheckRepository` (novo, `data/`): `fetchLatestRelease()` lê
+    `GET /repos/.../releases?per_page=1` (a LISTAGEM, não `/releases/latest` - ver achado
+    abaixo), `isNewerThanCurrent()` compara por partes numéricas (não string crua, pra
+    "v2026.09.2-9" não perder de "v2026.09.10-1" por ordem lexicográfica), e
+    `downloadApk()` baixa em streaming com progresso pra `cacheDir/app_update/`.
+  - `LocalTuneViewModel`: `UpdateUiState` + `checkForUpdate()` (1x na abertura do app,
+    silencioso em qualquer falha - nunca deve travar/incomodar o uso normal),
+    `downloadUpdate()`, `dismissUpdatePrompt()`.
+  - `LocalTuneApp.kt`: `UpdateAvailableDialog` (popup com progresso de download) +
+    `installApkUpdate()` (abre `ACTION_VIEW` com o APK baixado via FileProvider assim que o
+    download termina - sem passar por navegador nenhum).
+  - `AndroidManifest.xml`: `REQUEST_INSTALL_PACKAGES` (senão o Android bloqueia o intent de
+    instalar) + nova entrada em `res/xml/file_paths.xml` (`app_update/`) pro FileProvider já
+    existente (mesmo do zip de álbum, ADR-030) expor o APK baixado.
+- **ACHADOS AO VIVO 15/09/2026 (2 bugs reais, corrigidos antes de travar em qualquer coisa):**
+  1. `GET /releases/latest` devolve 404 sempre nesse repo - esse endpoint IGNORA
+     prereleases (doc do GitHub: "the most recent non-prerelease, non-draft release"), e
+     TODA release publicada pelo push automático na master sai `prerelease: true` (só uma
+     tag manual `v*` sairia "de verdade" - ver ADR de baixo do build-apk.yml). Trocado pra
+     `GET /releases` (listagem, mais recente primeiro) + pega o item `[0]`.
+  2. Mesmo corrigido o endpoint, a checagem continua retornando nada: **o repositório
+     `wellpailer64-dev/PailerFM` está PRIVADO** (confirmado via `gh repo view`). A API do
+     GitHub devolve 404 (não 403, de propósito - não revela nem que o repo existe) pra
+     qualquer leitura anônima em repo privado, prereleases ou não. Sem autenticação não dá
+     pra checar releases; e colocar um token no app é inseguro (qualquer um extrai de um
+     APK distribuído).
+- **PENDENTE - decisão do usuário:** perguntei se quer tornar o repositório público (única
+  forma de checagem anônima funcionar sem servidor próprio nem token exposto). Usuário
+  respondeu que vai discutir com o parceiro antes de decidir. **O código fica pronto e
+  "adormecido"**: com o repo privado, `fetchLatestRelease()` sempre devolve `null`
+  (silenciosamente, sem crash nem mensagem de erro pro usuário final) e o popup nunca
+  aparece - comportamento seguro por padrão, não precisa de flag nem reverter nada. Quando
+  o usuário decidir, só falta tornar o repo público pra a feature come  çar a funcionar
+  sozinha, sem mexer em mais nada.
+- **Não mudar sem avisar antes:** se decidirem manter o repo privado pra sempre, essa
+  feature nunca vai funcionar do jeito atual (sem servidor/backend próprio) - nesse caso,
+  a alternativa seria voltar a distribuir por link/WhatsApp manual (fluxo de antes) ou
+  montar um backend/proxy autenticado só pra expor a info de release (fora de escopo por
+  ora, não implementado).

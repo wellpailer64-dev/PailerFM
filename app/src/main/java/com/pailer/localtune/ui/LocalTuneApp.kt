@@ -255,6 +255,7 @@ import com.pailer.localtune.player.PlayerUiState
 import com.pailer.localtune.player.RadioBulletinBufferUiState
 import com.pailer.localtune.player.RadioBulletinUiState
 import com.pailer.localtune.player.RadioVoiceUiState
+import com.pailer.localtune.player.UpdateUiState
 import com.pailer.localtune.player.UserProfileUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
 import com.pailer.localtune.ui.theme.PailerCharcoal
@@ -572,6 +573,23 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // favoritos/historico (ver maybeOfferFreshRestore) - so dispara 1 vez por instalacao.
     LaunchedEffect(library.hasLoaded) {
         if (library.hasLoaded) viewModel.maybeOfferFreshRestore()
+    }
+
+    // Auto-atualizacao fora da Play Store (pedido do usuario 15/09/2026, ver
+    // UpdateCheckRepository) - checa 1 vez ao abrir o app; quando o download termina, abre o
+    // instalador sozinho (ver installApkUpdate abaixo) em vez de so oferecer um botao "Instalar".
+    val updateContext = LocalContext.current
+    val updateState = viewModel.updateState.value
+    LaunchedEffect(Unit) { viewModel.checkForUpdate() }
+    LaunchedEffect(updateState.downloadedApkFile) {
+        updateState.downloadedApkFile?.let { installApkUpdate(updateContext, it) }
+    }
+    if (updateState.latestRelease != null && !updateState.dismissed) {
+        UpdateAvailableDialog(
+            state = updateState,
+            onDownload = viewModel::downloadUpdate,
+            onDismiss = viewModel::dismissUpdatePrompt,
+        )
     }
     if (viewModel.showFreshRestorePrompt.value) {
         AlertDialog(
@@ -5816,6 +5834,70 @@ private fun shareAlbumAsZip(context: Context, scope: CoroutineScope, songs: List
         }
         context.startActivity(Intent.createChooser(intent, "Compartilhar album (zip)"))
     }
+}
+
+// Abre o instalador do Android direto pro APK ja baixado (ver UpdateCheckRepository.downloadApk/
+// UpdateUiState.downloadedApkFile) - mesmo padrao de FileProvider do buildAlbumZip acima (um File
+// cru de cache nao pode virar Uri content:// pra outro "app" - aqui o proprio PackageInstaller -
+// sem passar pelo FileProvider). REQUEST_INSTALL_PACKAGES no manifesto faz o Android pedir
+// "permitir que o Pailer FM instale outros apps?" sozinho na primeira vez, antes de prosseguir.
+private fun installApkUpdate(context: Context, apkFile: File) {
+    val uri = runCatching {
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apkFile)
+    }.getOrNull() ?: return
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
+}
+
+// Popup "Nova versao disponivel" (pedido do usuario 15/09/2026) - substitui ter que mandar o APK
+// manualmente pelo WhatsApp toda vez. "Agora nao" so fecha pra essa sessao (reaparece no proximo
+// launch enquanto a versao instalada continuar desatualizada - pedido explicito era um popup, nao
+// um botao escondido em Configuracoes).
+@Composable
+private fun UpdateAvailableDialog(
+    state: UpdateUiState,
+    onDownload: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val release = state.latestRelease ?: return
+    AlertDialog(
+        onDismissRequest = { if (!state.isDownloading) onDismiss() },
+        icon = { Icon(Icons.Filled.CloudUpload, contentDescription = null) },
+        title = { Text("Nova versão disponível") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("A versão ${release.tagName} do Pailer FM já está disponível.")
+                if (state.isDownloading) {
+                    LinearProgressIndicator(
+                        progress = { state.downloadProgress },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Baixando... ${(state.downloadProgress * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                state.message?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDownload, enabled = !state.isDownloading) {
+                Text(if (state.isDownloading) "Baixando..." else "Baixar e instalar")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !state.isDownloading) {
+                Text("Agora não")
+            }
+        },
+    )
 }
 
 @Composable

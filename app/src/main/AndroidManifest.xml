@@ -20,6 +20,11 @@
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- Auto-atualizacao (ver UpdateCheckRepository) - baixa o APK da ultima release do GitHub e
+         abre o instalador direto de dentro do app. Sem essa permissao o Android bloqueia
+         silenciosamente o intent de instalar; com ela, o sistema so pede confirmacao normal
+         ("permitir que o Pailer FM instale outros apps?") na primeira vez. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".PailerApplication"

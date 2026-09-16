@@ -3,4 +3,6 @@
      do app fica acessivel via FileProvider. -->
 <paths>
     <cache-path name="shared_zips" path="shared_zips/" />
+    <!-- APK baixado pelo auto-update (ver UpdateCheckRepository) antes de abrir o instalador. -->
+    <cache-path name="app_update" path="app_update/" />
 </paths>

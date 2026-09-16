@@ -47,6 +47,20 @@ jobs:
       - name: Gera local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
+      # Calculada ANTES do build (nao so depois, como antes) pra poder embutir a MESMA tag no
+      # APK via BuildConfig.RELEASE_TAG (ver app/build.gradle.kts e UpdateCheckRepository) - e o
+      # que o app compara contra a ultima release do GitHub pra saber se tem atualizacao. Tag
+      # manual (git tag v0.1.0) usa o proprio nome da tag; qualquer outro caso (push/dispatch na
+      # master) usa data + numero do run, igual sempre foi.
+      - name: Calcula tag da build
+        id: ver
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$(date -u +'%Y.%m.%d')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
       # So fora de pull_request - a chave de release real nunca fica exposta num build de PR
       # (nem de fork nem de branch do proprio repo). Builds de PR continuam saindo com a
       # assinatura de debug, igual sempre foi (ver app/build.gradle.kts).
@@ -62,6 +76,7 @@ jobs:
           RELEASE_KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEYSTORE_PASSWORD || '' }}
           RELEASE_KEY_ALIAS: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_ALIAS || '' }}
           RELEASE_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEY_PASSWORD || '' }}
+          APP_RELEASE_TAG: ${{ steps.ver.outputs.tag }}
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
@@ -81,10 +96,6 @@ jobs:
           name: PailerFM-apk
           path: dist/PailerFM.apk
           retention-days: 30
-
-      - name: Calcula tag por data
-        id: ver
-        run: echo "tag=v$(date -u +'%Y.%m.%d')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       # Merge na master: cria uma tag imutável por data + nº do run e um Release com o APK.
       - name: Publica Release automático (merge na master)
