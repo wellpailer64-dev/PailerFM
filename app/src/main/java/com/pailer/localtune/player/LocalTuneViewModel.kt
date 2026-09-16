@@ -138,6 +138,7 @@ data class PlayerUiState(
     val upcomingTracks: List<String> = emptyList(),
     val isPlaying: Boolean = false,
     val isRadioMuted: Boolean = false,
+    val autoplayEnabled: Boolean = true,
     val hasMedia: Boolean = false,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
@@ -470,6 +471,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // vinheta/passagem/boletim) - ver radioVolume()/toggleRadioMute(). Reseta sozinho em
     // startRadioNewsMode() (cada sessao nova comeca sem mute).
     private var radioMuted = false
+    // "Reproducao automatica" (botao ao lado da legenda na Home, pedido do usuario 15/09/2026,
+    // imitando o autoplay do Youtube) - ligado por padrao. So atua fora do modo radio (a radio ja
+    // tem sua propria continuacao via vinhetas/boletins) e so dispara quando a fila ACABA sozinha
+    // (Player.STATE_ENDED) - ver onEvents/maybeAutoplayNextAlbum.
+    private var autoplayEnabled = true
+    // Evita disparar autoplayNextAlbumSongs() de novo a cada onEvents() enquanto o player fica
+    // parado em STATE_ENDED (varios eventos chegam nesse estado) - reseta assim que a fila muda.
+    private var autoplayHandledForEndedQueue = false
     private var completedRadioSongs = 0
     private var newsBulletins: List<RadioScript> = emptyList()
     private var bulletinReloadInFlight = false
@@ -600,6 +609,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         private set
 
     var metadataState = androidx.compose.runtime.mutableStateOf(MetadataUiState())
+        private set
+
+    // Incrementado sozinho a cada album auto-taggeado (genero/ano) com mudanca pra gravar de
+    // verdade no arquivo - LibraryShell observa isso e chama requestRecentMetadataEditWrite()
+    // sozinha (ver markAutoTagPendingWrite/maybeAutoTagAlbumMetadata), pedido explicito do usuario
+    // 15/09/2026 pra nao depender de visita manual a Configuracoes > Tags pendentes.
+    var autoTagWriteRequestedVersion = androidx.compose.runtime.mutableStateOf(0)
         private set
 
     var albumArtworkState = androidx.compose.runtime.mutableStateOf(AlbumArtworkUiState())
@@ -741,6 +757,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             updatePlayerState(player)
             if (player.isPlaying) recordCurrentSong(player)
             mirrorToRemoteIfNeeded(player)
+            if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED)) {
+                maybeAutoplayNextAlbum(player)
+            }
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -1780,6 +1799,19 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    // Ano de lancamento (pedido do usuario 15/09/2026) - mesmo padrao de approveAlbumGenre, usado
+    // hoje so pela busca automatica (ver maybeAutoTagAlbumMetadata); nao ha tela manual de "albuns
+    // sem ano" equivalente ainda.
+    fun approveAlbumYear(album: LocalAlbum, year: Int) {
+        repository.saveAlbumYearOverride(album, year)
+        val updatedSongs = libraryState.value.songs.map { song ->
+            if (song.albumId == album.id && song.album == album.title) song.copy(year = year) else song
+        }
+        libraryState.value = libraryState.value.copy(songs = updatedSongs)
+        rebuildLibraryContent()
+        viewModelScope.launch { repository.saveCachedSongs(updatedSongs) }
+    }
+
     fun scanAlbumsWithoutArtwork() {
         albumArtworkState.value = albumArtworkState.value.copy(isScanning = true, message = null)
         viewModelScope.launch {
@@ -2073,6 +2105,31 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             appliedVersion = artistPhotoState.value.appliedVersion + 1,
             message = "Voltou a usar a capa de album como foto de \"${artist.name}\".",
         )
+    }
+
+    // Pedido do usuario 15/09/2026 (mesmo padrao do genero automatico ao tocar pela primeira
+    // vez): assim que a pagina do artista abre sem foto propria ainda, busca sozinho na Deezer
+    // (mesma fonte do buscador manual) e aplica o primeiro resultado - o nome mais relevante pra
+    // essa busca, segundo a propria Deezer - sem precisar abrir o buscador. So tenta 1 vez por
+    // artista (ache ou nao), pra nao bater na web de novo toda vez que a pagina abrir. O buscador
+    // manual (agora dentro de "Editar metadados" > Foto do artista, ver ArtistMetadataEditorOverlay)
+    // continua disponivel pra trocar a foto ou tentar de novo se essa automatica nao agradar.
+    fun maybeAutoFetchArtistPhoto(artist: LocalArtist) {
+        if (repository.artistPhotoOverrideUri(artist.key) != null) return
+        if (repository.hasAutoPhotoLookupRun(artist.key)) return
+        repository.markAutoPhotoLookupRun(artist.key)
+        viewModelScope.launch {
+            val candidate = runCatching { repository.searchArtistPhotoCandidates(artist.name) }
+                .getOrDefault(emptyList())
+                .firstOrNull() ?: return@launch
+            val bytes = repository.downloadArtwork(candidate.fullUrl) ?: return@launch
+            val ok = runCatching { repository.applyArtistPhoto(artist.key, bytes) }.getOrDefault(false)
+            if (ok) {
+                artistPhotoState.value = artistPhotoState.value.copy(
+                    appliedVersion = artistPhotoState.value.appliedVersion + 1,
+                )
+            }
+        }
     }
 
     fun scanMissingArtists() {
@@ -2750,6 +2807,84 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.let {
             if (it.isPlaying) it.pause() else it.play()
         }
+    }
+
+    // Botao de "reproducao automatica" na Home (ao lado da legenda) - liga/desliga o autoplay de
+    // album seguinte. Nao mexe na fila atual, so no que acontece quando ela acabar sozinha.
+    fun toggleAutoplay() {
+        autoplayEnabled = !autoplayEnabled
+        controller?.let { updatePlayerState(it) }
+    }
+
+    // Dispara quando a fila termina sozinha (Player.STATE_ENDED) com autoplay ligado e fora do
+    // modo radio - pedido do usuario 15/09/2026, imitando o "continuar reproduzindo" do Youtube:
+    // toca o proximo album do MESMO artista; se nao tiver outro album, pula pro proximo artista da
+    // mesma categoria (genero) da faixa que acabou de tocar.
+    private fun maybeAutoplayNextAlbum(player: Player) {
+        if (player.playbackState != Player.STATE_ENDED) {
+            autoplayHandledForEndedQueue = false
+            return
+        }
+        if (!autoplayEnabled || activeRadioName.isNotBlank() || autoplayHandledForEndedQueue) return
+        autoplayHandledForEndedQueue = true
+        val finishedSongId = player.currentMediaItem?.mediaId?.toLongOrNull() ?: return
+        val finishedSong = libraryContentState.value.songs.firstOrNull { it.id == finishedSongId } ?: return
+        val nextSongs = autoplayNextAlbumSongs(finishedSong) ?: return
+        playSongs(nextSongs, source = "Reprodução automática")
+    }
+
+    // Ver maybeAutoplayNextAlbum acima - primeiro tenta o proximo album (por ano, depois titulo)
+    // do mesmo artista da faixa que terminou; sem outro album, cai pro proximo artista dentro da
+    // MESMA radio de categoria/genero que essa faixa pertence (reusa genreRadios ja calculado em
+    // vez de reclassificar genero na mao - ver dynamicGenreRadios/genreEntriesFor). Faixa sem
+    // genero classificado (tag vazia e nenhum palpite por metadado - MUITO comum em bibliotecas
+    // locais reais, achado ao vivo 15/09/2026: "Chuva"/Froid ficava sem musica seguinte por causa
+    // disso) cai por ultimo pro proximo artista de TODA a biblioteca (ordem alfabetica) - sem essa
+    // ultima rede de seguranca o autoplay simplesmente parava mudo em vez de continuar tocando
+    // algo, o que ia contra o pedido do usuario. Retorna null so quando a biblioteca inteira e de
+    // um unico artista (nao ha mesmo pra onde ir).
+    private fun autoplayNextAlbumSongs(finishedSong: LocalSong): List<LocalSong>? {
+        val content = libraryContentState.value
+        if (content.albums.isEmpty()) return null
+
+        fun sortedAlbumSongs(album: LocalAlbum): List<LocalSong> =
+            album.songs.sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
+
+        fun albumYearOrder(album: LocalAlbum): Int = if (album.year > 0) album.year else Int.MAX_VALUE
+
+        fun firstAlbumSongsFor(artistName: String): List<LocalSong>? =
+            content.albums
+                .filter { album -> album.songs.any { it.artist.equals(artistName, ignoreCase = true) } }
+                .sortedWith(compareBy<LocalAlbum>({ albumYearOrder(it) }).thenBy { it.title.lowercase() })
+                .firstOrNull()
+                ?.let(::sortedAlbumSongs)
+
+        fun nextInList(names: List<String>): String? {
+            if (names.size < 2) return null
+            val currentIndex = names.indexOfFirst { it.equals(finishedSong.artist, ignoreCase = true) }
+                .let { if (it >= 0) it else 0 }
+            return (1 until names.size)
+                .map { offset -> names[(currentIndex + offset) % names.size] }
+                .firstOrNull { !it.equals(finishedSong.artist, ignoreCase = true) }
+        }
+
+        val artistAlbums = content.albums
+            .filter { album -> album.songs.any { it.artist.equals(finishedSong.artist, ignoreCase = true) } }
+            .sortedWith(compareBy<LocalAlbum>({ albumYearOrder(it) }).thenBy { it.title.lowercase() })
+        val currentAlbumIndex = artistAlbums.indexOfFirst { it.id == finishedSong.albumId }
+        if (currentAlbumIndex in artistAlbums.indices && currentAlbumIndex < artistAlbums.lastIndex) {
+            return sortedAlbumSongs(artistAlbums[currentAlbumIndex + 1])
+        }
+
+        val genreRadio = content.genreRadios.firstOrNull { radio -> radio.songs.any { it.id == finishedSong.id } }
+        if (genreRadio != null) {
+            val artistsInGenre = genreRadio.songs.map { it.artist }.distinct().sortedBy { it.lowercase() }
+            nextInList(artistsInGenre)?.let { nextArtist -> firstAlbumSongsFor(nextArtist)?.let { return it } }
+        }
+
+        val allArtists = content.artists.map { it.name }.distinct().sortedBy { it.lowercase() }
+        val nextArtist = nextInList(allArtists) ?: return null
+        return firstAlbumSongsFor(nextArtist)
     }
 
     // Volume "alvo" pros 2 canais de audio da radio (controller = musica, announcementPlayer =
@@ -4566,6 +4701,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             upcomingTracks = cachedUpcomingTracks,
             isPlaying = player.isPlaying,
             isRadioMuted = radioMuted,
+            autoplayEnabled = autoplayEnabled,
             hasMedia = player.mediaItemCount > 0,
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = duration.coerceAtLeast(0L),
@@ -4591,7 +4727,63 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val mediaId = player.currentMediaItem?.mediaId ?: return
         if (mediaId == lastRecordedMediaId) return
         lastRecordedMediaId = mediaId
-        mediaId.toLongOrNull()?.let(::recordPlayback)
+        mediaId.toLongOrNull()?.let {
+            recordPlayback(it)
+            maybeAutoTagAlbumMetadata(it)
+        }
+    }
+
+    // Pedido do usuario 15/09/2026: assim que uma faixa de um album SEM genero e/ou SEM ano toca
+    // pela primeira vez, busca sozinho numa fonte confiavel da web (mesmo
+    // AlbumGenreSuggestionRepository do fluxo manual em Configuracoes > Albuns sem genero) e ja
+    // salva como override o que achar - genero equivalente do nosso catalogo padronizado
+    // (GENRE_TAG_CATALOG via repository.availableGenres) e/ou o ano de lancamento, os dois vindo
+    // da MESMA chamada (iTunes ja devolve releaseDate junto do genero). O usuario sempre pode
+    // revisar/corrigir depois. So tenta 1 vez por album (ver hasAutoGenreLookupRun/
+    // markAutoGenreLookupRun), ache ou nao, pra nao bater na web de novo toda vez que uma faixa
+    // dele tocar. Quando algo e aplicado, tambem dispara sozinho o pedido de permissao do Android
+    // pra gravar de verdade no arquivo (ver markAutoTagPendingWrite/autoTagWriteRequestedVersion e
+    // requestRecentMetadataEditWrite em LocalTuneApp.kt) - pedido explicito do usuario: prefere o
+    // dialogo do sistema aparecer sozinho a ter que abrir Configuracoes > Tags pendentes.
+    private fun maybeAutoTagAlbumMetadata(songId: Long) {
+        val content = libraryContentState.value
+        val song = content.songs.firstOrNull { it.id == songId } ?: return
+        val album = content.albums.firstOrNull { it.id == song.albumId && it.title == song.album } ?: return
+        val needsGenre = song.genre.isBlank() && album.genre.isBlank()
+        val needsYear = album.year <= 0
+        if (!needsGenre && !needsYear) return
+        if (repository.hasAutoGenreLookupRun(album.id, album.title)) return
+        repository.markAutoGenreLookupRun(album.id, album.title)
+        viewModelScope.launch {
+            val availableGenres = repository.availableGenres(libraryState.value.songs)
+            val suggestion = runCatching { genreSuggestionRepository.suggestMetadata(album, availableGenres) }
+                .getOrNull() ?: return@launch
+            var applied = false
+            if (needsGenre && !suggestion.genre.isNullOrBlank()) {
+                approveAlbumGenre(album, suggestion.genre)
+                applied = true
+            }
+            if (needsYear && (suggestion.year ?: 0) > 0) {
+                approveAlbumYear(album, suggestion.year!!)
+                applied = true
+            }
+            if (applied) markAutoTagPendingWrite(album)
+        }
+    }
+
+    // Dispara sozinho o pedido de permissao pra gravar as mudancas automaticas (genero/ano) DESSE
+    // album de verdade no arquivo - escopado so as faixas desse album, mesmo padrao de
+    // requestedTagWriteChanges usado por saveAlbumMetadataEdit/saveArtistMetadataEdits pra edicao
+    // manual. A UI (LibraryShell) observa autoTagWriteRequestedVersion e chama
+    // requestRecentMetadataEditWrite() sozinha quando ele muda.
+    private fun markAutoTagPendingWrite(album: LocalAlbum) {
+        val songs = libraryState.value.songs
+        val albumSongIds = album.songs.map { it.id }.toSet()
+        val scoped = repository.pendingTagChanges(songs)
+            .filter { change -> change.songIds.any { it in albumSongIds } }
+        if (scoped.isEmpty()) return
+        requestedTagWriteChanges = scoped
+        autoTagWriteRequestedVersion.value += 1
     }
 
     private fun recordPlayback(songId: Long) {

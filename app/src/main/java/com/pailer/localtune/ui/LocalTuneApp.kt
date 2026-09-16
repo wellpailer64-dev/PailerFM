@@ -26,8 +26,12 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.ScrollScope
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
@@ -37,6 +41,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -135,6 +141,8 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.SubtitlesOff
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
@@ -199,6 +207,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -430,6 +439,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var selectedArtist by remember { mutableStateOf<LocalArtist?>(null) }
     var selectedRadio by remember { mutableStateOf<LocalRadio?>(null) }
     var selectedGenre by remember { mutableStateOf<LocalRadio?>(null) }
+    // Mini player some sozinho depois de 5s sem nenhum toque na tela e volta a aparecer no
+    // proximo toque (pedido do usuario 15/09/2026, imitando players tipo Youtube Music) - so a
+    // barra do mini player, a navegacao inferior (Inicio/Radio/Biblioteca) fica sempre visivel.
+    // lastInteractionAt e atualizado pelo pointerInput global no Box raiz mais abaixo.
+    var miniPlayerVisible by remember { mutableStateOf(true) }
+    var lastInteractionAt by remember { mutableStateOf(0L) }
     // Estados de scroll hoistados aqui (fora das telas de lista/grade) pra sobreviver a
     // navegacao entre abas e telas de detalhe - sem isso, cada `when` troca de branch destroi
     // e recria o LazyVerticalGrid/LazyColumn da tela anterior, voltando pro topo sempre que o
@@ -471,6 +486,15 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             tagWriteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
         } else {
             viewModel.writePendingTagsToMediaStore()
+        }
+    }
+    // Genero/ano descobertos sozinhos (ver maybeAutoTagAlbumMetadata no ViewModel) disparam o
+    // mesmo pedido de permissao acima sem precisar passar por Configuracoes > Tags pendentes -
+    // pedido explicito do usuario 15/09/2026, mesmo sabendo que o dialogo do Android vai aparecer
+    // sozinho de vez em quando (regra de escrita em arquivo de terceiros, nao da pra evitar).
+    LaunchedEffect(viewModel.autoTagWriteRequestedVersion.value) {
+        if (viewModel.autoTagWriteRequestedVersion.value > 0) {
+            requestRecentMetadataEditWrite()
         }
     }
     var pendingArtworkAlbum by remember { mutableStateOf<LocalAlbum?>(null) }
@@ -545,6 +569,15 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val library = viewModel.libraryState.value
     val content = viewModel.libraryContentState.value
     val player = viewModel.playerState.value
+    // Reaparece na hora quando uma midia comeca a tocar (hasMedia false->true) e reinicia a
+    // contagem de 5s a cada novo toque (lastInteractionAt) - ver Box raiz mais abaixo pro
+    // detector de toque global e AnimatedVisibility no MiniPlayer.
+    LaunchedEffect(lastInteractionAt, player.hasMedia) {
+        if (!player.hasMedia) return@LaunchedEffect
+        miniPlayerVisible = true
+        delay(5_000)
+        miniPlayerVisible = false
+    }
     val lyrics = viewModel.lyricsState.value
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
@@ -680,6 +713,22 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         Modifier
             .fillMaxSize()
             .background(appBackgroundBrush())
+            // Detector de toque global pro auto-hide do mini player (ver miniPlayerVisible acima)
+            // - Initial e sem consumir o evento, entao nao atrapalha nenhum clique/scroll normal
+            // da tela, so observa que um toque aconteceu em qualquer lugar.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        // So conta toque de verdade (pressed) - sem esse filtro, eventos de
+                        // hover/proximidade sem nenhum dedo na tela (achado ao vivo 15/09/2026)
+                        // reiniciavam a contagem sem parar e o mini player nunca sumia sozinho.
+                        if (event.changes.any { it.pressed }) {
+                            lastInteractionAt = System.currentTimeMillis()
+                        }
+                    }
+                }
+            }
     ) {
         BackgroundGrainOverlay()
         val showHomeBackdrop = selectedTab == MainTab.Home &&
@@ -708,32 +757,38 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     modifier = Modifier.padding(end = if (isLandscape) landscapeRailWidth else 0.dp),
                 ) {
                     if (player.hasMedia) {
-                        MiniPlayer(
-                            player = player,
-                            isFavorite = viewModel.isCurrentSongFavorite(),
-                            onOpen = { showFullPlayer = true },
-                            onToggleFavorite = viewModel::toggleCurrentSongFavorite,
-                            onToggle = viewModel::togglePlayPause,
-                            onPrevious = viewModel::skipPrevious,
-                            onNext = viewModel::skipNext,
-                            onToggleMute = viewModel::toggleRadioMute,
-                            onExitRadio = viewModel::stopRadio,
-                            onDislike = {
-                                // dislikeCurrentRadioSong() so troca a fila de verdade do
-                                // ExoPlayer (controller.replaceMediaItem) - radioSession e um
-                                // snapshot separado de UI (ver RadioDetailScreen/sessionSongs,
-                                // "Sequencia ao vivo") que precisa ser corrigido manualmente na
-                                // MESMA posicao, senao a faixa antiga continuava aparecendo la
-                                // mesmo com o player ja tocando a substituta (achado ao vivo
-                                // 11/09/2026).
-                                viewModel.dislikeCurrentRadioSong()?.let { result ->
-                                    if (result.index in radioSession.indices) {
-                                        radioSession = radioSession.toMutableList()
-                                            .apply { this[result.index] = result.replacement }
+                        AnimatedVisibility(
+                            visible = miniPlayerVisible,
+                            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+                            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+                        ) {
+                            MiniPlayer(
+                                player = player,
+                                isFavorite = viewModel.isCurrentSongFavorite(),
+                                onOpen = { showFullPlayer = true },
+                                onToggleFavorite = viewModel::toggleCurrentSongFavorite,
+                                onToggle = viewModel::togglePlayPause,
+                                onPrevious = viewModel::skipPrevious,
+                                onNext = viewModel::skipNext,
+                                onToggleMute = viewModel::toggleRadioMute,
+                                onExitRadio = viewModel::stopRadio,
+                                onDislike = {
+                                    // dislikeCurrentRadioSong() so troca a fila de verdade do
+                                    // ExoPlayer (controller.replaceMediaItem) - radioSession e um
+                                    // snapshot separado de UI (ver RadioDetailScreen/sessionSongs,
+                                    // "Sequencia ao vivo") que precisa ser corrigido manualmente na
+                                    // MESMA posicao, senao a faixa antiga continuava aparecendo la
+                                    // mesmo com o player ja tocando a substituta (achado ao vivo
+                                    // 11/09/2026).
+                                    viewModel.dislikeCurrentRadioSong()?.let { result ->
+                                        if (result.index in radioSession.indices) {
+                                            radioSession = radioSession.toMutableList()
+                                                .apply { this[result.index] = result.replacement }
+                                        }
                                     }
-                                }
-                            },
-                        )
+                                },
+                            )
+                        }
                     }
                     if (!isLandscape) {
                         BottomMainNavigationBar(
@@ -839,6 +894,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onSelectPhotoCandidate = viewModel::selectArtistPhotoCandidate,
                         onApplyPhoto = { viewModel.applyArtistPhoto(openedArtist) },
                         onRemovePhoto = { viewModel.removeArtistPhoto(openedArtist) },
+                        onAutoFetchPhoto = { viewModel.maybeAutoFetchArtistPhoto(openedArtist) },
                         listState = artistDetailListState,
                     )
                     openedRadio != null -> {
@@ -932,10 +988,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             suggestedAlbums = suggestedAlbums,
                             favoriteAlbums = favoriteAlbums,
                             radios = radios,
+                            artists = artists,
                             player = player,
                             lyrics = lyrics,
                             onContinue = { viewModel.continuePlayback(songs) },
                             onTogglePlayPause = viewModel::togglePlayPause,
+                            onFetchLyrics = { player.songId?.let(viewModel::fetchLyricsOnline) },
                             onOpenAlbum = { selectedAlbum = it },
                             onOpenRadio = {
                                 radioSession = emptyList()
@@ -944,6 +1002,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             onOpenCurrentPlayer = { showFullPlayer = true },
                             onOpenPlayer = openActiveRadio,
                             onPlay = { list, index, shuffle -> viewModel.playSongs(list, index, shuffle, source = if (shuffle) "Misturar tudo" else "Biblioteca") },
+                            onToggleAutoplay = viewModel::toggleAutoplay,
+                            artistPhotoUriFor = viewModel::artistPhotoUri,
+                            onOpenArtist = { selectedArtist = it },
                         )
                     }
                     selectedTab == MainTab.Radio -> PlaylistsScreen(
@@ -4216,16 +4277,42 @@ private fun HomeScreen(
     suggestedAlbums: List<LocalAlbum>,
     favoriteAlbums: List<LocalAlbum>,
     radios: List<LocalRadio>,
+    artists: List<LocalArtist>,
     player: PlayerUiState,
     lyrics: LyricsUiState = LyricsUiState(),
     onContinue: () -> Unit,
     onTogglePlayPause: () -> Unit,
+    onFetchLyrics: () -> Unit,
     onOpenAlbum: (LocalAlbum) -> Unit,
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenCurrentPlayer: () -> Unit,
     onOpenPlayer: () -> Unit,
     onPlay: (List<LocalSong>, Int, Boolean) -> Unit,
+    onToggleAutoplay: () -> Unit,
+    artistPhotoUriFor: (LocalArtist) -> Uri? = { null },
+    onOpenArtist: (LocalArtist) -> Unit = {},
 ) {
+    // Legenda (letra sincronizada sobre o disco) na Home - toggle manual do usuario, independente
+    // do auto-fetch ao arrastar pro lado no FullPlayer (ADR-023). Enquanto ligado, dispara a busca
+    // sozinho sempre que a musica atual nao tiver letra ainda - inclusive ao trocar de faixa com o
+    // toggle ja ativado (nao so no clique que liga), senao a legenda fica "presa" na letra da
+    // musica anterior. lyrics.message == null evita repetir uma busca que ja falhou pra essa
+    // musica (mesma trava do auto-fetch do player).
+    // Ligada por padrao (pedido do usuario 15/09/2026, mesma regra da reproducao automatica).
+    var homeCaptionsEnabled by rememberSaveable { mutableStateOf(true) }
+    val onToggleCaptions: () -> Unit = { homeCaptionsEnabled = !homeCaptionsEnabled }
+    LaunchedEffect(homeCaptionsEnabled, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.isEmpty, lyrics.message) {
+        if (homeCaptionsEnabled &&
+            player.songId != null &&
+            lyrics.songId == player.songId &&
+            !lyrics.isLoading &&
+            !lyrics.isFetching &&
+            lyrics.lyrics.isEmpty &&
+            lyrics.message == null
+        ) {
+            onFetchLyrics()
+        }
+    }
     val homeRecentAlbums = remember(recentlyAddedAlbums) { recentlyAddedAlbums.take(8) }
     // 2a fileira mostra os PROXIMOS recentes (nao os mesmos 8 de cima) - pedido do usuario
     // 07/09/2026: as duas fileiras repetiam exatamente os mesmos albuns, so espelhado. Cai de
@@ -4265,34 +4352,96 @@ private fun HomeScreen(
         )
         else -> null
     }
+    // Foto redonda do artista ao lado do titulo/artista/album (pedido do usuario 15/09/2026) -
+    // resolve o LocalArtist pelo nome cru do card (mesmo padrao de "playingArtist" no FullPlayer)
+    // pra poder abrir a pagina dele e puxar a foto (override da web ou capa de album como
+    // fallback, ver HomeArtistAvatar). Fica null (sem avatar) quando o nome nao bate com nenhum
+    // artista conhecido - ex.: "various artists" agregado.
+    val homePlayingArtist = remember(homePlaybackContent?.artist, artists) {
+        homePlaybackContent?.artist
+            ?.trim()?.lowercase()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { key -> artists.firstOrNull { it.key == key } }
+    }
+    val homePlayingArtistPhotoUri = homePlayingArtist?.let(artistPhotoUriFor)
+    // Fallback de "A seguir" quando a fila real do player vem vazia (musica parada mostrando so a
+    // previa de "continuar ouvindo", ainda nao carregada no ExoPlayer, ou faixa que e a ultima da
+    // fila) - sem isso o espaco reservado pra previa ficava em branco (feio, pedido do usuario
+    // 15/09/2026 pra sempre vir preenchido). Cai pro resto do mesmo album, depois mesmo artista,
+    // depois "ouvir de novo" - so fica vazio mesmo se a biblioteca nao tiver mais nada pra sugerir.
+    val homeUpNextPreview = remember(player.upcomingTracks, homePlaybackContent, songs, homeListenAgain) {
+        val liveQueue = player.upcomingTracks
+        if (liveQueue.isNotEmpty()) {
+            liveQueue
+        } else {
+            val currentId = homePlaybackContent?.songId
+            val sameAlbum = homePlaybackContent?.album
+                ?.takeIf { it.isNotBlank() }
+                ?.let { album -> songs.filter { it.album == album && it.id != currentId } }
+                .orEmpty()
+            val sameArtist = sameAlbum.ifEmpty {
+                homePlaybackContent?.artist
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { artist -> songs.filter { it.artist == artist && it.id != currentId } }
+                    .orEmpty()
+            }
+            val fallbackSongs = sameArtist.ifEmpty { homeListenAgain.filter { it.id != currentId } }
+            fallbackSongs.take(4).map { song ->
+                listOf(song.title, song.artist).filter { it.isNotBlank() }.joinToString(" - ")
+            }
+        }
+    }
 
     LazyColumn(
         flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(bottom = 18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        if (radioIsActive) {
+        // Sessao do disco (radio ao vivo OU tocando agora/continuar ouvindo) preenche a tela
+        // inteira - pedido do usuario 15/09/2026: precisa rolar pra baixo pra chegar em "Albuns
+        // adicionados recentemente". O espaco vazio sobrando (quando o card nao preenche tudo
+        // sozinho) mostra a previa da fila (HomeUpNextPreview) encostada embaixo.
+        if (radioIsActive || homePlaybackContent != null) {
             item {
-                LiveNowRadioCard(
-                    player = player,
-                    lyrics = lyrics,
-                    onClick = onOpenPlayer,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
-                )
-            }
-        }
-        // So mostra "Tocando agora"/"Continuar ouvindo" quando nao ha radio tocando - com a radio ativa o
-        // card "ao vivo" acima ja ocupa esse espaco (pedido do usuario).
-        if (homePlaybackContent != null) {
-            item {
-                ContinueListeningCard(
-                    content = homePlaybackContent,
-                    isPlaying = player.hasMedia && player.isPlaying,
-                    lyrics = if (homePlaybackContent.isCurrentMedia) lyrics else LyricsUiState(),
-                    onClick = if (homePlaybackContent.isCurrentMedia) onOpenCurrentPlayer else onContinue,
-                    onPlayPauseClick = if (homePlaybackContent.isCurrentMedia) onTogglePlayPause else onContinue,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
-                )
+                Column(modifier = Modifier.fillParentMaxHeight()) {
+                    if (radioIsActive) {
+                        LiveNowRadioCard(
+                            player = player,
+                            lyrics = lyrics,
+                            onClick = onOpenPlayer,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                        )
+                    } else if (homePlaybackContent != null) {
+                        ContinueListeningCard(
+                            content = homePlaybackContent,
+                            isPlaying = player.hasMedia && player.isPlaying,
+                            lyrics = if (homePlaybackContent.isCurrentMedia) lyrics else LyricsUiState(),
+                            onClick = if (homePlaybackContent.isCurrentMedia) onOpenCurrentPlayer else onContinue,
+                            onPlayPauseClick = if (homePlaybackContent.isCurrentMedia) onTogglePlayPause else onContinue,
+                            captionsEnabled = homeCaptionsEnabled,
+                            onToggleCaptions = onToggleCaptions,
+                            autoplayEnabled = player.autoplayEnabled,
+                            onToggleAutoplay = onToggleAutoplay,
+                            artist = homePlayingArtist,
+                            artistPhotoUri = homePlayingArtistPhotoUri,
+                            onOpenArtist = { homePlayingArtist?.let(onOpenArtist) },
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                        )
+                    }
+                    // Espaco fixo (nao mais um Spacer com weight) - pedido do usuario 15/09/2026:
+                    // a previa nao pode "descer" seguindo a altura do item quando o mini player
+                    // esconde/aparece (o Scaffold da mais/menos espaco pro conteudo nessa hora,
+                    // ver LibraryShell/miniPlayerVisible). Com altura fixa aqui, a previa fica
+                    // sempre na mesma posicao logo abaixo do card, e a sobra de espaco (ex.: mini
+                    // player escondido, ou pouca coisa em "A seguir") fica em branco no rodape.
+                    Spacer(Modifier.height(18.dp))
+                    if (homeUpNextPreview.isNotEmpty()) {
+                        HomeUpNextPreview(
+                            upcomingTracks = homeUpNextPreview,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                        )
+                    }
+                }
             }
         }
         item {
@@ -4794,6 +4943,7 @@ private fun ArtistDetailScreen(
     onSelectPhotoCandidate: (ArtworkCandidate) -> Unit = {},
     onApplyPhoto: () -> Unit = {},
     onRemovePhoto: () -> Unit = {},
+    onAutoFetchPhoto: () -> Unit = {},
     listState: LazyGridState = rememberLazyGridState(),
 ) {
     // Foto escolhida pelo usuario (busca na web) tem prioridade sobre a capa do primeiro album -
@@ -4801,6 +4951,9 @@ private fun ArtistDetailScreen(
     val artworkSong = artist.songs.firstOrNull { it.artworkUri != null }
     val displayUri = photoOverrideUri ?: artworkSong?.artworkUri
     val displayEmbeddedSource = if (photoOverrideUri != null) null else artworkSong?.contentUri
+    // Busca automatica da foto (pedido do usuario 15/09/2026) - dispara sozinha ao abrir a pagina
+    // do artista pela primeira vez, so 1 vez (ver maybeAutoFetchArtistPhoto/hasAutoPhotoLookupRun).
+    LaunchedEffect(artist.key) { onAutoFetchPhoto() }
     var showEditor by rememberSaveable(artist.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(artist.key) { mutableStateOf(false) }
     // Mais novo primeiro (pedido do usuario 15/09/2026) - album sem ano tageado (0) sempre por
@@ -4827,31 +4980,14 @@ private fun ArtistDetailScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Box(contentAlignment = Alignment.BottomEnd) {
-                        ArtworkBox(
-                            uri = displayUri,
-                            embeddedSourceUri = displayEmbeddedSource,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .aspectRatio(1f),
-                            iconModifier = Modifier.size(84.dp),
-                        )
-                        IconButton(
-                            onClick = onOpenPhotoSearch,
-                            modifier = Modifier
-                                .padding(10.dp)
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(PailerGunmetal.copy(alpha = 0.75f)),
-                        ) {
-                            Icon(
-                                Icons.Filled.Edit,
-                                contentDescription = "Buscar foto do artista na web",
-                                tint = MaterialTheme.colorScheme.onBackground,
-                                modifier = Modifier.size(18.dp),
-                            )
-                        }
-                    }
+                    ArtworkBox(
+                        uri = displayUri,
+                        embeddedSourceUri = displayEmbeddedSource,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(1f),
+                        iconModifier = Modifier.size(84.dp),
+                    )
                     Spacer(Modifier.height(16.dp))
                     Text(
                         artist.name,
@@ -4952,6 +5088,10 @@ private fun ArtistDetailScreen(
                     album = album,
                     onClick = { onOpenAlbum(album) },
                     subtitle = album.year.takeIf { it > 0 }?.toString(),
+                    // Nome um pouco menor e ano ainda menor (pedido do usuario 15/09/2026) - so
+                    // nesta tela, o grid geral (Biblioteca/Genero) mantem o tamanho padrao.
+                    titleStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                    subtitleStyle = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                 )
             }
         }
@@ -4961,6 +5101,9 @@ private fun ArtistDetailScreen(
                 artist = artist,
                 albums = albums,
                 availableGenres = availableGenres,
+                photoUri = displayUri,
+                photoEmbeddedSource = displayEmbeddedSource,
+                onOpenPhotoSearch = onOpenPhotoSearch,
                 onCancel = { showEditor = false },
                 onSave = { artistName, edits ->
                     onSaveMetadata(artistName, edits)
@@ -5152,6 +5295,9 @@ private fun ArtistMetadataEditorOverlay(
     artist: LocalArtist,
     albums: List<LocalAlbum>,
     availableGenres: List<String>,
+    photoUri: Uri?,
+    photoEmbeddedSource: Uri?,
+    onOpenPhotoSearch: () -> Unit,
     onCancel: () -> Unit,
     onSave: (String, List<AlbumMetadataEdit>) -> Unit,
 ) {
@@ -5201,6 +5347,32 @@ private fun ArtistMetadataEditorOverlay(
                         )
                         IconButton(onClick = onCancel) {
                             Icon(Icons.Filled.Close, contentDescription = "Cancelar", tint = MaterialTheme.colorScheme.onBackground)
+                        }
+                    }
+                }
+                // Foto do artista (pedido do usuario 15/09/2026) - antes era um lapis solto por
+                // cima da propria foto na tela do artista; juntar aqui deixa aquela tela mais
+                // limpa e concentra toda edicao de metadados num lugar so.
+                item {
+                    Text(
+                        "Foto do artista",
+                        color = MaterialTheme.colorScheme.onBackground,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ArtworkBox(
+                            uri = photoUri,
+                            embeddedSourceUri = photoEmbeddedSource,
+                            modifier = Modifier
+                                .size(64.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        TextButton(onClick = onOpenPhotoSearch) {
+                            Text("Buscar foto na web")
                         }
                     }
                 }
@@ -6684,6 +6856,7 @@ private fun LiveNowRadioCard(
                         songId = player.songId,
                         positionMs = player.positionMs,
                         isPlaying = player.isPlaying,
+                        enabled = true,
                         modifier = Modifier.padding(top = 6.dp),
                     )
                     Spacer(Modifier.height(5.dp))
@@ -6819,6 +6992,10 @@ private fun AlbumGridCard(
     // fillMaxWidth por padrao (grid) - "Mais desse artista" (AlbumDetailScreen) passa uma
     // largura fixa pra caber numa LazyRow horizontal.
     modifier: Modifier = Modifier.fillMaxWidth(),
+    // Overrides opcionais de fonte (pedido do usuario 15/09/2026 - ArtistDetailScreen usa um
+    // titulo/ano menores que o padrao do grid geral) - null mantem o estilo de sempre.
+    titleStyle: TextStyle? = null,
+    subtitleStyle: TextStyle? = null,
 ) {
     Column(
         modifier = modifier
@@ -6848,7 +7025,7 @@ private fun AlbumGridCard(
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.Normal,
-            style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
+            style = titleStyle ?: if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
         )
         if (!compact && !subtitle.isNullOrBlank()) {
             Text(
@@ -6856,7 +7033,7 @@ private fun AlbumGridCard(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelSmall,
+                style = subtitleStyle ?: MaterialTheme.typography.labelSmall,
             )
         }
     }
@@ -7634,6 +7811,76 @@ private data class HomePlaybackCardContent(
     val isCurrentMedia: Boolean,
 )
 
+// Botao de legenda (letra sincronizada sobre o disco, ver HomeLyricsSubtitle) no espaco vago ao
+// lado do titulo/artista/album/timecode na Home - toggle manual (ADR-031): liga/desliga
+// HomeLyricsSubtitle, e o proprio clique (em ContinueListeningCard/LandscapeCard) dispara a busca
+// online sozinho se a musica ainda nao tiver letra carregada.
+@Composable
+private fun CaptionsToggleButton(enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(
+                if (enabled) MaterialTheme.colorScheme.primary else PailerCharcoal.copy(alpha = 0.6f),
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = if (enabled) Icons.Filled.Subtitles else Icons.Filled.SubtitlesOff,
+            contentDescription = if (enabled) "Ocultar legenda" else "Mostrar legenda",
+            tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+// Botao de "reproducao automatica" (imitando o autoplay do Youtube, pedido do usuario
+// 15/09/2026) ao lado do botao de legenda - liga por padrao. Ligado, o app toca sozinho o proximo
+// album do mesmo artista (ou o proximo artista da mesma categoria, sem outro album) quando a fila
+// atual acaba - ver toggleAutoplay/maybeAutoplayNextAlbum no ViewModel.
+@Composable
+private fun AutoplayToggleButton(enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(
+                if (enabled) MaterialTheme.colorScheme.primary else PailerCharcoal.copy(alpha = 0.6f),
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = if (enabled) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+            contentDescription = if (enabled) "Desligar reprodução automática" else "Ligar reprodução automática",
+            tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+// Foto redonda do artista ao lado do titulo/artista/album na Home (pedido do usuario
+// 15/09/2026) - clique abre a pagina do artista. Prioriza a foto override (busca manual/
+// automatica na Deezer, ver ArtistDetailScreen/maybeAutoFetchArtistPhoto) e cai pra capa do
+// primeiro album do artista com capa quando nao ha override, mesmo fallback usado la.
+@Composable
+private fun HomeArtistAvatar(artist: LocalArtist, photoUri: Uri?, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val artworkSong = remember(artist) { artist.songs.firstOrNull { it.artworkUri != null } }
+    val displayUri = photoUri ?: artworkSong?.artworkUri
+    val displayEmbeddedSource = if (photoUri != null) null else artworkSong?.contentUri
+    ArtworkBox(
+        uri = displayUri,
+        embeddedSourceUri = displayEmbeddedSource,
+        modifier = modifier
+            .size(44.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        iconModifier = Modifier.size(20.dp),
+    )
+}
+
 @Composable
 private fun ContinueListeningCard(
     content: HomePlaybackCardContent,
@@ -7641,6 +7888,13 @@ private fun ContinueListeningCard(
     lyrics: LyricsUiState = LyricsUiState(),
     onClick: () -> Unit,
     onPlayPauseClick: () -> Unit,
+    captionsEnabled: Boolean,
+    onToggleCaptions: () -> Unit,
+    autoplayEnabled: Boolean,
+    onToggleAutoplay: () -> Unit,
+    artist: LocalArtist? = null,
+    artistPhotoUri: Uri? = null,
+    onOpenArtist: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val configuration = LocalConfiguration.current
@@ -7654,6 +7908,13 @@ private fun ContinueListeningCard(
                 lyrics = lyrics,
                 onClick = onClick,
                 onPlayPauseClick = onPlayPauseClick,
+                captionsEnabled = captionsEnabled,
+                onToggleCaptions = onToggleCaptions,
+                autoplayEnabled = autoplayEnabled,
+                onToggleAutoplay = onToggleAutoplay,
+                artist = artist,
+                artistPhotoUri = artistPhotoUri,
+                onOpenArtist = onOpenArtist,
             )
             return@Column
         }
@@ -7668,35 +7929,52 @@ private fun ContinueListeningCard(
                 isPlaying = isPlaying,
                 lyrics = lyrics,
                 onPlayPauseClick = onPlayPauseClick,
+                captionsEnabled = captionsEnabled,
                 modifier = Modifier.fillMaxWidth().aspectRatio(1f),
             )
             Spacer(Modifier.height(10.dp))
-            Text(
-                content.title,
-                color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                listOf(content.artist, content.album).filter { it.isNotBlank() }.joinToString(" · "),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Text(
-                if (isPlaying && content.durationMs > 0) {
-                    "${formatDuration(content.positionMs)} de ${formatDuration(content.durationMs)}"
-                } else if (isPlaying) {
-                    "Tocando agora"
-                } else {
-                    "Retomar em ${formatDuration(content.positionMs)}"
-                },
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelSmall,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (artist != null) {
+                    HomeArtistAvatar(artist = artist, photoUri = artistPhotoUri, onClick = onOpenArtist)
+                    Spacer(Modifier.width(10.dp))
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        content.title,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        // Um pouco menor que o padrao titleMedium (pedido do usuario 15/09/2026) -
+                        // ao lado da foto redonda do artista, o titulo grande demais competia com ela.
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOf(content.artist, content.album).filter { it.isNotBlank() }.joinToString(" · "),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Text(
+                        if (isPlaying && content.durationMs > 0) {
+                            "${formatDuration(content.positionMs)} de ${formatDuration(content.durationMs)}"
+                        } else if (isPlaying) {
+                            "Tocando agora"
+                        } else {
+                            "Retomar em ${formatDuration(content.positionMs)}"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                if (content.isCurrentMedia) {
+                    Spacer(Modifier.width(8.dp))
+                    AutoplayToggleButton(enabled = autoplayEnabled, onClick = onToggleAutoplay)
+                    Spacer(Modifier.width(8.dp))
+                    CaptionsToggleButton(enabled = captionsEnabled, onClick = onToggleCaptions)
+                }
+            }
         }
     }
 }
@@ -7708,6 +7986,13 @@ private fun ContinueListeningLandscapeCard(
     lyrics: LyricsUiState,
     onClick: () -> Unit,
     onPlayPauseClick: () -> Unit,
+    captionsEnabled: Boolean,
+    onToggleCaptions: () -> Unit,
+    autoplayEnabled: Boolean,
+    onToggleAutoplay: () -> Unit,
+    artist: LocalArtist? = null,
+    artistPhotoUri: Uri? = null,
+    onOpenArtist: () -> Unit = {},
 ) {
     val configuration = LocalConfiguration.current
     val compactLandscape = configuration.screenHeightDp < 420
@@ -7734,6 +8019,7 @@ private fun ContinueListeningLandscapeCard(
                 isPlaying = isPlaying,
                 lyrics = lyrics,
                 onPlayPauseClick = onPlayPauseClick,
+                captionsEnabled = captionsEnabled,
                 modifier = Modifier.size(artworkSize),
             )
         }
@@ -7742,14 +8028,27 @@ private fun ContinueListeningLandscapeCard(
             modifier = Modifier.weight(0.54f),
             verticalArrangement = Arrangement.Center,
         ) {
-            Text(
-                content.title,
-                color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (artist != null) {
+                    HomeArtistAvatar(artist = artist, photoUri = artistPhotoUri, onClick = onOpenArtist)
+                    Spacer(Modifier.width(10.dp))
+                }
+                Text(
+                    content.title,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (content.isCurrentMedia) {
+                    Spacer(Modifier.width(8.dp))
+                    AutoplayToggleButton(enabled = autoplayEnabled, onClick = onToggleAutoplay)
+                    Spacer(Modifier.width(8.dp))
+                    CaptionsToggleButton(enabled = captionsEnabled, onClick = onToggleCaptions)
+                }
+            }
             Text(
                 listOf(content.artist, content.album).filter { it.isNotBlank() }.joinToString(" · "),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -7793,9 +8092,32 @@ private fun HomePlaybackArtwork(
     isPlaying: Boolean,
     lyrics: LyricsUiState,
     onPlayPauseClick: () -> Unit,
+    captionsEnabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    Box(modifier = modifier) {
+    // Tracinho vertical na ponta da barra de progresso (pedido do usuario 15/09/2026): some depois
+    // de 3s tocando pra nao poluir o disco, mas volta a aparecer a cada novo toque no disco
+    // (passar o dedo/clicar-arrastar, detectado sem consumir o evento - pass = Initial - pra nao
+    // atrapalhar o clique do card nem do botao de play por baixo) e fica sempre visivel pausado.
+    var seekTickPing by remember { mutableStateOf(0) }
+    var showSeekTick by remember { mutableStateOf(false) }
+    LaunchedEffect(isPlaying, seekTickPing) {
+        if (isPlaying) {
+            showSeekTick = true
+            delay(3_000)
+            showSeekTick = false
+        } else {
+            showSeekTick = true
+        }
+    }
+    Box(
+        modifier = modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                seekTickPing++
+            }
+        },
+    ) {
         SpinningVinylArtwork(
             uri = content.artworkUri,
             embeddedSourceUri = content.artworkSourceUri,
@@ -7807,6 +8129,7 @@ private fun HomePlaybackArtwork(
             songId = content.songId,
             positionMs = content.positionMs,
             isPlaying = isPlaying,
+            enabled = captionsEnabled,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(horizontal = 18.dp, vertical = 18.dp),
@@ -7834,19 +8157,40 @@ private fun HomePlaybackArtwork(
         } else {
             0f
         }
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .height(4.dp)
-                .background(Color.White.copy(alpha = 0.3f)),
+        // A barra inteira (trilho + preenchimento + tracinho) some junto com o "Tocando agora"
+        // (PlaybackStatusTitle) - mesmo showSeekTick, nao so o tracinho isolado.
+        AnimatedVisibility(
+            visible = showSeekTick,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = fadeIn(),
+            exit = fadeOut(),
         ) {
             Box(
                 modifier = Modifier
-                    .fillMaxHeight()
-                    .fillMaxWidth(progress)
-                    .background(MaterialTheme.colorScheme.primary),
-            )
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .background(Color.White.copy(alpha = 0.3f)),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .fillMaxWidth(progress)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.CenterEnd,
+                ) {
+                    // Borda branca fina em volta do vermelho - sem ela o tracinho fica "vermelho
+                    // sobre vermelho" (mesma cor do preenchimento por baixo) e some de vista.
+                    Box(
+                        modifier = Modifier
+                            .width(3.dp)
+                            .height(14.dp)
+                            .clip(RoundedCornerShape(1.dp))
+                            .background(Color.White)
+                            .padding(1.dp)
+                            .background(MaterialTheme.colorScheme.primary),
+                    )
+                }
+            }
         }
     }
 }
@@ -7857,9 +8201,11 @@ private fun HomeLyricsSubtitle(
     songId: Long?,
     positionMs: Long,
     isPlaying: Boolean,
+    enabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
     if (
+        !enabled ||
         !isPlaying ||
         songId == null ||
         lyrics.songId != songId ||
@@ -8290,6 +8636,7 @@ private fun FullPlayer(
                         songId = player.songId,
                         positionMs = player.positionMs,
                         isPlaying = player.isPlaying,
+                        enabled = true,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(horizontal = 18.dp, vertical = 18.dp),
@@ -8801,6 +9148,50 @@ private fun LiveSourceLabel(text: String, isLive: Boolean, modifier: Modifier = 
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+// Previa da fila ("A seguir") no espaco vazio sobrando embaixo do disco na Home - pedido do
+// usuario 15/09/2026: fonte pequena e cards estreitos, so pra preencher o vao ate o fim da tela
+// sem competir visualmente com o card do disco em cima.
+@Composable
+private fun HomeUpNextPreview(upcomingTracks: List<String>, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            "A seguir",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        upcomingTracks.take(4).forEachIndexed { index, track ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(PailerGunmetal.copy(alpha = 0.35f))
+                    .padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    (index + 1).toString().padStart(2, '0'),
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.width(20.dp),
+                )
+                Text(
+                    track,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 

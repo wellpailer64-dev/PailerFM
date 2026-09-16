@@ -61,6 +61,9 @@ data class LocalAlbum(
     val key: String = "$id:$title"
     val dateAdded: Long = songs.maxOfOrNull { it.dateAdded } ?: 0L
     val genre: String = songs.firstOrNull { it.genre.isNotBlank() }?.genre.orEmpty()
+    // Ano de lancamento (MediaStore YEAR/tag do arquivo) - 0 quando nenhuma faixa tem o ano
+    // preenchido. Mesmo padrao de genre acima (primeira faixa com o dado, nao "mais comum").
+    val year: Int = songs.firstOrNull { it.year > 0 }?.year ?: 0
 
     // Compilacoes/albuns montados a mao (varios artistas sob o mesmo nome de album) tem o
     // mesmo ALBUM_ID no MediaStore, entao content://.../albumart/<id> devolve a MESMA capa
@@ -101,6 +104,7 @@ data class PendingTagChange(
     val albumValue: String?,
     val artistValue: String?,
     val genreValue: String?,
+    val yearValue: Int?,
     val writeFingerprint: String,
 )
 

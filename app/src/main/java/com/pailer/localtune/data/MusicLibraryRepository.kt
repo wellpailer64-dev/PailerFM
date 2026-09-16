@@ -120,6 +120,7 @@ class MusicLibraryRepository(private val context: Context) {
                             ?.takeIf { it.isNotBlank() }
                             ?: rawAlbum
                         val genreOverride = getAlbumGenreOverride(albumId, rawAlbum)
+                        val yearOverride = getAlbumYearOverride(albumId, rawAlbum)
                         val rawArtist = cursor.getString(artistColumn).cleanUnknown("Artista desconhecido")
                         val albumArtistOverride = getAlbumArtistOverride(albumId, rawAlbum)
                         val artistOverride = metadataPrefs.getString(artistOverrideKey(rawArtist), null)
@@ -137,7 +138,7 @@ class MusicLibraryRepository(private val context: Context) {
                                 trackNumber = cursor.getInt(trackColumn),
                                 dateAdded = cursor.getLong(dateAddedColumn),
                                 genre = genreOverride?.takeIf { it.isNotBlank() } ?: rawGenre,
-                                year = cursor.getInt(yearColumn),
+                                year = yearOverride?.takeIf { it > 0 } ?: cursor.getInt(yearColumn),
                                 contentUri = uri,
                             )
                         )
@@ -762,11 +763,36 @@ class MusicLibraryRepository(private val context: Context) {
             .distinctBy { it.lowercase() }
             .sortedBy { it.lowercase() }
 
+    // Marca de "ja tentei achar genero/ano sozinho pra esse album" (ver
+    // LocalTuneViewModel.maybeAutoTagAlbumMetadata) - independente de ter achado ou nao, so tenta
+    // 1 vez por album pra nao bater na web toda vez que uma faixa dele tocar. Cobre os dois campos
+    // porque vem da MESMA chamada na web (iTunes ja devolve genero e ano de lancamento juntos).
+    fun hasAutoGenreLookupRun(albumId: Long, album: String): Boolean =
+        metadataPrefs.getBoolean(autoGenreLookupDoneKey(albumId, album), false)
+
+    fun markAutoGenreLookupRun(albumId: Long, album: String) {
+        metadataPrefs.edit().putBoolean(autoGenreLookupDoneKey(albumId, album), true).apply()
+    }
+
     fun saveAlbumGenreOverride(album: LocalAlbum, genre: String) {
         metadataPrefs.edit()
             .putString(albumGenreOverrideKey(album.id, album.title), genre)
             .remove(tagWriteAppliedKey(album.id, album.title))
             .apply()
+    }
+
+    // Ano de lancamento (pedido do usuario 15/09/2026) - mesmo padrao do override de genero,
+    // preenchido pela mesma busca automatica (ver AlbumGenreSuggestionRepository.suggestMetadata).
+    fun saveAlbumYearOverride(album: LocalAlbum, year: Int) {
+        metadataPrefs.edit()
+            .putInt(albumYearOverrideKey(album.id, album.title), year)
+            .remove(tagWriteAppliedKey(album.id, album.title))
+            .apply()
+    }
+
+    private fun getAlbumYearOverride(albumId: Long, album: String): Int? {
+        val key = albumYearOverrideKey(albumId, album)
+        return if (metadataPrefs.contains(key)) metadataPrefs.getInt(key, 0) else null
     }
 
     fun saveAlbumArtistOverride(album: LocalAlbum, artist: String) {
@@ -791,14 +817,17 @@ class MusicLibraryRepository(private val context: Context) {
                 ?.takeIf { it.isNotBlank() }
             val artistOverride = getAlbumArtistOverride(album.id, album.title)
                 ?.takeIf { it.isNotBlank() }
+            val yearOverride = getAlbumYearOverride(album.id, album.title)
+                ?.takeIf { it > 0 }
             val fields = buildList {
                 if (!titleOverride.isNullOrBlank()) add("Album: $titleOverride")
                 if (!artistOverride.isNullOrBlank()) add("Artista: $artistOverride")
                 if (!genreOverride.isNullOrBlank()) add("Genero: $genreOverride")
+                if (yearOverride != null) add("Ano: $yearOverride")
             }
             if (fields.isEmpty()) return@mapNotNull null
             val songIds = album.songs.map { it.id }.sorted()
-            val fingerprint = tagWriteFingerprint(songIds, titleOverride, artistOverride, genreOverride)
+            val fingerprint = tagWriteFingerprint(songIds, titleOverride, artistOverride, genreOverride, yearOverride)
             if (metadataPrefs.getString(tagWriteAppliedKey(album.id, album.title), null) == fingerprint) {
                 return@mapNotNull null
             }
@@ -813,6 +842,7 @@ class MusicLibraryRepository(private val context: Context) {
                 albumValue = titleOverride,
                 artistValue = artistOverride,
                 genreValue = genreOverride,
+                yearValue = yearOverride,
                 writeFingerprint = fingerprint,
             )
         }.sortedBy { it.albumTitle.lowercase() }
@@ -907,6 +937,7 @@ class MusicLibraryRepository(private val context: Context) {
         change.albumValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ALBUM, it) }
         change.artistValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ARTIST, it) }
         change.genreValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.GENRE, it) }
+        change.yearValue?.takeIf { it > 0 }?.let { tag.setField(FieldKey.YEAR, it.toString()) }
         audioFile.commit()
 
         context.contentResolver.openOutputStream(song.contentUri, "wt")?.use { output ->
@@ -1147,6 +1178,19 @@ class MusicLibraryRepository(private val context: Context) {
     private fun artistPhotoOverrideKey(artistKey: String): String =
         "artist_photo:$artistKey"
 
+    // Marca de "ja tentei achar foto sozinho pra esse artista" (ver
+    // LocalTuneViewModel.maybeAutoFetchArtistPhoto) - mesmo padrao de hasAutoGenreLookupRun, so
+    // tenta 1 vez por artista pra nao bater na Deezer toda vez que a pagina dele abrir.
+    fun hasAutoPhotoLookupRun(artistKey: String): Boolean =
+        metadataPrefs.getBoolean(autoPhotoLookupDoneKey(artistKey), false)
+
+    fun markAutoPhotoLookupRun(artistKey: String) {
+        metadataPrefs.edit().putBoolean(autoPhotoLookupDoneKey(artistKey), true).apply()
+    }
+
+    private fun autoPhotoLookupDoneKey(artistKey: String): String =
+        "auto_photo_lookup_done:$artistKey"
+
     private fun sniffImageMimeType(bytes: ByteArray): String = when {
         bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() -> "image/png"
         else -> "image/jpeg"
@@ -1249,6 +1293,12 @@ class MusicLibraryRepository(private val context: Context) {
     private fun albumGenreOverrideKey(albumId: Long, album: String): String =
         "album_genre:${albumStableKey(albumId, album)}"
 
+    private fun albumYearOverrideKey(albumId: Long, album: String): String =
+        "album_year:${albumStableKey(albumId, album)}"
+
+    private fun autoGenreLookupDoneKey(albumId: Long, album: String): String =
+        "auto_genre_lookup_done:${albumStableKey(albumId, album)}"
+
     private fun legacyAlbumGenreOverrideKey(albumId: Long, album: String): String =
         "$albumId:${album.lowercase().trim()}"
 
@@ -1283,6 +1333,7 @@ class MusicLibraryRepository(private val context: Context) {
         album: String?,
         artist: String?,
         genre: String?,
+        year: Int? = null,
     ): String =
         buildString {
             append(songIds.joinToString(","))
@@ -1292,6 +1343,8 @@ class MusicLibraryRepository(private val context: Context) {
             append(artist.orEmpty().trim())
             append("|genre=")
             append(genre.orEmpty().trim())
+            append("|year=")
+            append(year?.toString().orEmpty())
         }
 
     private fun artistOverrideKey(artist: String): String =

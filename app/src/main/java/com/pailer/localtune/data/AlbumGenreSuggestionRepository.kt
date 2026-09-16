@@ -7,28 +7,44 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
+// Genero + ano de lancamento sugeridos numa MESMA busca (pedido do usuario 15/09/2026: "podemos
+// fazer essa busca junto com o genero" pro ano) - o iTunes ja devolve releaseDate junto do
+// primaryGenreName no mesmo item, entao nao ha motivo pra bater na API 2x por album.
+data class AlbumMetadataSuggestion(val genre: String?, val year: Int?)
+
 class AlbumGenreSuggestionRepository {
-    suspend fun suggestGenre(album: LocalAlbum, availableGenres: List<String>): String? = withContext(Dispatchers.IO) {
-        val known = knownArtistHint(album.artist, availableGenres)
-        if (known != null) return@withContext known
+    suspend fun suggestGenre(album: LocalAlbum, availableGenres: List<String>): String? =
+        suggestMetadata(album, availableGenres).genre
 
-        val query = "${album.title} ${album.artist.substringBefore(",")}".trim()
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val json = getJson("$ITUNES_BASE/search?term=$encodedQuery&media=music&entity=album&limit=5&country=BR")
-            ?: return@withContext null
-        val results = json.optJSONArray("results") ?: return@withContext null
+    suspend fun suggestMetadata(album: LocalAlbum, availableGenres: List<String>): AlbumMetadataSuggestion =
+        withContext(Dispatchers.IO) {
+            val knownGenre = knownArtistHint(album.artist, availableGenres)
 
-        val genres = buildList {
-            for (index in 0 until results.length()) {
-                val item = results.optJSONObject(index) ?: continue
-                val genre = item.optString("primaryGenreName").trim()
-                if (genre.isNotBlank()) add(genre)
+            val query = "${album.title} ${album.artist.substringBefore(",")}".trim()
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val json = getJson("$ITUNES_BASE/search?term=$encodedQuery&media=music&entity=album&limit=5&country=BR")
+            val results = json?.optJSONArray("results")
+
+            var year: Int? = null
+            val genres = buildList {
+                if (results != null) {
+                    for (index in 0 until results.length()) {
+                        val item = results.optJSONObject(index) ?: continue
+                        val genre = item.optString("primaryGenreName").trim()
+                        if (genre.isNotBlank()) add(genre)
+                        if (year == null) {
+                            item.optString("releaseDate").take(4).toIntOrNull()?.let { year = it }
+                        }
+                    }
+                }
             }
-        }
 
-        genres.firstNotNullOfOrNull { genre -> matchAvailableGenre(genre, availableGenres) }
-            ?: genres.firstOrNull()
-    }
+            val genre = knownGenre
+                ?: genres.firstNotNullOfOrNull { g -> matchAvailableGenre(g, availableGenres) }
+                ?: genres.firstOrNull()
+
+            AlbumMetadataSuggestion(genre = genre, year = year)
+        }
 
     private fun getJson(url: String): JSONObject? {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
