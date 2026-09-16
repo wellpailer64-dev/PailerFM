@@ -2262,18 +2262,22 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         title: String,
         artistName: String,
         genre: String,
+        year: Int = album.year,
     ): LocalAlbum {
         val cleanTitle = title.trim().ifBlank { album.title }
         val cleanArtist = artistName.trim().ifBlank { album.artist }
         val cleanGenre = genre.trim()
+        val cleanYear = year.takeIf { it > 0 } ?: 0
         val titleChanged = cleanTitle != album.title
         val artistChanged = cleanArtist != album.artist
         val genreChanged = cleanGenre != album.genre
+        val yearChanged = cleanYear > 0 && cleanYear != album.year
         val albumSongIds = album.songs.map { it.id }.toSet()
 
         if (titleChanged) repository.saveAlbumTitleOverride(album, cleanTitle)
         if (artistChanged) repository.saveAlbumArtistOverride(album, cleanArtist)
         if (genreChanged) repository.saveAlbumGenreOverride(album, cleanGenre)
+        if (yearChanged) repository.saveAlbumYearOverride(album, cleanYear)
 
         val updatedSongs = libraryState.value.songs.map { song ->
             if (song.id !in albumSongIds) {
@@ -2283,6 +2287,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     artist = if (artistChanged) cleanArtist else song.artist,
                     album = if (titleChanged) cleanTitle else song.album,
                     genre = if (genreChanged) cleanGenre else song.genre,
+                    year = if (yearChanged) cleanYear else song.year,
                 )
             }
         }
@@ -2291,7 +2296,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         rebuildLibraryContent()
         viewModelScope.launch { repository.saveCachedSongs(updatedSongs) }
         val pending = repository.pendingTagChanges(updatedSongs)
-        requestedTagWriteChanges = if (titleChanged || artistChanged || genreChanged) {
+        requestedTagWriteChanges = if (titleChanged || artistChanged || genreChanged || yearChanged) {
             pending.filter { change -> change.songIds.any { it in albumSongIds } }
         } else {
             emptyList()
@@ -2315,6 +2320,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         artist = if (artistChanged) cleanArtist else it.artist,
                         album = if (titleChanged) cleanTitle else it.album,
                         genre = if (genreChanged) cleanGenre else it.genre,
+                        year = if (yearChanged) cleanYear else it.year,
                     )
                 },
             )
@@ -4754,29 +4760,24 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val mediaId = player.currentMediaItem?.mediaId ?: return
         if (mediaId == lastRecordedMediaId) return
         lastRecordedMediaId = mediaId
-        mediaId.toLongOrNull()?.let {
-            recordPlayback(it)
-            maybeAutoTagAlbumMetadata(it)
-        }
+        mediaId.toLongOrNull()?.let(::recordPlayback)
     }
 
-    // Pedido do usuario 15/09/2026: assim que uma faixa de um album SEM genero e/ou SEM ano toca
-    // pela primeira vez, busca sozinho numa fonte confiavel da web (mesmo
-    // AlbumGenreSuggestionRepository do fluxo manual em Configuracoes > Albuns sem genero) e ja
-    // salva como override o que achar - genero equivalente do nosso catalogo padronizado
-    // (GENRE_TAG_CATALOG via repository.availableGenres) e/ou o ano de lancamento, os dois vindo
-    // da MESMA chamada (iTunes ja devolve releaseDate junto do genero). O usuario sempre pode
-    // revisar/corrigir depois. So tenta 1 vez por album (ver hasAutoGenreLookupRun/
-    // markAutoGenreLookupRun), ache ou nao, pra nao bater na web de novo toda vez que uma faixa
-    // dele tocar. Quando algo e aplicado, tambem dispara sozinho o pedido de permissao do Android
-    // pra gravar de verdade no arquivo (ver markAutoTagPendingWrite/autoTagWriteRequestedVersion e
-    // requestRecentMetadataEditWrite em LocalTuneApp.kt) - pedido explicito do usuario: prefere o
-    // dialogo do sistema aparecer sozinho a ter que abrir Configuracoes > Tags pendentes.
-    private fun maybeAutoTagAlbumMetadata(songId: Long) {
-        val content = libraryContentState.value
-        val song = content.songs.firstOrNull { it.id == songId } ?: return
-        val album = content.albums.firstOrNull { it.id == song.albumId && it.title == song.album } ?: return
-        val needsGenre = song.genre.isBlank() && album.genre.isBlank()
+    // Pedido do usuario 15/09/2026 (revisado no mesmo dia - o gatilho original era "primeira
+    // faixa do album que toca", mas o usuario queria algo mais previsivel: ABRIR a pagina do
+    // album). Checa genero e ano SEPARADAMENTE (cada um so busca se estiver faltando) e aplica os
+    // dois de uma vez so quando algum precisar - mesma AlbumGenreSuggestionRepository do fluxo
+    // manual em Configuracoes > Albuns sem genero, genero(s) sempre do nosso catalogo padronizado
+    // (GENRE_TAG_CATALOG via repository.availableGenres, suporta mais de 1 genero junto - ver
+    // AlbumGenreSuggestionRepository.suggestMetadata). O usuario sempre pode revisar/corrigir
+    // depois. So tenta 1 vez por album (ver hasAutoGenreLookupRun/markAutoGenreLookupRun), ache ou
+    // nao, pra nao bater na web de novo toda vez que a pagina abrir. Quando algo e aplicado,
+    // tambem dispara sozinho o pedido de permissao do Android pra gravar de verdade no arquivo
+    // (ver markAutoTagPendingWrite/autoTagWriteRequestedVersion e requestRecentMetadataEditWrite
+    // em LocalTuneApp.kt) - pedido explicito do usuario: prefere o dialogo do sistema aparecer
+    // sozinho a ter que abrir Configuracoes > Tags pendentes.
+    fun maybeAutoTagAlbumMetadata(album: LocalAlbum) {
+        val needsGenre = album.genre.isBlank()
         val needsYear = album.year <= 0
         if (!needsGenre && !needsYear) return
         if (repository.hasAutoGenreLookupRun(album.id, album.title)) return

@@ -212,6 +212,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
@@ -866,6 +867,16 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 )
 
                 val openedAlbum = selectedAlbum
+                // Mantem a tela do album aberta em dia com genero/ano recem-descobertos pela
+                // busca automatica (ver AlbumDetailScreen.onAutoFetchMetadata) - sem isso,
+                // approveAlbumGenre/approveAlbumYear atualizam `albums` mas o `openedAlbum`
+                // continua apontando pro snapshot antigo ate o usuario sair e voltar na tela.
+                LaunchedEffect(albums, openedAlbum?.key) {
+                    val current = openedAlbum ?: return@LaunchedEffect
+                    albums.firstOrNull { it.key == current.key }
+                        ?.takeIf { it != current }
+                        ?.let { selectedAlbum = it }
+                }
                 val openedArtist = selectedArtist
                 val openedRadio = selectedRadio
                 val openedGenre = selectedGenre
@@ -890,8 +901,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         isSongFavorite = viewModel::isSongFavorite,
                         onToggleSongFavorite = viewModel::toggleSongFavorite,
                         availableGenres = availableGenres,
-                        onSaveMetadata = { title, artistName, genre ->
-                            selectedAlbum = viewModel.saveAlbumMetadataEdit(openedAlbum, title, artistName, genre)
+                        onSaveMetadata = { title, artistName, genre, year ->
+                            selectedAlbum = viewModel.saveAlbumMetadataEdit(openedAlbum, title, artistName, genre, year)
                             requestRecentMetadataEditWrite()
                         },
                         onCreateRadio = { viewModel.createRadioFromAlbum(openedAlbum) },
@@ -904,6 +915,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         listState = albumDetailListState,
                         otherArtistAlbums = openedAlbumOtherAlbums,
                         onOpenAlbum = { selectedAlbum = it },
+                        onAutoFetchMetadata = { viewModel.maybeAutoTagAlbumMetadata(openedAlbum) },
                     )
                     openedArtist != null -> ArtistDetailScreen(
                         artist = openedArtist,
@@ -5507,6 +5519,7 @@ private fun MetadataTextField(
     onValueChange: (String) -> Unit,
     label: String,
     placeholder: String = "",
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
 ) {
     TextField(
         value = value,
@@ -5517,6 +5530,7 @@ private fun MetadataTextField(
         placeholder = if (placeholder.isBlank()) null else {
             { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) }
         },
+        keyboardOptions = keyboardOptions,
         shape = RoundedCornerShape(8.dp),
         colors = TextFieldDefaults.colors(
             focusedContainerColor = PailerSurfaceHighest,
@@ -5847,7 +5861,7 @@ private fun AlbumDetailScreen(
     isSongFavorite: (LocalSong) -> Boolean,
     onToggleSongFavorite: (LocalSong) -> Unit,
     availableGenres: List<String>,
-    onSaveMetadata: (String, String, String) -> Unit,
+    onSaveMetadata: (String, String, String, Int) -> Unit,
     onCreateRadio: () -> Unit = {},
     albumArtwork: AlbumArtworkUiState = AlbumArtworkUiState(),
     onOpenArtworkSearch: () -> Unit = {},
@@ -5861,7 +5875,11 @@ private fun AlbumDetailScreen(
     // "o artista" desse album pra buscar mais coisas dele).
     otherArtistAlbums: List<LocalAlbum> = emptyList(),
     onOpenAlbum: (LocalAlbum) -> Unit = {},
+    onAutoFetchMetadata: () -> Unit = {},
 ) {
+    // Busca automatica de genero/ano (pedido do usuario 15/09/2026) - dispara sozinha ao abrir a
+    // pagina do album, so 1 vez por album (ver maybeAutoTagAlbumMetadata/hasAutoGenreLookupRun).
+    LaunchedEffect(album.key) { onAutoFetchMetadata() }
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -6065,8 +6083,8 @@ private fun AlbumDetailScreen(
                 album = album,
                 availableGenres = availableGenres,
                 onCancel = { showEditor = false },
-                onSave = { title, artistName, genre ->
-                    onSaveMetadata(title, artistName, genre)
+                onSave = { title, artistName, genre, year ->
+                    onSaveMetadata(title, artistName, genre, year)
                     showEditor = false
                 },
                 onFixArtwork = {
@@ -6110,12 +6128,15 @@ private fun AlbumMetadataEditorOverlay(
     album: LocalAlbum,
     availableGenres: List<String>,
     onCancel: () -> Unit,
-    onSave: (String, String, String) -> Unit,
+    onSave: (String, String, String, Int) -> Unit,
     onFixArtwork: () -> Unit = {},
 ) {
     var title by remember(album.key) { mutableStateOf(album.title) }
     var artist by remember(album.key) { mutableStateOf(album.artist) }
     var genre by remember(album.key) { mutableStateOf(album.genre) }
+    // Pedido do usuario 15/09/2026 - campo livre (o mesmo usado pra ano automatico via
+    // approveAlbumYear/saveAlbumYearOverride), so digitos, vazio quando o album nao tem ano ainda.
+    var year by remember(album.key) { mutableStateOf(album.year.takeIf { it > 0 }?.toString().orEmpty()) }
 
     Box(
         modifier = Modifier
@@ -6154,6 +6175,12 @@ private fun AlbumMetadataEditorOverlay(
                     onValueChange = { genre = it },
                     suggestions = availableGenres,
                 )
+                MetadataTextField(
+                    value = year,
+                    onValueChange = { input -> year = input.filter { it.isDigit() }.take(4) },
+                    label = "Ano de lançamento",
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
                 OutlinedButton(onClick = onFixArtwork, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Filled.Image, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
@@ -6167,7 +6194,7 @@ private fun AlbumMetadataEditorOverlay(
                         Text("Cancelar")
                     }
                     Button(
-                        onClick = { onSave(title, artist, genre) },
+                        onClick = { onSave(title, artist, genre, year.toIntOrNull() ?: 0) },
                         modifier = Modifier.weight(1f),
                     ) {
                         Text("Salvar")
