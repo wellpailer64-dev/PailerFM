@@ -5878,7 +5878,8 @@ private fun AlbumDetailScreen(
     onAutoFetchMetadata: () -> Unit = {},
 ) {
     // Busca automatica de genero/ano (pedido do usuario 15/09/2026) - dispara sozinha ao abrir a
-    // pagina do album, so 1 vez por album (ver maybeAutoTagAlbumMetadata/hasAutoGenreLookupRun).
+    // pagina do album, reavaliada toda vez (sem trava de "so 1 vez pra sempre" - ver
+    // maybeAutoTagAlbumMetadata) enquanto o album continuar sem genero e/ou sem ano.
     LaunchedEffect(album.key) { onAutoFetchMetadata() }
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }

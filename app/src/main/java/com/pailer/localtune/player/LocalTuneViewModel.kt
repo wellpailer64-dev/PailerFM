@@ -4770,18 +4770,20 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // manual em Configuracoes > Albuns sem genero, genero(s) sempre do nosso catalogo padronizado
     // (GENRE_TAG_CATALOG via repository.availableGenres, suporta mais de 1 genero junto - ver
     // AlbumGenreSuggestionRepository.suggestMetadata). O usuario sempre pode revisar/corrigir
-    // depois. So tenta 1 vez por album (ver hasAutoGenreLookupRun/markAutoGenreLookupRun), ache ou
-    // nao, pra nao bater na web de novo toda vez que a pagina abrir. Quando algo e aplicado,
-    // tambem dispara sozinho o pedido de permissao do Android pra gravar de verdade no arquivo
-    // (ver markAutoTagPendingWrite/autoTagWriteRequestedVersion e requestRecentMetadataEditWrite
-    // em LocalTuneApp.kt) - pedido explicito do usuario: prefere o dialogo do sistema aparecer
-    // sozinho a ter que abrir Configuracoes > Tags pendentes.
+    // depois.
+    //
+    // De proposito SEM trava de "so tenta 1 vez pra sempre" (existiu antes, removida 15/09/2026):
+    // o gatilho e simplesmente "o album ainda esta sem genero e/ou sem ano" (needsGenre/needsYear
+    // abaixo), reavaliado toda vez que a pagina abre - achado ao vivo com o White Pony: uma
+    // primeira tentativa que falhou (bug na busca, ja corrigido) ficava marcada como "ja tentei"
+    // pra sempre e nunca mais tentava de novo, mesmo o album continuando sem os dados. Sem a
+    // trava, reabrir a pagina de um album que realmente nao tem genero/ano em nenhuma fonte so
+    // bate na web de novo (barato, 1-2 chamadas) - e ele naturalmente para de tentar sozinho assim
+    // que os dois campos forem preenchidos (needsGenre/needsYear viram false).
     fun maybeAutoTagAlbumMetadata(album: LocalAlbum) {
         val needsGenre = album.genre.isBlank()
         val needsYear = album.year <= 0
         if (!needsGenre && !needsYear) return
-        if (repository.hasAutoGenreLookupRun(album.id, album.title)) return
-        repository.markAutoGenreLookupRun(album.id, album.title)
         viewModelScope.launch {
             val availableGenres = repository.availableGenres(libraryState.value.songs)
             val suggestion = runCatching { genreSuggestionRepository.suggestMetadata(album, availableGenres) }

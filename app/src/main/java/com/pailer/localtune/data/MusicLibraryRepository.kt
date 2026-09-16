@@ -763,17 +763,6 @@ class MusicLibraryRepository(private val context: Context) {
             .distinctBy { it.lowercase() }
             .sortedBy { it.lowercase() }
 
-    // Marca de "ja tentei achar genero/ano sozinho pra esse album" (ver
-    // LocalTuneViewModel.maybeAutoTagAlbumMetadata) - independente de ter achado ou nao, so tenta
-    // 1 vez por album pra nao bater na web toda vez que uma faixa dele tocar. Cobre os dois campos
-    // porque vem da MESMA chamada na web (iTunes ja devolve genero e ano de lancamento juntos).
-    fun hasAutoGenreLookupRun(albumId: Long, album: String): Boolean =
-        metadataPrefs.getBoolean(autoGenreLookupDoneKey(albumId, album), false)
-
-    fun markAutoGenreLookupRun(albumId: Long, album: String) {
-        metadataPrefs.edit().putBoolean(autoGenreLookupDoneKey(albumId, album), true).apply()
-    }
-
     fun saveAlbumGenreOverride(album: LocalAlbum, genre: String) {
         metadataPrefs.edit()
             .putString(albumGenreOverrideKey(album.id, album.title), genre)
@@ -1179,8 +1168,11 @@ class MusicLibraryRepository(private val context: Context) {
         "artist_photo:$artistKey"
 
     // Marca de "ja tentei achar foto sozinho pra esse artista" (ver
-    // LocalTuneViewModel.maybeAutoFetchArtistPhoto) - mesmo padrao de hasAutoGenreLookupRun, so
-    // tenta 1 vez por artista pra nao bater na Deezer toda vez que a pagina dele abrir.
+    // LocalTuneViewModel.maybeAutoFetchArtistPhoto) - so tenta 1 vez por artista pra nao bater na
+    // Deezer toda vez que a pagina dele abrir. Diferente do genero/ano de album (ver
+    // maybeAutoTagAlbumMetadata) - a foto sempre "acha algo" (Deezer quase sempre tem alguma foto
+    // de artista por nome), entao a trava de 1 vez nao trava um caso legitimamente sem dado igual
+    // acontecia com genero/ano.
     fun hasAutoPhotoLookupRun(artistKey: String): Boolean =
         metadataPrefs.getBoolean(autoPhotoLookupDoneKey(artistKey), false)
 
@@ -1295,9 +1287,6 @@ class MusicLibraryRepository(private val context: Context) {
 
     private fun albumYearOverrideKey(albumId: Long, album: String): String =
         "album_year:${albumStableKey(albumId, album)}"
-
-    private fun autoGenreLookupDoneKey(albumId: Long, album: String): String =
-        "auto_genre_lookup_done:${albumStableKey(albumId, album)}"
 
     private fun legacyAlbumGenreOverrideKey(albumId: Long, album: String): String =
         "$albumId:${album.lowercase().trim()}"
