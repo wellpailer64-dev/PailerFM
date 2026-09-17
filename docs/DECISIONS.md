@@ -1980,11 +1980,27 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
      tocados), `assembleRelease` instalado por cima do app já no aparelho de teste via
      `adb install -r` (sem perder dados - mesma chave de release dedicada, ver
      [RELEASE.md](RELEASE.md)) e o app abriu sem crash (`adb logcat` sem `FATAL`).
-- **Decisão consciente que NÃO foi tomada:** o app não força "abrir vaga" no buffer
-  quando ele já está cheio de itens normais - o especial só é baixado/priorizado na
-  PRÓXIMA vaga livre que aparecer (quando algo tocar e sair do buffer), não descarta um
-  item normal já baixado pra abrir espaço na hora. Furar fila = tocar antes do que já
-  esperava, não = interromper o que já está pronto.
+  6. **Vagas reservadas (mesmo dia, pedido do usuário logo depois de testar):** o app
+     mantém o buffer sempre cheio (`BULLETIN_BUFFER_TARGET = 10`), então um buffer já
+     cheio de itens normais só buscaria um especial recém-aprovado depois de esvaziar
+     tudo até abrir vaga de verdade - podia demorar bastante tocando rádio. Corrigido com
+     `BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS = 3`: `refillBulletinBuffer()` para de
+     aceitar item NORMAL assim que o buffer já tem `10 - 3 = 7` normais, e só busca
+     especial pras 3 vagas que sobraram (`downloadNextApprovedBulletin(specialOnly=true)`,
+     novo parâmetro em `BroadcastFeedRepository`, filtra em vez de só ordenar). Efeito
+     colateral aceito de propósito: o buffer "normal" efetivo cai pra 7 (não mais 10)
+     sempre que não há especial pendente - é a troca certa pra abrir espaço rápido pra
+     um especial sem esperar o buffer inteiro drenar.
+- **Limitação conhecida (não resolvida, não é bug):** nenhuma das duas versões desta ADR
+  força "abrir vaga" DESCARTANDO um item normal já baixado - o especial só ocupa uma vaga
+  que abre naturalmente (buffer cheio de antes de qualquer uma das duas correções
+  continua cheio até algo tocar e sair; só builds instaladas DEPOIS da correção de
+  vagas reservadas se autorregulam sozinhas dali pra frente). Confirmado ao vivo
+  17/09/2026: o primeiro especial aprovado na sessão não tocou primeiro na prática
+  porque o buffer do aparelho já estava com 10/10 itens normais restaurados de antes -
+  precisou do botão manual "Resetar" pra esvaziar e repovoar já respeitando a
+  prioridade. Furar fila = tocar antes do que ainda não foi baixado, não = interromper o
+  que já está pronto.
 - **Motivo:** usuário quer um canal de "recado direto" (avisos, publis, pedidos pontuais)
   que fure a programação normal, diferente de notícia temporal ou curiosidade atemporal -
   daí a cor vermelha e a posição no topo da UI (sinalização visual de "isso é prioritário").

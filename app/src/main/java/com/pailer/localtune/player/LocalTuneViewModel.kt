@@ -2722,15 +2722,27 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             try {
                 while (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused) {
                     val bufferPositionBeforeThisItem = bulletinBuffer.size
+                    // Ultimas BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS vagas sao reservadas pra
+                    // especial (ver ADR-037): uma vez que o buffer ja tem
+                    // BULLETIN_BUFFER_TARGET - BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS itens
+                    // normais, para de aceitar normal ate a meta e so busca especial pras vagas
+                    // que sobraram. Sem isso, um buffer que o app mantem sempre cheio de itens
+                    // normais so buscaria um especial recem-aprovado depois de esvaziar tudo.
+                    val normalCount = bulletinBuffer.count { !it.script.isSpecial }
+                    val specialOnly = normalCount >= (BULLETIN_BUFFER_TARGET - BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS)
                     syncBulletinBufferState(
                         isPreparing = true,
-                        statusMessage = "Buscando boletim aprovado no feed Pailer FM...",
+                        statusMessage = if (specialOnly) {
+                            "Vagas reservadas p/ especial: verificando feed Pailer FM..."
+                        } else {
+                            "Buscando boletim aprovado no feed Pailer FM..."
+                        },
                         progressPercent = 5,
                     )
                     try {
                         Log.d(
                             TAG_RADIO_VOICE,
-                            "boletim: buscando posicao=$bufferPositionBeforeThisItem",
+                            "boletim: buscando posicao=$bufferPositionBeforeThisItem specialOnly=$specialOnly",
                         )
                         // withTimeoutOrNull aqui (alem do timeout interno de conexao do
                         // BroadcastFeedRepository) porque hang de DNS/handshake em algumas
@@ -2741,12 +2753,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             broadcastFeedRepository.downloadNextApprovedBulletin(
                                 targetDir = coreBufferDir,
                                 reservedKeys = currentReservedBulletinStoryKeys(),
+                                specialOnly = specialOnly,
                             )
                         }
                         if (remoteBulletin == null) {
-                            // Feed sem boletim novo pra essa vaga. Desiste sem erro; os proximos
-                            // gatilhos (abertura do app, troca de faixa, fim de boletim) tentam
-                            // de novo.
+                            // Feed sem boletim novo pra essa vaga (ou, em modo specialOnly, sem
+                            // especial pendente agora). Desiste sem erro; os proximos gatilhos
+                            // (abertura do app, troca de faixa, fim de boletim) tentam de novo -
+                            // as vagas reservadas ficam livres ate um especial aparecer.
                             syncBulletinBufferState(isPreparing = false, statusMessage = null)
                             break
                         }
@@ -3814,6 +3828,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // do boletim ficar 100% radio-agnostico. Buffer UNICO (unificado 10/09/2026, ver
         // comentario em bulletinBuffer) - 10 e o estoque real, nao 10 por "nivel".
         const val BULLETIN_BUFFER_TARGET = 10
+        // Pedido do usuario (17/09/2026, ADR-037): reserva as ultimas 3 vagas do buffer so pra
+        // boletim "especial" - normal para de ser baixado em BULLETIN_BUFFER_TARGET -
+        // BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS (7) itens, mesmo com vaga livre ate 10. Sem
+        // isso, um buffer ja cheio de itens normais (comum - o app mantem ele sempre cheio)
+        // so buscaria um especial recem-aprovado depois de esvaziar TUDO ate abrir vaga de
+        // verdade, o que pode levar bastante tempo tocando radio. Com reserva, a vaga pra um
+        // especial fica pronta assim que o buffer normal encolhe pra 7 (3 musicas/boletins
+        // tocados), sem precisar esperar o buffer inteiro esvaziar.
+        const val BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS = 3
         const val RECENT_BULLETIN_STORY_KEY_LIMIT = 80
 
         // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() - so precisa

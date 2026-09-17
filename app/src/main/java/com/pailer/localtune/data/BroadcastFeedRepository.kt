@@ -38,6 +38,10 @@ class BroadcastFeedRepository(private val context: Context) {
     suspend fun downloadNextApprovedBulletin(
         targetDir: File,
         reservedKeys: Set<String>,
+        // true quando o chamador so tem vagas RESERVADAS pra especial sobrando (ver
+        // BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS em LocalTuneViewModel.kt/ADR-037) - ignora
+        // itens normais mesmo que existam, pra nao gastar essas vagas com conteudo comum.
+        specialOnly: Boolean = false,
     ): RemoteApprovedBulletin? = withContext(Dispatchers.IO) {
         val cancelWatchdog = coroutineContext.job.invokeOnCompletion { cause ->
             if (cause is CancellationException) {
@@ -45,7 +49,7 @@ class BroadcastFeedRepository(private val context: Context) {
             }
         }
         try {
-            downloadNextApprovedBulletinBlocking(targetDir, reservedKeys)
+            downloadNextApprovedBulletinBlocking(targetDir, reservedKeys, specialOnly)
         } finally {
             cancelWatchdog.dispose()
         }
@@ -54,18 +58,25 @@ class BroadcastFeedRepository(private val context: Context) {
     private fun downloadNextApprovedBulletinBlocking(
         targetDir: File,
         reservedKeys: Set<String>,
+        specialOnly: Boolean,
     ): RemoteApprovedBulletin? {
         return runCatching {
             targetDir.mkdirs()
             val manifest = JSONObject(fetchText(MANIFEST_URL))
             val items = manifest.optJSONArray("items") ?: JSONArray()
+            val candidates = (0 until items.length()).mapNotNull { items.optJSONObject(it) }
             // Especial (recado/publi por pedido direto, content_type == "especial") fura fila de
             // DOWNLOAD tambem, nao so de reproducao (ver ADR-037 em docs/DECISIONS.md) - senao ele
             // so seria baixado quando chegasse a vez dele na ordem do manifest, que o painel Python
-            // intercala por categoria sem saber de prioridade nenhuma. Duas passadas preservando a
-            // ordem relativa de cada grupo: especiais primeiro, resto do feed depois.
-            val ordered = (0 until items.length()).mapNotNull { items.optJSONObject(it) }
-                .sortedByDescending { it.optString("content_type") == "especial" }
+            // intercala por categoria sem saber de prioridade nenhuma. Com specialOnly, ignora
+            // qualquer item normal de vez (vagas reservadas nao devem ser gastas com eles);
+            // sem specialOnly, ordena especiais primeiro mas ainda aceita normal (sortedByDescending
+            // e estavel - preserva a ordem relativa dentro de cada grupo).
+            val ordered = if (specialOnly) {
+                candidates.filter { it.optString("content_type") == "especial" }
+            } else {
+                candidates.sortedByDescending { it.optString("content_type") == "especial" }
+            }
             for (item in ordered) {
                 val bulletin = tryDownloadApprovedItem(item, targetDir, reservedKeys)
                 if (bulletin != null) return@runCatching bulletin
