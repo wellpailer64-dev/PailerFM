@@ -4968,7 +4968,12 @@ private fun UpdateAvailableDialog(
         title = { Text("Nova versão disponível") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("A versão ${release.tagName} do Pailer FM já está disponível.")
+                if (release.notes.isNullOrBlank()) {
+                    Text("A versão ${release.tagName} do Pailer FM já está disponível.")
+                } else {
+                    Text("Novidades da ${release.tagName}:", fontWeight = FontWeight.SemiBold)
+                    Text(release.notes, style = MaterialTheme.typography.bodyMedium)
+                }
                 if (state.isDownloading) {
                     LinearProgressIndicator(
                         progress = { state.downloadProgress },

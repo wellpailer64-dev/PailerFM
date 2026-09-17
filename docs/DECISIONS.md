@@ -2095,7 +2095,63 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, sem warning novo (inclusive
   removido `onFetchLyrics` de `HomeScreen`, que ficou sem uso depois da mudança #2 - só
   `FullPlayer` ainda precisa dele, pro botão explícito).
-- **Teste combinado com a ADR-033:** usuário vai confirmar essas três mudanças
-  instalando via o popup de auto-atualização (push → CI → Release novo → app pede pra
-  atualizar sozinho), não via `adb install` manual - primeiro teste de ponta a ponta da
-  auto-atualização desde que foi ativada.
+- **Teste combinado com a ADR-033:** usuário confirmou essas três mudanças instalando via
+  o popup de auto-atualização (push → CI → Release novo → app pede pra atualizar
+  sozinho), não via `adb install` manual - primeiro teste de ponta a ponta da
+  auto-atualização desde que foi ativada. Ver achados do teste e a feature de changelog
+  resumido que saiu dele na ADR-039 abaixo.
+
+## ADR-039 — Primeiro teste real da auto-atualização: 2 achados + changelog resumido no popup
+
+- **Contexto (17/09/2026):** primeira vez testando a auto-atualização (ADR-033) de ponta
+  a ponta, depois das três mudanças da ADR-038. Dois problemas reais apareceram no
+  caminho, mais um pedido de melhoria pro popup.
+- **Achado 1 - build local nunca detecta atualização, de propósito:** o app instalado no
+  aparelho de teste tinha sido compilado localmente (`assembleRelease` direto, sem CI),
+  então `BuildConfig.RELEASE_TAG` era `"local-dev"` - e
+  `UpdateCheckRepository.isNewerThanCurrent()` desliga a checagem inteira nesse caso
+  (`if (BuildConfig.RELEASE_TAG == "local-dev") return false`, decisão de propósito da
+  ADR-033: notificar sobre uma build de teste não faz sentido). Não é bug - mas quer
+  dizer que **build local nunca serve de base pra testar o popup de atualização**;
+  precisa de uma build de verdade do CI instalada primeiro (ex. baixada de um Release
+  mais antigo via `gh release download`) pra ter uma tag real pra comparar.
+- **Achado 2 - upload do APK pro Release trava/falha aleatoriamente:** o passo "Publica
+  Release automático" já vinha demorando mais que o resto do pipeline (visto antes, sem
+  explicação clara). Na tentativa seguinte, o upload do APK (35MB, tamanho normal) deu
+  `Headers Timeout Error` depois de ~7min parado em "Uploading PailerFM.apk..." -
+  provável instabilidade da API de asset upload do GitHub combinada com
+  `softprops/action-gh-release@v2`, não algo errado na configuração (tamanho do arquivo
+  normal, mesma operação que às vezes completa em segundos). Deixou pra trás uma release
+  **publicada mas sem asset nenhum** (`v2026.09.17-41` original, 0 assets) - perigoso
+  porque `UpdateCheckRepository` pega sempre o item `[0]` de `GET /releases?per_page=1`
+  (o mais recente): com uma release quebrada na frente, o app nunca chegaria nem na
+  release anterior que funcionava. Corrigido ao vivo: `gh release delete ... --cleanup-tag`
+  pra apagar a release quebrada e a tag junto, depois `gh run rerun --failed` (reaproveita
+  o build já compilado, só repete os passos que falharam) - sucesso na 2a tentativa.
+  **Não mudar sem saber:** se isso acontecer nas próximas, o mesmo par de comandos
+  resolve; não decidido ainda se vale a pena automatizar um retry dentro do próprio
+  workflow (ex. `nick-invision/retry` em volta do passo de publicar).
+- **Melhoria pedida pelo usuário, implementada na mesma sessão:** o popup mostrava só "A
+  versão vX.Y.Z já está disponível", sem dizer o que mudou. Agora o corpo da release no
+  GitHub (campo `body`) vira um changelog resumido automático - um bullet por commit
+  desde a release anterior, só a PRIMEIRA linha da mensagem (nunca o corpo técnico
+  detalhado). `LatestReleaseInfo` (`UpdateCheckRepository.kt`) ganhou `notes: String?`
+  lido direto do `body` da release; `UpdateAvailableDialog` (`LocalTuneApp.kt`) mostra
+  "Novidades da vX.Y.Z:" + os bullets quando `notes` existe, cai pro texto genérico
+  antigo quando não (releases antigas, ou tag manual sem changelog).
+  - `build-apk.yml`: `actions/checkout@v4` ganhou `fetch-depth: 0` (histórico completo +
+    tags - o checkout raso padrão não tem tags antigas pra comparar). Novo passo "Monta
+    changelog resumido": `git describe --tags --abbrev=0 HEAD^` acha a tag anterior
+    alcançável a partir do commit PAI (a tag desta build ainda não existe nesse ponto do
+    workflow); `git log <tag-anterior>..HEAD --pretty=format:'- %s' --no-merges` monta um
+    bullet por commit. Sem tag nenhuma ainda (primeiro release do repo), cai pros últimos
+    20 commits.
+  - **Não decidido / limitação aceita:** os bullets são as mensagens de commit CRUAS
+    (escritas pra outra sessão/desenvolvedor entender o porquê técnico, não pro usuário
+    final) - às vezes um commit vai ser algo tipo "CI: corrige maxdepth do find" que não
+    diz muito pra quem só quer saber "o que ficou melhor". Aceito por enquanto (pedido
+    explícito do usuário era "o mais resumido possível", sem curadoria manual por
+    release) - revisitar se os changelogs ficarem confusos na prática.
+- **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, YAML do workflow validado
+  (`python -c "import yaml; ..."`). Não testado ainda ao vivo (próxima release já sai com
+  isso, sem push nesta sessão - pedido do usuário).

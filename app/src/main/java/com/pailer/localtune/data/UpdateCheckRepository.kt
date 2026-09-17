@@ -14,6 +14,12 @@ data class LatestReleaseInfo(
     val tagName: String,
     val apkDownloadUrl: String,
     val htmlUrl: String,
+    // Corpo da release no GitHub (ver build-apk.yml, "Monta changelog resumido") - lista de
+    // bullets ja pronta (um por commit desde a release anterior), pra mostrar no popup de
+    // atualizacao em vez do texto generico "versao X disponivel". Null/vazio pra releases sem
+    // changelog (ex. tag manual antiga, ou release feita antes desse campo existir) - o popup
+    // cai pro texto generico nesse caso.
+    val notes: String? = null,
 )
 
 // Checagem de atualizacao fora da Play Store (pedido do usuario 15/09/2026: em vez de mandar o
@@ -43,7 +49,10 @@ class UpdateCheckRepository(private val context: Context) {
                     break
                 }
             }
-            apkUrl?.let { url -> LatestReleaseInfo(tagName = tagName, apkDownloadUrl = url, htmlUrl = json.optString("html_url")) }
+            val notes = json.optString("body").trim().takeIf { it.isNotBlank() }
+            apkUrl?.let { url ->
+                LatestReleaseInfo(tagName = tagName, apkDownloadUrl = url, htmlUrl = json.optString("html_url"), notes = notes)
+            }
         }.getOrNull()
     }
 

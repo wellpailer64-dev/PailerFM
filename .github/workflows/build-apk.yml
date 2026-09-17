@@ -15,7 +15,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 (17/09/2026): historico completo + tags, necessario pro passo "Monta
+      # changelog resumido" abaixo comparar contra a tag da release anterior (git describe/git
+      # log precisam do historico inteiro - o checkout raso padrao (so o ultimo commit) nao
+      # tem as tags anteriores pra comparar).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -92,6 +98,33 @@ jobs:
             echo "tag=v$(date -u +'%Y.%m.%d')-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Changelog resumido pro popup de atualizacao in-app (pedido do usuario 17/09/2026): um
+      # bullet por commit desde a ultima release publicada nesse branch, usando so a PRIMEIRA
+      # linha da mensagem (o titulo/resumo - nunca o corpo detalhado, tecnico demais pra quem so
+      # quer ver "o que mudou"). git describe acha a tag alcancavel mais proxima do commit PAI
+      # (HEAD^, nao HEAD - a tag desta propria build ainda nao existe nesse ponto do workflow);
+      # sem tag nenhuma ainda (primeira release do repo), cai pros ultimos 20 commits. --no-merges
+      # pra nao poluir com "Merge branch..." em PRs mergeadas. UpdateCheckRepository.kt le esse
+      # texto direto do campo "body" da release via API do GitHub - nenhuma mudanca no app
+      # depende do FORMATO exato aqui alem de "texto simples com uma linha por novidade".
+      - name: Monta changelog resumido (bullets desde a release anterior)
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "$PREV_TAG"..HEAD --pretty=format:'- %s' --no-merges)
+          else
+            LOG=$(git log --pretty=format:'- %s' --no-merges -20)
+          fi
+          if [ -z "$LOG" ]; then
+            LOG="- Build automática do merge ${{ github.sha }} na master."
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$LOG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # So fora de pull_request - a chave de release real nunca fica exposta num build de PR
       # (nem de fork nem de branch do proprio repo). Builds de PR continuam saindo com a
       # assinatura de debug, igual sempre foi (ver app/build.gradle.kts).
@@ -137,8 +170,7 @@ jobs:
           fail_on_unmatched_files: true
           tag_name: ${{ steps.ver.outputs.tag }}
           name: PailerFM ${{ steps.ver.outputs.tag }}
-          body: |
-            Build automática do merge ${{ github.sha }} na master.
+          body: ${{ steps.changelog.outputs.body }}
           prerelease: true
 
       # Tag manual v* (ex.: git tag v0.1.0): Release "de verdade", não prerelease.
