@@ -1991,16 +1991,37 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
      colateral aceito de propósito: o buffer "normal" efetivo cai pra 7 (não mais 10)
      sempre que não há especial pendente - é a troca certa pra abrir espaço rápido pra
      um especial sem esperar o buffer inteiro drenar.
-- **Limitação conhecida (não resolvida, não é bug):** nenhuma das duas versões desta ADR
-  força "abrir vaga" DESCARTANDO um item normal já baixado - o especial só ocupa uma vaga
-  que abre naturalmente (buffer cheio de antes de qualquer uma das duas correções
-  continua cheio até algo tocar e sair; só builds instaladas DEPOIS da correção de
-  vagas reservadas se autorregulam sozinhas dali pra frente). Confirmado ao vivo
-  17/09/2026: o primeiro especial aprovado na sessão não tocou primeiro na prática
-  porque o buffer do aparelho já estava com 10/10 itens normais restaurados de antes -
-  precisou do botão manual "Resetar" pra esvaziar e repovoar já respeitando a
-  prioridade. Furar fila = tocar antes do que ainda não foi baixado, não = interromper o
-  que já está pronto.
+- **Terceira correção, mesmo dia (usuário recusou depender do botão manual "Resetar"):**
+  `checkForSpecialOnAppOpen()`, chamado uma vez no `init` do `LocalTuneViewModel`,
+  SEQUENCIAL e ANTES de `refillBulletinBuffer()` (mesma corrotina - evita baixar o
+  mesmo especial duas vezes em paralelo). Ignora `BULLETIN_BUFFER_TARGET` de propósito:
+  mesmo com o buffer já cheio (`refillBulletinBuffer()` sozinho seria no-op aqui, nem
+  chega a consultar o feed), este método ainda baixa e insere o especial via
+  `addFirst()`. Pode deixar `bulletinBuffer` com `TARGET + 1` item temporariamente -
+  aceito de propósito, nunca descarta um item normal já baixado; a fila assenta de
+  volta no teto sozinha assim que esse especial tocar. No-op rápido (sem rede) se já
+  existe um especial no buffer, pra nunca empilhar mais de um furando fila ao mesmo
+  tempo. `BroadcastFeedRepository.downloadNextApprovedBulletin()`/
+  `tryDownloadApprovedItem()` ganharam log de diagnóstico (`logSkipReason`) explicando
+  por que um candidato foi pulado em modo `specialOnly` (vencido, já reservado etc.) -
+  útil pra depurar em campo sem acesso ao storage privado do app (build release não é
+  debuggable, `adb shell run-as` não funciona).
+- **Confirmado ao vivo 17/09/2026:** o item já estava no buffer via o mecanismo de vagas
+  reservadas da segunda correção (o usuário usou o app entre um build e outro, tocou
+  música suficiente pra abrir as vagas reservadas, e o refill normal já tinha pego o
+  especial e posto na frente) - `checkForSpecialOnAppOpen()` rodou e confirmou
+  "já tem especial no buffer, pulando" em vez de precisar baixar de novo. Como a única
+  forma de um item sair da frente do buffer é tocar (`removeFirst()`), ele estar
+  presente confirma que ainda está na posição 0, não tocado - exatamente o resultado
+  que o usuário pediu, sem apertar nenhum botão.
+- **Limitação conhecida que continua (não resolvida, não é bug):** nenhuma das
+  correções força "abrir vaga" DESCARTANDO um item normal já baixado - só tolera
+  `TARGET + 1` temporariamente (`checkForSpecialOnAppOpen`) ou reserva 3 vagas de
+  antemão (segunda correção). Um buffer que já estava cheio de itens normais ANTES de
+  qualquer uma das três correções (build antiga, nunca atualizada) continua precisando
+  de uma abertura de vaga natural (tocar algo) ou do botão "Resetar" a primeira vez -
+  dali em diante o sistema se autorregula sozinho em toda abertura do app. Furar fila =
+  tocar antes do que ainda não foi baixado, não = interromper o que já está pronto.
 - **Motivo:** usuário quer um canal de "recado direto" (avisos, publis, pedidos pontuais)
   que fure a programação normal, diferente de notícia temporal ou curiosidade atemporal -
   daí a cor vermelha e a posição no topo da UI (sinalização visual de "isso é prioritário").

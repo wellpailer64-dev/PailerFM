@@ -77,8 +77,11 @@ class BroadcastFeedRepository(private val context: Context) {
             } else {
                 candidates.sortedByDescending { it.optString("content_type") == "especial" }
             }
+            if (specialOnly) {
+                Log.d(TAG, "specialOnly: ${ordered.size} candidato(s) especial no manifest")
+            }
             for (item in ordered) {
-                val bulletin = tryDownloadApprovedItem(item, targetDir, reservedKeys)
+                val bulletin = tryDownloadApprovedItem(item, targetDir, reservedKeys, logSkipReason = specialOnly)
                 if (bulletin != null) return@runCatching bulletin
             }
             null
@@ -91,10 +94,17 @@ class BroadcastFeedRepository(private val context: Context) {
         item: JSONObject,
         targetDir: File,
         reservedKeys: Set<String>,
+        logSkipReason: Boolean = false,
     ): RemoteApprovedBulletin? {
-        if (item.optString("status") != "approved") return null
-        if (item.optString("expires_at").isExpired()) return null
         val id = item.optString("id").trim()
+        if (item.optString("status") != "approved") {
+            if (logSkipReason) Log.d(TAG, "specialOnly: $id pulado - status=${item.optString("status")}")
+            return null
+        }
+        if (item.optString("expires_at").isExpired()) {
+            if (logSkipReason) Log.d(TAG, "specialOnly: $id pulado - vencido")
+            return null
+        }
         if (id.isBlank()) return null
         val title = item.optString("title").ifBlank { item.optString("slug").ifBlank { id } }
         val category = item.optString("category").ifBlank { "geral" }
@@ -107,7 +117,10 @@ class BroadcastFeedRepository(private val context: Context) {
         // foi baixado 10x seguidas pro buffer inteiro em vez de variar entre os itens do feed.
         val source = "Pailer FM Broadcast · $category"
         val reservationKey = "${source.normalizedRemoteKey()}|${title.normalizedRemoteKey()}"
-        if (reservationKey in reservedKeys) return null
+        if (reservationKey in reservedKeys) {
+            if (logSkipReason) Log.d(TAG, "specialOnly: $id pulado - reservationKey ja em uso: $reservationKey")
+            return null
+        }
         val audio = item.optJSONObject("audio") ?: return null
         val audioPath = audio.optString("path").takeIf { it.isNotBlank() } ?: return null
         val extension = audio.optString("format").ifBlank { audioPath.substringAfterLast('.', "wav") }

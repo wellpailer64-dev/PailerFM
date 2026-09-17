@@ -734,6 +734,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             loadCoreBufferManifest()
             syncBulletinBufferState()
+            // Pedido do usuario (17/09/2026, ADR-037): nao quer precisar clicar em "Resetar" -
+            // verifica especial pendente TODA abertura do app, furando fila mesmo com o buffer
+            // ja cheio de itens normais (refillBulletinBuffer() sozinho nao tentaria nada aqui,
+            // ve bulletinBuffer.size >= BULLETIN_BUFFER_TARGET e desiste sem checar o feed).
+            // Roda sequencial, ANTES de refillBulletinBuffer() e na MESMA corrotina (nao um
+            // launch separado) - evita baixar o mesmo especial duas vezes em paralelo.
+            checkForSpecialOnAppOpen()
             refillBulletinBuffer()
         }
     }
@@ -2697,6 +2704,42 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         radioPrefs.edit()
             .putString(KEY_RECENT_BULLETIN_STORY_KEYS, recentBulletinStoryKeys.joinToString("\n"))
             .apply()
+    }
+
+    // Verifica um boletim "especial" pendente na abertura do app e, se achar, fura a fila na
+    // hora - ver ADR-037 em docs/DECISIONS.md. Chamada de proposito ANTES de
+    // refillBulletinBuffer() (mesma corrotina, nunca em paralelo com ele) e ignora
+    // BULLETIN_BUFFER_TARGET: mesmo com o buffer ja cheio de itens normais (refillBulletinBuffer
+    // sozinho seria um no-op nesse caso, ve o teto batido e nem consulta o feed), este metodo
+    // ainda baixa e insere o especial. Pode deixar bulletinBuffer com TARGET + 1 item
+    // temporariamente - aceito de proposito, nunca descarta um item normal ja baixado pra abrir
+    // espaco (mesma decisao consciente do resto do ADR-037); a fila assenta de volta no teto
+    // sozinha assim que esse especial tocar. No-op rapido (sem tocar rede) se ja existe um
+    // especial no buffer - nao empilha vários furando fila ao mesmo tempo.
+    private suspend fun checkForSpecialOnAppOpen() {
+        if (bulletinBuffer.any { it.script.isSpecial }) {
+            Log.d(TAG_RADIO_VOICE, "boletim: checkForSpecialOnAppOpen - ja tem especial no buffer, pulando")
+            return
+        }
+        Log.d(TAG_RADIO_VOICE, "boletim: checkForSpecialOnAppOpen - consultando feed")
+        val remoteBulletin = withTimeoutOrNull(REMOTE_FEED_TIMEOUT_MS) {
+            broadcastFeedRepository.downloadNextApprovedBulletin(
+                targetDir = coreBufferDir,
+                reservedKeys = currentReservedBulletinStoryKeys(),
+                specialOnly = true,
+            )
+        }
+        if (remoteBulletin == null) {
+            Log.d(TAG_RADIO_VOICE, "boletim: checkForSpecialOnAppOpen - nenhum especial novo pra baixar")
+            return
+        }
+        rememberRecentBulletinStory(remoteBulletin.script)
+        bulletinBuffer.addFirst(
+            PreparedBulletin(script = remoteBulletin.script, file = remoteBulletin.audioFile),
+        )
+        saveCoreBufferManifest()
+        syncBulletinBufferState()
+        Log.d(TAG_RADIO_VOICE, "boletim: especial furou fila na abertura do app id=${remoteBulletin.id}")
     }
 
     // Mantem bulletinBuffer com BULLETIN_BUFFER_TARGET itens prontos (roteiro decorado + WAV
