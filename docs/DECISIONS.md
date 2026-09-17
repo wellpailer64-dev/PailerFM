@@ -2153,5 +2153,54 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
     explícito do usuário era "o mais resumido possível", sem curadoria manual por
     release) - revisitar se os changelogs ficarem confusos na prática.
 - **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, YAML do workflow validado
-  (`python -c "import yaml; ..."`). Não testado ainda ao vivo (próxima release já sai com
-  isso, sem push nesta sessão - pedido do usuário).
+  (`python -c "import yaml; ..."`). Não testado ainda ao vivo - pedido do usuário
+  (17/09/2026) foi commitar sem push nessa hora da sessão; enviado junto do push
+  seguinte (ver ADR-040), que já leva o changelog resumido nesta própria release.
+
+## ADR-040 — Sequência ao vivo: some o "furar fila", cards mais finos, revela por bloco
+
+- **Contexto (17/09/2026):** última rodada de pedidos da sessão, todos na tela da rádio
+  (`RadioDetailScreen`/`RadioTrackRow`, `LocalTuneApp.kt`).
+- **1. Tocar no card da próxima música deixava pular pra ela (não era combinado):**
+  `RadioTrackRow` tinha `onClick`/`.clickable` chamando `onPlaySong(index)` →
+  `viewModel.playRadioSession(radioSession, openedRadio.name, startIndex = index)` - dava
+  pra furar a sequência ao vivo tocando em qualquer card. Removido: `RadioTrackRow` não
+  tem mais `onClick` nenhum (só exibe, mesmo padrão não-clicável que `RadioNewsBreakCard`
+  já tinha). Parâmetro `onPlaySong` de `RadioDetailScreen` removido por ficar sem uso
+  (nenhum outro lugar dessa tela pulava música) - `playRadioSession(..., startIndex)`
+  continua existindo/usado normalmente pra ENTRAR na rádio do início (`startIndex` tem
+  default `0`).
+- **2. Cards "muito grossos":** `RadioTrackRow` emagrecido - `vertical padding` 8dp→4dp,
+  capa (`ArtworkBox`) 48dp→38dp, coluna do índice/ícone "tocando agora" 30dp→24dp, nome do
+  artista de `bodySmall` pra `labelSmall`. Mesma informação, ocupando menos altura por
+  item.
+- **3. Sequência inteira aparecia de uma vez (spoiler da programação inteira):** antes,
+  `sessionSongs.forEachIndexed` desenhava TODAS as músicas da sessão com marcador de
+  boletim a cada `songsBetweenBulletins` (padrão 3 - o "bloco" já existia como conceito
+  em `RadioBulletinSettings.songsBetweenBulletins`, só nunca tinha sido usado pra limitar
+  o que aparece na tela). Agora mostra só o BLOCO que contém `player.queueIndex`
+  (`blockStart`/`blockEnd` calculados por divisão inteira, 1-based) + o card de "Notícia"
+  que fecha esse bloco - fora de sessão (antes de entrar), sempre o primeiro bloco. Como a
+  tela recompõe a cada posição nova tocada, o próximo bloco aparece sozinho assim que o
+  boletim passa - sensação de rádio "infinita"/com fator surpresa, pedido explícito do
+  usuário. Nenhum estado novo precisou ser guardado (`remember`/`mutableStateOf`) - é só
+  um filtro derivado de `player.queueIndex`, que já existe.
+- **4. Botões de gerenciar rádio (+ / lixeira / renomear) somem de dentro da sessão ao
+  vivo:** esses 4 `IconButton` (adicionar fonte, remover fonte, renomear, apagar rádio)
+  apareciam TANTO na tela de fora da rádio (antes de entrar, ramo `else` de
+  `isInSession`) QUANTO dentro dela, ao lado do botão "Sair da rádio" (ramo
+  `if (isInSession)`). Removidos só do ramo de dentro da sessão - o raciocínio do usuário:
+  esse tipo de edição só faz sentido feita de fora, e ter os ícones ali dentro não ajudava
+  em nada, só ocupava espaço. "Sair da rádio" agora ocupa a Row inteira sozinho
+  (`fillMaxWidth()` em vez de dividir com os outros 4 via `weight(1f)`). O ramo de fora da
+  rádio (`else`) manteve os 4 botões exatamente como estavam.
+- **5. Título "Sequência ao vivo" → "Sequência ao vivo do bloco", fonte menor:** era
+  `SectionTitle("Sequencia ao vivo")` (`titleMedium`, mesmo componente reusado em
+  "Álbuns adicionados recentemente" etc. - não mexido, é usado em várias outras seções
+  não relacionadas a este pedido). Trocado por um `Text` próprio só aqui, com
+  `labelLarge` (menor que `titleMedium`) e o texto novo.
+- **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, sem warning novo (nenhum
+  parâmetro ficou sem uso depois de remover `onPlaySong`/`onClick`). Lógica de
+  `blockStart`/`blockEnd` conferida manualmente pra `interval = 3` em várias posições
+  (1, 3, 4, 6, 7 - todas caem no bloco certo). Não testado ao vivo ainda nesta sessão -
+  vai junto do próximo push/release.

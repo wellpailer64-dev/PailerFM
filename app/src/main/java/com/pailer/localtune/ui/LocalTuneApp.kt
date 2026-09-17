@@ -978,7 +978,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                 }
                             }
                         },
-                        onPlaySong = { index -> viewModel.playRadioSession(radioSession, openedRadio.name, startIndex = index) },
                         onOpenPlayer = { showFullPlayer = true },
                         onDeleteRadio = {
                             viewModel.deleteRadio(openedRadio)
@@ -5555,7 +5554,6 @@ private fun RadioDetailScreen(
     isGenerating: Boolean,
     onBack: () -> Unit,
     onEnterRadio: () -> Unit,
-    onPlaySong: (Int) -> Unit,
     onOpenPlayer: () -> Unit,
     onDeleteRadio: () -> Unit = {},
     artists: List<LocalArtist> = emptyList(),
@@ -5594,81 +5592,21 @@ private fun RadioDetailScreen(
             }
             // Ja mostrando a rádio ao vivo no card acima (nome, faixa atual, capa) - repetir
             // mosaico/nome/descricao aqui embaixo seria redundante. So o botao pra sair.
+            // Botoes de gerenciar fontes/renomear/apagar removidos daqui (pedido do usuario
+            // 17/09/2026): esse tipo de alteracao na radio so faz sentido feita de FORA dela
+            // (ramo "else" abaixo, antes de entrar) - dentro da sessao ao vivo, so "Sair da
+            // radio" faz sentido, em destaque ocupando a largura toda.
             item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                Button(
+                    onClick = onBack,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
                 ) {
-                    Button(
-                        onClick = onBack,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(52.dp),
-                    ) {
-                        Icon(Icons.Filled.Close, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Sair da rádio")
-                    }
-                    if (radio.isCustom) {
-                        IconButton(
-                            onClick = { showAddSource = true },
-                            modifier = Modifier
-                                .size(52.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(PailerGunmetal.copy(alpha = 0.5f)),
-                        ) {
-                            Icon(
-                                Icons.Filled.Add,
-                                contentDescription = "Adicionar artista ou álbum a esta rádio",
-                                tint = MaterialTheme.colorScheme.onBackground,
-                            )
-                        }
-                    }
-                    if (canManageSources) {
-                        IconButton(
-                            onClick = { showManageSources = true },
-                            modifier = Modifier
-                                .size(52.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(PailerGunmetal.copy(alpha = 0.5f)),
-                        ) {
-                            Icon(
-                                Icons.Filled.Remove,
-                                contentDescription = "Remover artista ou álbum desta rádio",
-                                tint = MaterialTheme.colorScheme.onBackground,
-                            )
-                        }
-                    }
-                    if (canRename) {
-                        IconButton(
-                            onClick = { showRenameDialog = true },
-                            modifier = Modifier
-                                .size(52.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(PailerGunmetal.copy(alpha = 0.5f)),
-                        ) {
-                            Icon(
-                                Icons.Filled.Edit,
-                                contentDescription = "Renomear rádio",
-                                tint = MaterialTheme.colorScheme.onBackground,
-                            )
-                        }
-                    }
-                    IconButton(
-                        onClick = { showDeleteConfirm = true },
-                        modifier = Modifier
-                            .size(52.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(PailerGunmetal.copy(alpha = 0.5f)),
-                    ) {
-                        Icon(
-                            Icons.Filled.Delete,
-                            contentDescription = "Remover radio",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                        )
-                    }
+                    Icon(Icons.Filled.Close, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Sair da rádio")
                 }
             }
         } else {
@@ -5792,30 +5730,54 @@ private fun RadioDetailScreen(
         }
         if (sessionSongs.isNotEmpty()) {
             item {
-                SectionTitle("Sequencia ao vivo")
+                // Titulo proprio (nao SectionTitle - reservado pras secoes da Home/Biblioteca,
+                // fonte maior de proposito la) - fonte menor, pedido do usuario (17/09/2026).
+                Text(
+                    "Sequência ao vivo do bloco",
+                    modifier = Modifier.padding(top = 8.dp, bottom = 8.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Black,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
             }
+            // Mostra so o BLOCO atual (interval musicas + o boletim que fecha ele), nao a
+            // sequencia inteira - pedido do usuario (17/09/2026): mostrar tudo de uma vez
+            // dava spoiler da programacao inteira; de 3 em 3 (ou o que songsBetweenBulletins
+            // definir) mantem a sensacao de radio "infinita" com fator surpresa. Bloco atual =
+            // o que contem player.queueIndex (1-based, mesmo indice de sessionSongs); fora da
+            // sessao (isInSession == false, queueIndex nao serve de referencia), mostra sempre
+            // o primeiro bloco. Revela o proximo bloco sozinho conforme queueIndex avanca (a UI
+            // ja recompoe a cada posicao nova tocada, nao precisa de estado proprio aqui).
+            //
             // Boletim nunca vira item de fila de verdade no ExoPlayer (toca por cima via
             // announcementPlayer, ver LocalTuneViewModel) - o indice de sessionSongs bate direto
             // com player.currentMediaItemIndex/queueIndex. Card "Noticia" aqui e so uma marcacao
-            // visual de ONDE o boletim entra (a cada `interval` musicas, mesmo calculo de
-            // completedRadioSongs/songsBetweenBulletins no ViewModel), pedido do usuario
-            // (04/09/2026) pra visualizar tocando/ja tocada/proximo boletim sem abrir o player.
+            // visual de ONDE o boletim entra, pedido do usuario (04/09/2026) pra visualizar
+            // tocando/ja tocada/proximo boletim sem abrir o player.
+            //
+            // Cards da sequencia NAO SAO MAIS clicaveis (pedido do usuario 17/09/2026): tocar
+            // num card da proxima musica deixava "furar fila"/pular pra frente, o que nao era
+            // combinado - RadioTrackRow perdeu o onClick de proposito.
             val interval = songsBetweenBulletins.coerceAtLeast(1)
-            sessionSongs.forEachIndexed { index, song ->
-                val position = index + 1
-                item(key = song.id) {
-                    RadioTrackRow(
-                        index = position,
-                        song = song,
-                        isPlaying = isInSession && position == player.queueIndex,
-                        isPlayed = isInSession && position < player.queueIndex,
-                        onClick = { onPlaySong(index) },
-                    )
-                }
-                if (position % interval == 0) {
-                    item(key = "news_break_$position") {
-                        RadioNewsBreakCard()
+            val currentPosition = if (isInSession) player.queueIndex.coerceAtLeast(1) else 1
+            val blockStart = ((currentPosition - 1) / interval) * interval + 1
+            val blockEnd = blockStart + interval - 1
+            sessionSongs.withIndex()
+                .filter { (i, _) -> (i + 1) in blockStart..blockEnd }
+                .forEach { (index, song) ->
+                    val position = index + 1
+                    item(key = song.id) {
+                        RadioTrackRow(
+                            index = position,
+                            song = song,
+                            isPlaying = isInSession && position == player.queueIndex,
+                            isPlayed = isInSession && position < player.queueIndex,
+                        )
                     }
+                }
+            if (sessionSongs.size >= blockEnd) {
+                item(key = "news_break_$blockEnd") {
+                    RadioNewsBreakCard()
                 }
             }
         } else {
@@ -5913,18 +5875,21 @@ private fun LiveRadioBadge(isActive: Boolean) {
 private fun RadioTrackRow(
     index: Int,
     song: LocalSong,
-    onClick: () -> Unit,
     isPlaying: Boolean = false,
     isPlayed: Boolean = false,
 ) {
     // Contraste em 3 niveis pedido pelo usuario (04/09/2026): tocando agora em destaque, ja
     // tocada apagada/cinza, proxima no tom normal - mesmo padrao visual de AlbumTrackRow
     // (icone GraphicEq + cor primaria quando toca), so com o estado "ja tocada" novo aqui.
+    // NAO clicavel de proposito (pedido do usuario 17/09/2026): tocar num card da sequencia
+    // deixava pular pra frente na radio ao vivo, funcionalidade que nao era combinada - so
+    // exibe, nunca interage. Padding/artwork reduzidos no mesmo pedido: card mais fino/
+    // minimalista (era 48dp de capa + 8dp de padding vertical, ficou 38dp + 4dp).
     val contentAlpha = if (isPlayed) 0.5f else 1f
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(8.dp))
             .then(
                 if (isPlaying) {
                     Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
@@ -5932,21 +5897,20 @@ private fun RadioTrackRow(
                     Modifier
                 }
             )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 8.dp),
+            .padding(horizontal = 6.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (isPlaying) {
             Icon(
                 Icons.Filled.GraphicEq,
                 contentDescription = "Tocando agora",
-                modifier = Modifier.width(30.dp).size(18.dp),
+                modifier = Modifier.width(24.dp).size(16.dp),
                 tint = MaterialTheme.colorScheme.primary,
             )
         } else {
             Text(
                 index.toString(),
-                modifier = Modifier.width(30.dp).alpha(contentAlpha),
+                modifier = Modifier.width(24.dp).alpha(contentAlpha),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -5954,15 +5918,16 @@ private fun RadioTrackRow(
         ArtworkBox(
             uri = song.artworkUri,
             embeddedSourceUri = song.contentUri,
-            modifier = Modifier.size(48.dp).alpha(contentAlpha),
+            modifier = Modifier.size(38.dp).alpha(contentAlpha),
         )
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f).alpha(contentAlpha)) {
             Text(
                 song.title,
                 color = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (isPlaying) FontWeight.SemiBold else FontWeight.Normal,
             )
             Text(
@@ -5970,7 +5935,7 @@ private fun RadioTrackRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelSmall,
             )
         }
         Text(
