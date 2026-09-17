@@ -29,12 +29,27 @@ jobs:
       # mesmo de chegar no build de verdade (quebrou silenciosamente TODO push na master desde
       # pelo menos 16/09/2026, sem nenhum Release novo sair - so descoberto ao investigar por
       # que a auto-atualizacao in-app nao tinha nada novo pra oferecer). O runner ubuntu-latest
-      # do GitHub ja vem com Android SDK/cmdline-tools pre-instalado (ANDROID_HOME/
-      # ANDROID_SDK_ROOT ja setados), e o passo seguinte ja faz seu proprio
-      # `sdkmanager --install` pras versoes especificas que o projeto precisa - a action nunca
-      # foi necessaria pra nada alem disso.
+      # do GitHub ja vem com Android SDK pre-instalado em /usr/local/lib/android/sdk (visto no
+      # log de erro da action antiga), so nao fica no PATH por padrao - acha o sdkmanager real
+      # (a versao do cmdline-tools instalada varia por imagem do runner, ex. "16.0" hoje, entao
+      # busca em vez de fixar o nome da pasta) e adiciona ao PATH, sem baixar nem reinstalar
+      # nada.
+      - name: Aponta pro Android SDK ja pre-instalado no runner
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER_PATH=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 2 -name sdkmanager 2>/dev/null | head -n1)
+          if [ -z "$SDKMANAGER_PATH" ]; then
+            echo "::error::sdkmanager nao encontrado em $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          dirname "$SDKMANAGER_PATH" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
       - name: Instala NDK e CMake pinados
         run: |
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install \
             "platforms;android-34" \
             "build-tools;34.0.0" \
