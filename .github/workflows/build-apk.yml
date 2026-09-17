@@ -23,9 +23,16 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # android-actions/setup-android@v3 removido (17/09/2026): o passo interno dele tenta
+      # baixar o pacote legado "tools" via sdkmanager, que a Google removeu do repositorio do
+      # SDK - falha sempre com "Warning: Failed to find package 'tools'" / exit code 1, antes
+      # mesmo de chegar no build de verdade (quebrou silenciosamente TODO push na master desde
+      # pelo menos 16/09/2026, sem nenhum Release novo sair - so descoberto ao investigar por
+      # que a auto-atualizacao in-app nao tinha nada novo pra oferecer). O runner ubuntu-latest
+      # do GitHub ja vem com Android SDK/cmdline-tools pre-instalado (ANDROID_HOME/
+      # ANDROID_SDK_ROOT ja setados), e o passo seguinte ja faz seu proprio
+      # `sdkmanager --install` pras versoes especificas que o projeto precisa - a action nunca
+      # foi necessaria pra nada alem disso.
       - name: Instala NDK e CMake pinados
         run: |
           sdkmanager --install \
