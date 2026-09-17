@@ -34,18 +34,20 @@ jobs:
       # (a versao do cmdline-tools instalada varia por imagem do runner, ex. "16.0" hoje, entao
       # busca em vez de fixar o nome da pasta) e adiciona ao PATH, sem baixar nem reinstalar
       # nada.
-      - name: Aponta pro Android SDK ja pre-instalado no runner
+      # Diagnostico temporario (17/09/2026): duas tentativas anteriores adivinharam onde o SDK
+      # pre-instalado do runner fica e erraram as duas (o caminho muda entre imagens do
+      # runner). Lista o que existe de verdade antes de tentar de novo, em vez de adivinhar
+      # uma terceira vez.
+      - name: DIAGNOSTICO - lista o que existe no runner
         run: |
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          SDKMANAGER_PATH=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 2 -name sdkmanager 2>/dev/null | head -n1)
-          if [ -z "$SDKMANAGER_PATH" ]; then
-            echo "::error::sdkmanager nao encontrado em $SDK_ROOT/cmdline-tools"
-            exit 1
-          fi
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          dirname "$SDKMANAGER_PATH" >> "$GITHUB_PATH"
-          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "--- procurando sdkmanager em todo o sistema ---"
+          find / -iname "sdkmanager" -not -path "*/node_modules/*" 2>/dev/null
+          echo "--- /usr/local/lib/android (se existir) ---"
+          find /usr/local/lib/android -maxdepth 4 2>/dev/null
+          echo "--- variaveis ANDROID*/ANY relevantes ---"
+          env | grep -i android || true
 
       - name: Instala NDK e CMake pinados
         run: |
