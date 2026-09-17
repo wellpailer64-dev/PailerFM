@@ -65,5 +65,8 @@ gradle assembleDebug     # ou assembleRelease
 
 APK debug em `app/build/outputs/apk/debug/app-debug.apk`; release em
 `app/build/outputs/apk/release/app-release.apk` (assinada, instalavel direto via
-`adb install`). Fluxo completo de build+instalacao+debug no aparelho, incluindo por que
-a build release usa a chave de debug de proposito: [docs/RELEASE.md](docs/RELEASE.md).
+`adb install`). Pra atualizar um app ja instalado no aparelho sem perder dados locais,
+usar sempre `assembleRelease` (nao `assembleDebug`) quando `keystore.properties` existir
+na maquina — as duas builds tem assinaturas diferentes e o Android recusa atualizar por
+cima quando elas nao batem. Fluxo completo de build+instalacao+debug no aparelho:
+[docs/RELEASE.md](docs/RELEASE.md).

@@ -1851,3 +1851,153 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   instalado no aparelho de verdade entre um estágio e o próximo (mesmo fluxo de
   `adb install -r` + `logcat` desta sessão) - nenhum estágio quebrou o build na primeira
   tentativa depois do estágio 1.
+
+## ADR-036 — Prazo de validade real dos boletins (painel + Cloudflare + app) e depuração grande da central local
+
+- **Contexto (17/09/2026):** sessão inteira de depuração/evolução na central local
+  (`_broadcast-boletins-local/`, fora deste app - ver
+  [BROADCAST_METADATA.md](BROADCAST_METADATA.md)), não só nesse app Android. Como o app
+  hoje **não tem mais fallback nenhum** (ADR-035 - sem boletim aprovado no feed, a vaga
+  fica vazia), a qualidade/frescor do que a central produz passou a ser a única fonte de
+  boletim que existe, sem rede de segurança. Resumo do que foi corrigido/adicionado do
+  lado da central (todo o trabalho pesado é Python, fora deste repo Android):
+  1. **Card preso pra sempre na síntese**: bug de chave errada gravava a revisão humana
+     (Eliminar/Refazer) sob o `job_id` interno em vez do `id` estável do inventário -
+     card nunca saía da tela. Corrigido na UI (`ui/app.js`) e desprendido manualmente o
+     caso já travado.
+  2. **GPU disputada entre redator e síntese de voz**: Ollama mantinha o Qwen3 14B
+     carregado na VRAM (8GB, RTX 3050) por minutos após cada redação, brigando com a
+     OmniVoice pela mesma GPU. Corrigido com `keep_alive: "0"` na chamada ao Ollama -
+     libera a GPU assim que a redação termina, antes da síntese começar.
+  3. **Fonte "g1 Ciência e Saúde" sempre falhava**: servidor manda a resposta em gzip
+     mesmo sem pedir; o parser de RSS não descomprimia antes de tentar ler XML.
+     Corrigido (`gzip.decompress`), e adicionado suporte gzip em todas as buscas de RSS.
+  4. **13 fontes novas adicionadas** (de 5 pra 18 portais: Ciência Hoje, Pesquisa FAPESP,
+     Galileu, Aventuras na História, Mental Floss, Smithsonian, JSTOR Daily, Aeon,
+     Nautilus, ScienceAlert, Live Science, The Conversation Brasil, Oddity Central) - 3
+     candidatos ficaram de fora (Mega Curioso: domínio morto, redireciona pro Estadão;
+     National Geographic Brasil: sem RSS público; Atlas Obscura: bloqueia bot com 403).
+  5. **Política de uso por fonte (direito autoral)**: nenhum portal RSS é banco de texto
+     - a raspagem de corpo integral do artigo foi **desligada por padrão pra todas as
+     fontes** (`SOURCE_POLICY`/`ai_ingestion_allowed`). O redator recebe só
+     fonte+título+resumo do próprio RSS. Em compensação, a mesma página que já era
+     baixada passou a ser vasculhada só por **links de fonte primária** (domínios
+     `.gov`/`.edu`/`nature.com`/`arxiv.org`/instituições de pesquisa BR) e **autoria**
+     (meta tags), sem guardar o texto do artigo - essa proveniência (fonte, licença,
+     `primary_sources[]`, `authors[]`) fica gravada por boletim e aparece em
+     `source_record.provenance` dentro do `manifest.json` publicado.
+  6. **3 bugs reais de categorização** achados testando com dados reais: nome da fonte
+     ("Olhar Digital" continha "digital", forçava tudo pra tecnologia; "g1 Mundo" continha
+     "mundo", forçava tudo pra geopolítica); a palavra "jogo"/"jogos" batendo em
+     expressões sem nada a ver com videogame ("jogo de poder", "jogos de hoje" = futebol);
+     e "espaço" (espaço físico da sala) sendo confundido com espaço sideral.
+  7. **Classificação `temporal`/`evergreen` nunca funcionou de verdade**: uma linha
+     forçava todo boletim pra `temporal` incondicionalmente, e a lista de sinais tinha
+     lixo de teste esquecido (`"cyberpunk"`, `"redator14b"`). Reescrita com sinais reais
+     de urgência ("hoje", "resultado", "anuncia"...) e de atemporalidade ("curiosidade",
+     "mito", "origem de"...), com a categoria como desempate.
+  8. **Prazo de validade com apagar de verdade** (decisão explícita do usuário - notícia
+     vencida não tem valor de guardar): `purge_expired_bulletins()` roda a cada rodada do
+     pipeline e apaga roteiro/áudio/metadata/proveniência de boletins vencidos, tanto os
+     ainda ativos quanto os já publicados só em `distribuicao-app/public/`. Janelas: 24h
+     pra categorias "aconteceu agora" (geopolítica/tecnologia/saúde/geral), 72h pras
+     demais categorias temporais, 60 dias de prateleira pra atemporal (não é infinito).
+     O relógio conta a partir da publicação original da notícia (capturada do RSS), não
+     de quando a central produziu. Cada item do `manifest.json` ganhou o campo
+     `expires_at` (ISO8601 UTC) pra qualquer consumidor (painel, Cloudflare, este app)
+     aplicar a mesma regra.
+  9. **Site do Cloudflare reorganizado**: cards separados em duas seções empilhadas
+     (⏱ Temporal / ♾ Atemporal), cada uma com subseções por categoria, cards menores e
+     selo de prazo (`vence em Xh`/`vencido`/`prateleira Xd`) direto no card.
+- **Decisão (lado deste app):** `BroadcastFeedRepository.kt` passou a checar
+  `item.optString("expires_at")` antes de baixar qualquer boletim do manifest - item
+  vencido é pulado (mesmo `for` que já ignora `status != "approved"`), sem baixar áudio à
+  toa nem tocar conteúdo desatualizado. Parse via `java.time.Instant.parse()` (nativo
+  desde API 26, `minSdk` deste projeto - sem desugaring extra); string vazia ou formato
+  inesperado é tratado como **não vencido** (fail-open) - prefere baixar um item sem data
+  a esconder o feed inteiro por um formato de data que mudou sem avisar.
+- **Motivo:** fechar o mesmo circuito do ADR-034/035 (central produz, app só consome) pro
+  eixo de frescor de conteúdo - sem isso, um boletim de notícia velha podia ficar dias
+  tocável no app só porque já tinha sido baixado antes de vencer.
+- **Verificação:** `./gradlew :app:compileDebugKotlin` rodou limpo (só warnings
+  pré-existentes de outro arquivo, nada relacionado a esta mudança). O lado Python foi
+  testado à parte, com um boletim falso criado/vencido/apagado de propósito antes de
+  rodar contra os dados reais (ver commit da central local).
+- **Não mudar sem avisar antes:** o `expires_at` é calculado inteiramente do lado da
+  central (Python) - este app só lê e compara contra `Instant.now()`, nunca recalcula
+  prazo nenhum. Se o formato do campo mudar (hoje é sempre `AAAA-MM-DDTHH:mm:ssZ` UTC),
+  atualizar o parser aqui junto.
+- **Pendência conhecida, não implementada nesta sessão:** um boletim que o app **já
+  baixou** pro buffer local (`coreBufferDir`) e ainda não tocou não é reavaliado contra
+  `expires_at` depois do download - só boletins ainda não baixados são pulados. Fechar
+  esse ciclo (buffer local também descarta sozinho o que já venceu) exige entender o
+  ciclo de vida do buffer em `LocalTuneViewModel.kt`
+  (`refillBulletinBuffer`/`saveCoreBufferManifest`/limpeza de órfãos) antes de mexer -
+  não investigado a fundo ainda, fica pra uma próxima sessão. Ver item correspondente em
+  [TODO.md](TODO.md).
+
+## ADR-037 — IMPLEMENTADO (17/09/2026) — Boletim "especial" por pedido direto, com prioridade de produção e reprodução
+
+- **Status:** implementado dos dois lados (painel Python e este app) em 17/09/2026, na
+  mesma sessão em que foi desenhado. Ver
+  [CONTROL_PANEL.md](../../_broadcast-boletins-local/CONTROL_PANEL.md) (seção
+  "Implementado — Recados / Publis") pro lado do painel.
+- **Contexto (17/09/2026):** ideia do usuário, surgida em conversa. Registrado como ADR
+  (mesmo padrão do ADR-033 - "decisão de direção primeiro, implementação documentada
+  depois") pra não perder o desenho entre sessões.
+- **Objetivo:** gerar um boletim sem depender de nenhuma manchete de RSS. O usuário digita
+  um pedido livre (um assunto, um recado, uma "publi") e isso vira o prompt pro Qwen3 14B
+  escrever o bate-bola Fran/Nico sobre aquele assunto específico - o mesmo redator de hoje,
+  só que a matéria de entrada é o pedido do usuário, não uma notícia captada.
+- **Fluxo pretendido (lado painel, fora deste app):** campo de pedido livre na UI do
+  painel → novo caminho de redação que pula seleção/enriquecimento de notícia e monta o
+  prompt direto do pedido → roteiro nasce com `content_type: "especial"` (hoje o sistema só
+  tem `"temporal"`/`"evergreen"`) → furando fila de produção (próximo a ser sintetizado,
+  na frente da reserva normal) → aparece na nova coluna "📣 Recados / Publis" do site
+  publicado (já existe no ar, vazia - ver commit de hoje em
+  `distribution_index_html()`/`broadcast_core.py`).
+- **Decisão (lado deste app):** um boletim `especial` recém-baixado do feed remoto **fura a
+  fila do buffer local** - se o app já tiver vários boletins baixados esperando a vez, o
+  especial vira o próximo a tocar, não entra no fim da lista.
+- **Implementação (lado app):**
+  1. `RadioScript` (`RadioBulletin.kt`) ganhou `isSpecial: Boolean = false`.
+  2. `BroadcastFeedRepository.downloadNextApprovedBulletinBlocking()` lê `content_type` de
+     cada item do manifest e ordena os candidatos (`sortedByDescending`, estável) pra
+     tentar baixar um `especial` ANTES de qualquer outro item, mesmo que ele não seja o
+     primeiro do array — sem isso, um especial só seria baixado quando chegasse a vez dele
+     na ordem que o painel Python intercala por categoria (que não sabe de prioridade
+     nenhuma). Lógica por-item extraída pra `tryDownloadApprovedItem()` (era um único loop
+     grande antes) pra reaproveitar sem duplicar as ~30 linhas de validação/download.
+  3. `LocalTuneViewModel.refillBulletinBuffer()`: item com `isSpecial == true` entra com
+     `bulletinBuffer.addFirst()` em vez de `addLast()`. `dequeueBufferedBulletinForPlayback()`
+     continua um `removeFirst()` simples, sem nenhuma mudança — a prioridade toda vem da
+     ORDEM DE INSERÇÃO, não de lógica extra no consumo.
+  4. `saveCoreBufferManifest()`/`loadCoreBufferManifest()`: campo `"special"` persistido no
+     JSON do manifest local (`optBoolean("special", false)` na leitura — manifest salvo
+     antes desse campo existir volta como não-especial, mesmo padrão de
+     `scriptFromGemini`/`voiceFromGemini`).
+  5. Verificado: `./gradlew :app:compileDebugKotlin` limpo (sem warning novo nos arquivos
+     tocados), `assembleRelease` instalado por cima do app já no aparelho de teste via
+     `adb install -r` (sem perder dados - mesma chave de release dedicada, ver
+     [RELEASE.md](RELEASE.md)) e o app abriu sem crash (`adb logcat` sem `FATAL`).
+- **Decisão consciente que NÃO foi tomada:** o app não força "abrir vaga" no buffer
+  quando ele já está cheio de itens normais - o especial só é baixado/priorizado na
+  PRÓXIMA vaga livre que aparecer (quando algo tocar e sair do buffer), não descarta um
+  item normal já baixado pra abrir espaço na hora. Furar fila = tocar antes do que já
+  esperava, não = interromper o que já está pronto.
+- **Motivo:** usuário quer um canal de "recado direto" (avisos, publis, pedidos pontuais)
+  que fure a programação normal, diferente de notícia temporal ou curiosidade atemporal -
+  daí a cor vermelha e a posição no topo da UI (sinalização visual de "isso é prioritário").
+- **Decisões de design (resolvidas 17/09/2026, ver CONTROL_PANEL.md pro detalhe do lado
+  painel):**
+  1. `"especial"` é um `content_type` novo, paralelo a temporal/evergreen (não uma flag
+     por cima de outro tipo).
+  2. Tem prazo de validade: 1 semana (`EXPIRY_SPECIAL_HOURS` em `broadcast_core.py`),
+     depois disso some do feed pelo mesmo mecanismo de expurgo dos demais.
+  3. Passa por revisão humana: fica em "redação" esperando aprovação manual (botão
+     "Sintetizar") em vez de entrar sozinho no funil como o resto do pipeline.
+  4. Sem limite de quantos especiais ficam pendentes - não apareceu necessidade na prática
+     ainda; revisitar se virar problema real.
+- **Não mudar sem:** manter a garantia de que um manifest sem nenhum item `especial` se
+  comporta **exatamente** como antes desta ADR (zero mudança de comportamento pra quem
+  nunca usar a feature) - `isSpecial` sempre `false` por default em toda leitura/escrita.

@@ -9,15 +9,24 @@ ADB e como investigar problema quando algo não aparece na tela.
 Toda instalação de teste usa **release**, não debug, por pedido do usuário: builds
 mais rápidas de instalar/testar e mais perto do app "de verdade".
 
-A assinatura da build release é **de propósito a mesma chave de debug** (ver
-`app/build.gradle.kts`, `buildTypes.release.signingConfig`), e não a chave de release
-dedicada em `keystore.properties`/`../keystore/pailer-release.jks`. Isso é intencional:
-com a mesma assinatura, `adb install -r` sempre atualiza por cima do app já instalado,
-sem nunca precisar desinstalar — e desinstalar apaga dados locais (favoritos,
-histórico, overrides de metadados). A chave de
-release dedicada fica pronta e sem uso pra um dia publicar de verdade (Play Store ou
-distribuição fora do debug); trocar pra ela em `buildTypes.release` é decisão consciente
-— ver comentário no topo do `app/build.gradle.kts`.
+**Atualizado 17/09/2026 (ADR-032 supera o que este doc dizia antes):** a build release
+NÃO assina mais com a chave de debug de propósito — `buildTypes.release.signingConfig`
+usa a chave de release DEDICADA (`keystore.properties` local, `storeFile` apontando pra
+`../keystore/pailer-release.jks`) sempre que esse arquivo existir na máquina (ou, no CI,
+os secrets `RELEASE_KEYSTORE_*`). Nesta máquina (bancada de desenvolvimento local),
+`keystore.properties` **existe** — confirmado 17/09/2026 ao instalar uma build sobre o
+app já no aparelho. Só cai pra chave de debug automática (`~/.android/debug.keystore`,
+efêmera por máquina) quando NENHUMA das duas fontes está disponível (ex.: clonando o
+repo do zero sem o arquivo nem os secrets).
+
+**Na prática, isso significa:** `gradle assembleDebug` produz um APK com uma assinatura
+DIFERENTE da que já está instalada no aparelho de teste (que foi instalada como release,
+com a chave dedicada) — `adb install -r` desse debug falha com
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE` em vez de atualizar. Pra atualizar o app já
+instalado sem perder dados locais (favoritos, histórico, overrides de metadados), usar
+sempre `gradle assembleRelease` (não `assembleDebug`) enquanto `keystore.properties`
+existir aqui. A chave de release dedicada era só "pronta e sem uso" quando este doc foi
+escrito (ADR-012) — hoje ela é a chave de verdade em uso pras instalações de teste.
 
 `isMinifyEnabled = false` também é de propósito: R8/shrink pode quebrar reflection
 (jaudiotagger, MediaStore) de formas difíceis de depurar, e o ganho não compensa pra um
@@ -95,8 +104,9 @@ copy app\build\outputs\apk\release\app-release.apk dist\PailerFM.apk
 
 ## keystore.properties
 
-Existe mas fica fora do git (`.gitignore`) e não é usado pela build release hoje (ver
-seção acima). Guarda a referência pra chave de release dedicada:
+Existe nesta máquina (fora do git, `.gitignore`) e **é usado pela build release hoje**
+(ver seção "Por que build release" acima, atualizada 17/09/2026 — ADR-032 mudou isso).
+Guarda a referência pra chave de release dedicada:
 
 ```
 storeFile=../keystore/pailer-release.jks

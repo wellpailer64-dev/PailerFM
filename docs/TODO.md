@@ -25,6 +25,13 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 - [ ] **Limpeza de WAVs órfãos**: nome por token + varredura no início da sessão +
   delete ao receber resultado morto — mata R4 (ainda relevante pros `.wav` baixados do
   feed remoto, ver `saveCoreBufferManifest()`/`ORPHAN_CLEANUP_GRACE_MS`)
+- [ ] **Buffer local não reavalia `expires_at` de boletim já baixado** (ADR-036,
+  17/09/2026): `BroadcastFeedRepository` já pula item vencido **antes** de baixar, mas um
+  boletim que já está em `coreBufferDir` esperando a vez não é checado de novo contra o
+  próprio prazo — pode tocar mesmo depois de vencido se ficar tempo demais no buffer sem
+  ser consumido. Precisa entender o ciclo de vida do buffer em
+  `LocalTuneViewModel.kt` (`refillBulletinBuffer`/`saveCoreBufferManifest`/limpeza de
+  órfãos) antes de mexer — não investigado ainda.
 - ~~**Desacoplar caminho sherpa do `ttsReady` legado**~~ — moot, `ttsReady`/TTS Android
   removidos 16/09/2026
 
@@ -68,6 +75,9 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
   16/09/2026, ver ADR-035)
 - ~~Ligar o redator local de verdade (`OptionalLocalLlmRadioScriptWriter`)~~ — moot,
   redator local removido inteiro 16/09/2026
+- ~~Boletim "especial" fura fila no buffer~~ — feito 17/09/2026 (ADR-037):
+  `BroadcastFeedRepository` baixa `content_type == "especial"` com prioridade,
+  `LocalTuneViewModel` insere no início do buffer (`addFirst`) em vez do fim.
 - [ ] Atualizar este doc conforme itens fecham
 
 ## Backlog sem prioridade

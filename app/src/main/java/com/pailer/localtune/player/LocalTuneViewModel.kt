@@ -2751,14 +2751,21 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             break
                         }
                         rememberRecentBulletinStory(remoteBulletin.script)
-                        bulletinBuffer.addLast(
-                            PreparedBulletin(
-                                script = remoteBulletin.script,
-                                file = remoteBulletin.audioFile,
-                                scriptFromGemini = false,
-                                voiceFromGemini = false,
-                            ),
+                        val preparedBulletin = PreparedBulletin(
+                            script = remoteBulletin.script,
+                            file = remoteBulletin.audioFile,
+                            scriptFromGemini = false,
+                            voiceFromGemini = false,
                         )
+                        // Especial fura fila do buffer (ver ADR-037 em docs/DECISIONS.md): entra
+                        // na FRENTE em vez do fim, pra ser o proximo escolhido em
+                        // dequeueBufferedBulletinForPlayback() (removeFirst simples - nenhuma
+                        // mudanca precisa la, so na ordem de insercao aqui).
+                        if (remoteBulletin.script.isSpecial) {
+                            bulletinBuffer.addFirst(preparedBulletin)
+                        } else {
+                            bulletinBuffer.addLast(preparedBulletin)
+                        }
                         // Persiste AGORA que o item esta de verdade no buffer - sem isso, um
                         // processo morto logo depois (comum no Android, app em segundo plano)
                         // perdia boletins prontos que ainda nao tinham sido salvos em disco.
@@ -2827,6 +2834,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         put("summary", item.script.story.summary)
                         put("scriptSource", item.script.source.name)
                         put("duration", item.script.duration.name)
+                        put("special", item.script.isSpecial)
                         put(
                             "lines",
                             JSONArray().apply {
@@ -2902,6 +2910,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         lines = lines,
                         source = RadioScriptSource.valueOf(json.getString("scriptSource")),
                         duration = com.pailer.localtune.data.RadioBulletinDuration.valueOf(json.getString("duration")),
+                        // optBoolean(_, false): manifest gravado antes desse campo existir volta
+                        // sem ele - trata como normal, nao especial (mesmo padrao de
+                        // scriptFromGemini/voiceFromGemini logo abaixo).
+                        isSpecial = json.optBoolean("special", false),
                     )
                     val file = json.optString("coreFile").takeIf { it.isNotBlank() }
                         ?.let { coreBufferDir.resolve(it) }

@@ -13,6 +13,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.text.Normalizer
+import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.Locale
 
 data class RemoteApprovedBulletin(
@@ -53,67 +55,85 @@ class BroadcastFeedRepository(private val context: Context) {
         targetDir: File,
         reservedKeys: Set<String>,
     ): RemoteApprovedBulletin? {
-        return runCatching lookup@{
+        return runCatching {
             targetDir.mkdirs()
             val manifest = JSONObject(fetchText(MANIFEST_URL))
             val items = manifest.optJSONArray("items") ?: JSONArray()
-            for (index in 0 until items.length()) {
-                val item = items.optJSONObject(index) ?: continue
-                if (item.optString("status") != "approved") continue
-                val id = item.optString("id").trim()
-                if (id.isBlank()) continue
-                val title = item.optString("title").ifBlank { item.optString("slug").ifBlank { id } }
-                val category = item.optString("category").ifBlank { "geral" }
-                // Precisa reproduzir EXATAMENTE RadioScript.newsReservationKey() (LocalTuneViewModel.kt):
-                // source e title normalizados SEPARADAMENTE e so depois unidos por "|". Normalizar a
-                // string inteira de uma vez (source+"|"+title) destroi o "|" junto com os outros
-                // separadores (normalizedRemoteKey troca tudo que nao e a-z0-9 por espaco) e a chave
-                // nunca bate com nada - foi assim que, ao vivo (16/09/2026), o mesmo boletim aprovado
-                // foi baixado 10x seguidas pro buffer inteiro em vez de variar entre os itens do feed.
-                val source = "Pailer FM Broadcast · $category"
-                val reservationKey = "${source.normalizedRemoteKey()}|${title.normalizedRemoteKey()}"
-                if (reservationKey in reservedKeys) continue
-                val audio = item.optJSONObject("audio") ?: continue
-                val audioPath = audio.optString("path").takeIf { it.isNotBlank() } ?: continue
-                val extension = audio.optString("format").ifBlank { audioPath.substringAfterLast('.', "wav") }
-                    .lowercase(Locale.ROOT)
-                    .filter { it.isLetterOrDigit() }
-                    .ifBlank { "wav" }
-                val expectedBytes = audio.optLong("bytes", -1L)
-                val expectedSha256 = audio.optString("sha256").takeIf { it.isNotBlank() }
-                val audioFile = targetDir.resolve("broadcast_${id}.$extension")
-                if (!audioFile.isUsableAudio(expectedBytes, expectedSha256)) {
-                    downloadFile(resolveFeedUrl(audioPath), audioFile)
-                }
-                if (!audioFile.isUsableAudio(expectedBytes, expectedSha256)) continue
-
-                val lines = item.optJSONObject("script")
-                    ?.optString("path")
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { path -> runCatching { parseScriptLines(fetchText(resolveFeedUrl(path))) }.getOrNull() }
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: listOf(
-                        RadioScriptLine(
-                            RadioSpeaker.Female,
-                            "Boletim aprovado da Pailer FM: $title",
-                        ),
-                    )
-                val script = RadioScript(
-                    story = NewsStory(
-                        title = title,
-                        source = "Pailer FM Broadcast · $category",
-                        summary = "Boletim aprovado no feed remoto. ID: $id.",
-                    ),
-                    lines = lines,
-                    source = RadioScriptSource.BroadcastFeed,
-                    duration = durationFromSeconds(audio.optDouble("duration_seconds", 0.0)),
-                )
-                return@lookup RemoteApprovedBulletin(id, script, audioFile)
+            // Especial (recado/publi por pedido direto, content_type == "especial") fura fila de
+            // DOWNLOAD tambem, nao so de reproducao (ver ADR-037 em docs/DECISIONS.md) - senao ele
+            // so seria baixado quando chegasse a vez dele na ordem do manifest, que o painel Python
+            // intercala por categoria sem saber de prioridade nenhuma. Duas passadas preservando a
+            // ordem relativa de cada grupo: especiais primeiro, resto do feed depois.
+            val ordered = (0 until items.length()).mapNotNull { items.optJSONObject(it) }
+                .sortedByDescending { it.optString("content_type") == "especial" }
+            for (item in ordered) {
+                val bulletin = tryDownloadApprovedItem(item, targetDir, reservedKeys)
+                if (bulletin != null) return@runCatching bulletin
             }
             null
         }.onFailure {
             Log.w(TAG, "feed remoto de boletins indisponivel", it)
         }.getOrNull()
+    }
+
+    private fun tryDownloadApprovedItem(
+        item: JSONObject,
+        targetDir: File,
+        reservedKeys: Set<String>,
+    ): RemoteApprovedBulletin? {
+        if (item.optString("status") != "approved") return null
+        if (item.optString("expires_at").isExpired()) return null
+        val id = item.optString("id").trim()
+        if (id.isBlank()) return null
+        val title = item.optString("title").ifBlank { item.optString("slug").ifBlank { id } }
+        val category = item.optString("category").ifBlank { "geral" }
+        val isSpecial = item.optString("content_type") == "especial"
+        // Precisa reproduzir EXATAMENTE RadioScript.newsReservationKey() (LocalTuneViewModel.kt):
+        // source e title normalizados SEPARADAMENTE e so depois unidos por "|". Normalizar a
+        // string inteira de uma vez (source+"|"+title) destroi o "|" junto com os outros
+        // separadores (normalizedRemoteKey troca tudo que nao e a-z0-9 por espaco) e a chave
+        // nunca bate com nada - foi assim que, ao vivo (16/09/2026), o mesmo boletim aprovado
+        // foi baixado 10x seguidas pro buffer inteiro em vez de variar entre os itens do feed.
+        val source = "Pailer FM Broadcast · $category"
+        val reservationKey = "${source.normalizedRemoteKey()}|${title.normalizedRemoteKey()}"
+        if (reservationKey in reservedKeys) return null
+        val audio = item.optJSONObject("audio") ?: return null
+        val audioPath = audio.optString("path").takeIf { it.isNotBlank() } ?: return null
+        val extension = audio.optString("format").ifBlank { audioPath.substringAfterLast('.', "wav") }
+            .lowercase(Locale.ROOT)
+            .filter { it.isLetterOrDigit() }
+            .ifBlank { "wav" }
+        val expectedBytes = audio.optLong("bytes", -1L)
+        val expectedSha256 = audio.optString("sha256").takeIf { it.isNotBlank() }
+        val audioFile = targetDir.resolve("broadcast_${id}.$extension")
+        if (!audioFile.isUsableAudio(expectedBytes, expectedSha256)) {
+            downloadFile(resolveFeedUrl(audioPath), audioFile)
+        }
+        if (!audioFile.isUsableAudio(expectedBytes, expectedSha256)) return null
+
+        val lines = item.optJSONObject("script")
+            ?.optString("path")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { path -> runCatching { parseScriptLines(fetchText(resolveFeedUrl(path))) }.getOrNull() }
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf(
+                RadioScriptLine(
+                    RadioSpeaker.Female,
+                    "Boletim aprovado da Pailer FM: $title",
+                ),
+            )
+        val script = RadioScript(
+            story = NewsStory(
+                title = title,
+                source = "Pailer FM Broadcast · $category",
+                summary = "Boletim aprovado no feed remoto. ID: $id.",
+            ),
+            lines = lines,
+            source = RadioScriptSource.BroadcastFeed,
+            duration = durationFromSeconds(audio.optDouble("duration_seconds", 0.0)),
+            isSpecial = isSpecial,
+        )
+        return RemoteApprovedBulletin(id, script, audioFile)
     }
 
     private fun fetchText(url: String): String {
@@ -208,6 +228,19 @@ class BroadcastFeedRepository(private val context: Context) {
             .replace(Regex("[^a-z0-9]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
+
+    // "expires_at" vem do manifest como ISO8601 UTC (ex.: 2026-09-18T00:34:25Z).
+    // Sem o campo, ou se nao der pra ler, trata como nao vencido (fail-open) -
+    // melhor baixar um item sem data do que esconder o feed inteiro por um
+    // formato inesperado.
+    private fun String.isExpired(): Boolean {
+        if (isBlank()) return false
+        return try {
+            Instant.parse(this).isBefore(Instant.now())
+        } catch (_: DateTimeParseException) {
+            false
+        }
+    }
 
     private companion object {
         const val BASE_URL = "https://pailer-fm-boletins.well-pailer64.workers.dev"

@@ -44,6 +44,12 @@ data class RadioScript(
     // LocalTuneViewModel.kt) - o feed remoto sempre passa duration explicito (ver
     // BroadcastFeedRepository.durationFromSeconds).
     val duration: RadioBulletinDuration = RadioBulletinDuration.Normal,
+    // Boletim "especial" (recado/publi por pedido direto, content_type == "especial" no
+    // manifest da central de broadcast - ver ADR-037 em docs/DECISIONS.md). Furando fila:
+    // BroadcastFeedRepository tenta baixar um especial antes de qualquer outro item do
+    // feed, e LocalTuneViewModel insere no INICIO do buffer local (addFirst) em vez do
+    // fim, pra tocar antes do que ja estava esperando a vez.
+    val isSpecial: Boolean = false,
 ) {
     val displayText: String
         get() = story.title
