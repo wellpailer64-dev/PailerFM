@@ -17,53 +17,27 @@ uma vez, nem depois de reiniciar o aparelho.
 
 ## Estrutura
 
-Ao escolher a pasta, o app cria automaticamente 4 subpastas dentro dela
+Ao escolher a pasta, o app cria automaticamente subpastas dentro dela
 (`AppFolderRepository.ensureSubfolders`):
 
 ```
 <pasta escolhida>/
 ├── Backup/               ← gerido pelo app, sempre atualizado
 │   └── pailer_fm_backup.json
-├── Logs/                 ← gerido pelo app, so recebe arquivo em caso de crash
-│   └── crash_AAAA-MM-DD_HH-mm-ss.txt
-├── Redator Local/        ← COPIA DE REFERENCIA, nao e lida pelo app em uso normal
-│   └── <ultimo .zip importado pela UI>
-└── Pacote de Vozes/      ← COPIA DE REFERENCIA, nao e lida pelo app em uso normal
-    └── <ultimo .zip importado pela UI>
+└── Logs/                 ← gerido pelo app, so recebe arquivo em caso de crash
+    └── crash_AAAA-MM-DD_HH-mm-ss.txt
 ```
 
 | Subpasta | O que tem | Quem escreve | O app lê de volta? |
 |---|---|---|---|
 | `Backup/` | `pailer_fm_backup.json` — favoritos, overrides de álbum/artista, fotos de artista (base64), histórico, config de boletim | `BackupRepository.performBackup()` — manual ("Fazer backup agora") ou automático (1x/dia perto da meia-noite, ver `BackupScheduler`) | Sim, via "Restaurar de um arquivo" (escolha manual do arquivo, não automática) |
 | `Logs/` | Um `.txt` por crash, com stack trace completo + versão do app | `PailerApplication` (handler de `Thread.setDefaultUncaughtExceptionHandler`), só se a pasta oficial já estiver configurada | Não — só para o usuário/dev ler manualmente |
-| `Redator Local/` | Cópia do `.zip` que o usuário importou pela última vez em "Importar redator" | `RadioWriterPackageRepository.importPackage()`, melhor esforço (nunca falha a importação por causa disso) | **Não** |
-| `Pacote de Vozes/` | Cópia do `.zip` que o usuário importou pela última vez em "Importar pacote" | `RadioVoicePackageRepository.importPackage()`, melhor esforço | **Não** |
 
-## Por que Redator Local/Pacote de Vozes são só cópia de referência
-
-Os modelos de verdade (GGUF do redator via llama.cpp, ONNX da voz via sherpa-onnx) são
-carregados por **código nativo** (JNI) que precisa de um caminho de arquivo de disco real
-(`File.absolutePath`). Uma pasta escolhida via SAF/`ACTION_OPEN_DOCUMENT_TREE` é acessada
-pelo app como um `content://` Uri administrado pelo `DocumentsContract` — não existe garantia
-de que vire um caminho de arquivo de verdade (e depender disso quebraria em qualquer provider
-que não seja armazenamento local puro, ex. Google Drive).
-
-Por isso o app **continua** extraindo/rodando os pacotes em armazenamento privado interno:
-
-```
-filesDir/radio_writer/            ← pacote de redator ATIVO (ver TTS.md/RADIO_PIPELINE.md)
-filesDir/radio_voice_package/     ← pacote de voz ATIVO
-```
-
-O `.zip` original que o usuário importou é copiado pra pasta oficial **só como referência/
-organização** — reimportar o pacote sempre lê o `.zip` que o usuário escolher no seletor de
-arquivos naquele momento (pode ser o da pasta oficial ou de qualquer outro lugar), nunca a
-cópia de referência diretamente.
-
-**Consequência prática:** colocar/trocar um arquivo manualmente dentro de `Redator Local/` ou
-`Pacote de Vozes/` (ex.: pelo gerenciador de arquivos do Android) **não muda o que o app usa**.
-Pra ativar um pacote diferente é sempre necessário reimportar pela UI (Configurações →
-Boletins da rádio → "Importar redator"/"Importar pacote"), apontando pro arquivo desejado.
+**16/09/2026:** as subpastas `Redator Local/` e `Pacote de Vozes/` (cópias de referência
+dos pacotes de redator/voz local importados pela UI) foram removidas junto da remoção do
+redator local, redator Gemini e síntese de voz local/Gemini/TTS Android — ver ADR-035 em
+[DECISIONS.md](DECISIONS.md). Todo boletim vem pronto do feed remoto, não há mais pacote
+nenhum pra importar.
 
 ## Backup: pasta oficial x arquivo avulso
 

@@ -58,11 +58,6 @@
             </intent-filter>
         </service>
 
-        <service
-            android:name=".player.RadioVoiceSynthesisService"
-            android:exported="false"
-            android:process=":radio_voice" />
-
         <receiver
             android:name=".widget.PlayerWidgetActionReceiver"
             android:exported="false" />

@@ -10,16 +10,11 @@ import java.io.File
 
 // Pasta oficial do Pailer FM (pedido do usuario 07/09/2026) - uma unica pasta que o usuario
 // escolhe UMA VEZ (ACTION_OPEN_DOCUMENT_TREE, permissao persistida - nao pede de novo depois),
-// dentro da qual o app organiza subpastas: Backup, Logs, Redator Local, Pacote de Vozes.
+// dentro da qual o app organiza subpastas: Backup, Logs.
 //
-// IMPORTANTE - por que Redator Local/Pacote de Vozes sao so uma COPIA DE REFERENCIA aqui: os
-// modelos de verdade (GGUF do redator, ONNX da voz) sao carregados por codigo NATIVO (llama.cpp/
-// sherpa-onnx via JNI) que precisa de um caminho de arquivo de disco de verdade - uma pasta via
-// SAF/DocumentFile e um content:// Uri, nao um caminho de arquivo, e bibliotecas nativas nao
-// conseguem abrir isso diretamente. Por isso o app CONTINUA extraindo/rodando os pacotes em
-// armazenamento privado interno (ver RadioWriterPackageRepository/RadioVoicePackageRepository,
-// pasta context.filesDir) - so o .zip ORIGINAL importado e copiado pra pasta oficial, como
-// referencia/arquivo organizado pro usuario, sem o app depender dele pra funcionar.
+// (Redator local e voz local/Gemini removidos 16/09/2026 - a central de broadcast externa ja
+// escreve e sintetiza tudo; as subpastas "Redator Local"/"Pacote de Vozes" que existiam aqui
+// foram removidas junto.)
 class AppFolderRepository(private val context: Context) {
     private val prefs = context.getSharedPreferences("app_folder", Context.MODE_PRIVATE)
 
@@ -58,7 +53,7 @@ class AppFolderRepository(private val context: Context) {
 
     fun ensureSubfolders() {
         val root = rootDocument() ?: return
-        listOf(SUBFOLDER_BACKUP, SUBFOLDER_LOGS, SUBFOLDER_WRITER, SUBFOLDER_VOICE).forEach { name ->
+        listOf(SUBFOLDER_BACKUP, SUBFOLDER_LOGS).forEach { name ->
             if (root.findFile(name) == null) {
                 runCatching { root.createDirectory(name) }
             }
@@ -134,8 +129,6 @@ class AppFolderRepository(private val context: Context) {
         private const val KEY_FOLDER_URI = "folder_uri"
         const val SUBFOLDER_BACKUP = "Backup"
         const val SUBFOLDER_LOGS = "Logs"
-        const val SUBFOLDER_WRITER = "Redator Local"
-        const val SUBFOLDER_VOICE = "Pacote de Vozes"
         const val BACKUP_FILE_NAME = "pailer_fm_backup.json"
     }
 }

@@ -4,6 +4,14 @@
 > Toda mudança estrutural mantém as funcionalidades existentes e é feita incrementalmente.
 > O app já funciona e está em uso diário. Nada de "clean architecture deluxe" que mate a rádio no processo.
 
+**16/09/2026:** redator local/Gemini, RSS (`NewsBulletinRepository`), síntese de voz local/
+Gemini/TTS Android (`RadioVoiceSynthesisService`, processo `:radio_voice`) foram todos
+removidos — ver ADR-035 em [DECISIONS.md](DECISIONS.md). Boletim hoje só vem pronto do
+feed remoto (`BroadcastFeedRepository`). As races R5, R6, R7 e R9 abaixo (e a regra 5/7 da
+Seção B) descrevem esse pipeline antigo e **não se aplicam mais** — mantidas como
+histórico, marcadas como resolvidas por remoção. `ttsReady`/`newsBulletins` também não
+existem mais como variáveis do ViewModel.
+
 Este doc tem duas metas:
 
 1. **Seção A** — registrar o comportamento implícito de hoje (vars soltas no
@@ -22,14 +30,15 @@ Este doc tem duas metas:
 |---|---|---|
 | `radioNewsEnabled` | modo rádio ativo (boletins ligados) | `startRadioNewsMode`, `stopRadioNewsMode` |
 | `completedRadioSongs` | contador p/ intervalo entre boletins | `onMediaItemTransition`, resets |
-| `newsBulletins` | scripts carregados em background | `startRadioNewsMode` (async) |
-| `nextBulletinIndex` | cursor circular dos boletins | `speakNextNewsBreak` |
+| `bulletinBuffer` | boletins baixados do feed remoto, prontos pra tocar | `refillBulletinBuffer` (async) |
 | `speakingNews` | boletim em andamento | `speakNextNewsBreak`, `finishNewsBreak` |
 | `currentNewsHeadline` / intro text | texto exibido na UI | vários |
 | `resumeAfterNews` | "estava tocando antes da fala" | capturado no início da fala, consumido no fim |
 | `pendingRadioIntro` | intro da rádio pendente/emitindo | `speakRadioIntro`, `finishRadioIntro` |
 | `announcementPlayer` | `MediaPlayer` do anúncio local | `playAnnouncementFile`, `stopRadioNewsMode` |
-| `ttsReady` / `ttsRequested` | init do TTS legado concluído | callback de init assíncrono |
+
+`newsBulletins`/`nextBulletinIndex`/`ttsReady`/`ttsRequested` existiam aqui até
+16/09/2026 (RSS + TTS legado) — removidos junto do redator/voz local, ver ADR-035.
 
 Nenhuma dessas variáveis é protegida por lock ou token: callbacks chegam da main thread,
 do binder thread do `ResultReceiver` e das threads do `MediaPlayer`/TTS sem coordenação.
@@ -41,12 +50,12 @@ do binder thread do `ResultReceiver` e das threads do `MediaPlayer`/TTS sem coor
 | R1 | Pausa manual durante o boletim é anulada: a música volta sozinha quando a fala termina | `finishNewsBreak()` retoma se `resumeAfterNews`, capturado antes e nunca revalidado |
 | R2 | Play/pause pelo widget/notificação durante a locução faz a música tocar por cima da fala | controles continuam agindo no player; nada informa ao fluxo do boletim |
 | R3 | Skip durante geração/fala: o boletim da música que já passou toca depois | skip não cancela job nem invalida resultado; transição manual também não conta para o intervalo |
-| R4 | WAVs órfãos em `cacheDir` | timeout de 12 s ou morte do app: serviço escreve o arquivo mas ninguém deleta |
-| R5 | Dois engines TTS na RAM simultaneamente | requests ao `:radio_voice` não são serializados |
-| R6 | Intro atrasa até ~1,8 s mesmo com sherpa ativo | espera por `ttsReady` do TTS legado antes de decidir caminho |
-| R7 | Sem TTS do sistema funcional, rádio perde intro/boletim mesmo com pacote sherpa OK | `ttsReady`/`pendingRadioIntro` bloqueiam o fluxo inteiro |
-| R8 | Música fica pausada para sempre se a fala travar (timeout local + TTS legado falhando calado); Media3 rebaixa o serviço e o sistema mata o processo | nenhum caminho garantia chamada a `finishNewsBreak()`/`finishRadioIntro()` |
-| R9 | Boletim nunca mais toca na sessão (sem pausa, sem log, sem fallback) — reportado em radios personalizadas mas não é exclusivo delas | `startRadioNewsMode` carrega `newsBulletins` uma única vez, em paralelo à vinheta; se os 5 feeds RSS falharem todos (rede instável/DNS/feed fora do ar — cada falha é ignorada silenciosamente em `NewsBulletinRepository.loadStories`), a lista fica vazia pro resto da sessão e `speakNextNewsBreak()`/`prepareUpcomingBulletin()` só retornavam cedo, sem tentar de novo |
+| R4 | WAVs órfãos em `filesDir/radio_bulletins_ready` | download do feed remoto ou morte do app antes do item ser registrado no buffer; coberto hoje por `ORPHAN_CLEANUP_GRACE_MS` em `saveCoreBufferManifest()` |
+| ~~R5~~ | ~~Dois engines TTS na RAM simultaneamente~~ | **resolvida por remoção (16/09/2026):** processo `:radio_voice`/`RadioVoiceSynthesisService` não existe mais |
+| ~~R6~~ | ~~Intro atrasa até ~1,8 s mesmo com sherpa ativo~~ | **resolvida por remoção:** `ttsReady`/TTS legado removidos |
+| ~~R7~~ | ~~Sem TTS do sistema funcional, rádio perde intro/boletim~~ | **resolvida por remoção:** sem TTS do sistema no fluxo automático - buffer vazio só cancela a entrada, nunca bloqueia intro |
+| R8 | Música fica pausada para sempre se a fala travar; Media3 rebaixa o serviço e o sistema mata o processo | nenhum caminho garantia chamada a `finishNewsBreak()`/`finishRadioIntro()` |
+| ~~R9~~ | ~~Boletim nunca mais toca na sessão~~ | **resolvida por remoção:** não existe mais `newsBulletins`/RSS; feed remoto é reconsultado a cada `refillBulletinBuffer()`, sem estado "carregado uma vez" que possa ficar vazio pra sempre |
 
 **Mitigação atual (ADR-009 em [DECISIONS.md](DECISIONS.md)):** watchdog de 90 s com
 token por anúncio força a retomada quando R8 acontece. Correção de raiz é o controller

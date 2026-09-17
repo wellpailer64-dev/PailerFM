@@ -14,14 +14,15 @@ A assinatura da build release é **de propósito a mesma chave de debug** (ver
 dedicada em `keystore.properties`/`../keystore/pailer-release.jks`. Isso é intencional:
 com a mesma assinatura, `adb install -r` sempre atualiza por cima do app já instalado,
 sem nunca precisar desinstalar — e desinstalar apaga dados locais (favoritos,
-histórico, overrides de metadados, o pacote de vozes TTS importado). A chave de
+histórico, overrides de metadados). A chave de
 release dedicada fica pronta e sem uso pra um dia publicar de verdade (Play Store ou
 distribuição fora do debug); trocar pra ela em `buildTypes.release` é decisão consciente
 — ver comentário no topo do `app/build.gradle.kts`.
 
 `isMinifyEnabled = false` também é de propósito: R8/shrink pode quebrar reflection
-(jaudiotagger, MediaStore) e o JNI do sherpa-onnx de formas difíceis de depurar, e o
-ganho não compensa pra um app pessoal não publicado.
+(jaudiotagger, MediaStore) de formas difíceis de depurar, e o ganho não compensa pra um
+app pessoal não publicado. (JNI do sherpa-onnx removido 16/09/2026 junto da síntese de
+voz local, ver ADR-035 em [DECISIONS.md](DECISIONS.md).)
 
 ## Ferramentas portáteis (não depende do Android Studio)
 

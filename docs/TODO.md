@@ -19,13 +19,14 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 > é pegar o `adb logcat | grep PailerPlaybackDiag` de uma ocorrência real antes de
 > decidir a correção.
 
-- [ ] **Serializar requests** ao `RadioVoiceSynthesisService` (fila única/canal) — mata R5
-  e é pré-condição para cache de engine
-- [ ] **Cache LRU de engines TTS** no processo `:radio_voice` (matar ADR-003 com segurança):
-  manter 1–2 engines, `release()` ao despejar
+- ~~**Serializar requests** ao `RadioVoiceSynthesisService`~~ — moot, serviço removido
+  16/09/2026 junto da síntese de voz local (ver ADR-035 em DECISIONS.md)
+- ~~**Cache LRU de engines TTS** no processo `:radio_voice`~~ — moot, mesma remoção
 - [ ] **Limpeza de WAVs órfãos**: nome por token + varredura no início da sessão +
-  delete ao receber resultado morto — mata R4
-- [ ] **Desacoplar caminho sherpa do `ttsReady` legado** — mata R6/R7
+  delete ao receber resultado morto — mata R4 (ainda relevante pros `.wav` baixados do
+  feed remoto, ver `saveCoreBufferManifest()`/`ORPHAN_CLEANUP_GRACE_MS`)
+- ~~**Desacoplar caminho sherpa do `ttsReady` legado**~~ — moot, `ttsReady`/TTS Android
+  removidos 16/09/2026
 
 ## P1 — Pipeline determinístico do boletim
 
@@ -49,9 +50,9 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 
 ## P3 — Desmontar monólitos (incremental, uma tela/feature por vez)
 
-- [ ] Split `LocalTuneViewModel.kt` (~1.5k linhas): LibraryViewModel, RadioViewModel,
+- [ ] Split `LocalTuneViewModel.kt` (~3.7k linhas): LibraryViewModel, RadioViewModel,
   MetadataViewModel + coordenador de estado global
-- [ ] Split `LocalTuneApp.kt` (~3.4k linhas): um arquivo por tela/feature (Home, Artists,
+- [ ] Split `LocalTuneApp.kt` (~8.9k linhas): um arquivo por tela/feature (Home, Artists,
   Albums, Radio, Settings panels, Player, Widgets preview)
 
 ## P4 — Unificar pipeline de áudio
@@ -62,10 +63,11 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 
 ## P5 — Features (só depois do pipeline determinístico)
 
-- [ ] Dois locutores + diálogos de notícia como feature estável (hoje depende das
-      correções acima para não virar fonte de race conditions)
-- [ ] Ligar o redator local de verdade (`OptionalLocalLlmRadioScriptWriter`):
-      prompt controlado, JSON curto, timeout agressivo (ver ADR-002)
+- ~~Dois locutores + diálogos de notícia como feature estável~~ — feito via central de
+  broadcast externa (redação humana+IA fora do app), não pelo redator local (removido
+  16/09/2026, ver ADR-035)
+- ~~Ligar o redator local de verdade (`OptionalLocalLlmRadioScriptWriter`)~~ — moot,
+  redator local removido inteiro 16/09/2026
 - [ ] Atualizar este doc conforme itens fecham
 
 ## Backlog sem prioridade

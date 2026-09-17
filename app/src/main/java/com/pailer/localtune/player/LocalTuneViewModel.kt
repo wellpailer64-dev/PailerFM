@@ -8,14 +8,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.media.MediaPlayer
 import android.net.Uri
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.os.PowerManager
-import android.os.ResultReceiver
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import android.speech.tts.Voice
 import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
@@ -47,7 +40,7 @@ import com.pailer.localtune.data.ArtistNewsCard
 import com.pailer.localtune.data.ArtistNewsRepository
 import com.pailer.localtune.data.BackupRepository
 import com.pailer.localtune.data.BackupScheduler
-import com.pailer.localtune.data.BulletinTtsProvider
+import com.pailer.localtune.data.BroadcastFeedRepository
 import com.pailer.localtune.data.DuplicateArtistGroup
 import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
@@ -58,21 +51,15 @@ import com.pailer.localtune.data.LyricsRepository
 import com.pailer.localtune.data.LyricsSource
 import com.pailer.localtune.data.MusicLibraryRepository
 import com.pailer.localtune.data.ArtworkCandidate
-import com.pailer.localtune.data.GeminiApiKeySettings
-import com.pailer.localtune.data.GeminiTtsModel
 import com.pailer.localtune.data.PendingTagChange
 import com.pailer.localtune.data.RadioBulletinMode
-import com.pailer.localtune.data.RadioBulletinRepository
 import com.pailer.localtune.data.RadioBulletinSettings
 import com.pailer.localtune.data.RadioScript
 import com.pailer.localtune.data.RadioScriptLine
 import com.pailer.localtune.data.RadioScriptSource
 import com.pailer.localtune.data.RadioSpeaker
-import com.pailer.localtune.data.RadioVoicePackageRepository
-import com.pailer.localtune.data.RadioWriterPackageRepository
 import com.pailer.localtune.data.LatestReleaseInfo
 import com.pailer.localtune.data.UpdateCheckRepository
-import com.pailer.localtune.data.withPhilosophicalCloser
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
@@ -80,9 +67,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -91,7 +75,6 @@ import java.net.URL
 import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Locale
-import kotlin.coroutines.resume
 import kotlin.random.Random
 
 data class LibraryUiState(
@@ -299,23 +282,6 @@ data class ArtistNewsUiState(
 
 data class RadioBulletinUiState(
     val settings: RadioBulletinSettings = RadioBulletinSettings(),
-    val localWriterInstalled: Boolean = false,
-    val localWriterImporting: Boolean = false,
-    val localWriterName: String = "Redator local",
-    val localWriterDetail: String = "Pacote de LLM ainda nao instalado",
-    val localWriterMessage: String? = null,
-    // true quando ha pelo menos 1 chave de API do Gemini salva localmente (GeminiApiKeySettings) -
-    // pedido do usuario (03/09/2026): escrever o boletim via Gemini (nuvem, rapido) em vez do
-    // redator local (Qwen3 4B no aparelho, ver ADR-020) - tambem usada pelo Gemini Flash TTS
-    // experimental. Multi-chave (10/09/2026): ate GeminiApiKeySettings.MAX_KEYS (8), testadas em
-    // cadeia - geminiApiKeySlotsFilled[i] diz se o slot i tem chave salva, pra pagina dedicada
-    // "Chaves do Gemini" (GeminiApiKeysSettingsPanel) saber quais mostrar como "salva" vs vazias.
-    val geminiConfigured: Boolean = false,
-    val geminiApiKeySlotsFilled: List<Boolean> = List(GeminiApiKeySettings.MAX_KEYS) { false },
-    // Estado do botao "Testar vozes" da secao Gemini Flash TTS (ver testGeminiFlashTtsVoices()) -
-    // mesmo molde de RadioVoiceUiState.isTesting/message pro pacote de voz local.
-    val isTestingGeminiVoice: Boolean = false,
-    val geminiVoiceTestMessage: String? = null,
 )
 
 // Estado do buffer de boletins prontos (bulletinBuffer/refillBulletinBuffer, ver ADR-019),
@@ -331,10 +297,7 @@ data class RadioBulletinBufferUiState(
     val isPreparing: Boolean = false,
     val isPaused: Boolean = false,
     val statusMessage: String? = null,
-    // Percentual real: na escrita (redator local Qwen3) vem do callback nativo por token
-    // (LlamaProgressListener, tokens gerados/teto); na sintese de voz vem do
-    // RadioVoiceSynthesisService (index/total de fala). Nunca estimado (pedido do usuario
-    // 03/09/2026 foi "acompanhamento em porcentagem", nao "estimativa").
+    // So usado hoje pra sinalizar que a busca no feed remoto comecou (ver refillBulletinBuffer).
     val progressPercent: Int? = null,
     // Pedido do usuario (03/09/2026): botao de reproduzir o primeiro boletim pronto do buffer,
     // sem precisar entrar numa radio pra testar - ver playReadyBufferedBulletin().
@@ -363,40 +326,12 @@ data class RadioBulletinBufferUiState(
     val fullGeminiSlots: Set<Int> = emptySet(),
 )
 
-data class RadioVoiceUiState(
-    val isInstalled: Boolean = false,
-    val isImporting: Boolean = false,
-    val isTesting: Boolean = false,
-    val isTestingAndroidVoice: Boolean = false,
-    val isEnabled: Boolean = false,
-    val packageName: String = "Voz local",
-    val femaleSpeaker: String = "",
-    val maleSpeaker: String = "",
-    val detail: String = "Nenhum pacote de voz instalado",
-    val message: String? = null,
-    // Existe um audio de teste (voz ou boletim) ainda no disco pra tocar de novo sem gerar
-    // outra vez - ver playTestAudio()/replayLastTestAudio().
-    val canReplayTest: Boolean = false,
-)
-
-private data class LocalVoiceSynthesisResult(
-    val file: File?,
-    val detail: String,
-    val elapsedMs: Long,
-)
-
-// Um item do buffer UNICO de boletins (ver bulletinBuffer/refillBulletinBuffer). `file` fica
-// nulo quando a voz local/Gemini estava desativada ou a sintese falhou/estourou o timeout -
-// nesse caso speakNextNewsBreak cai pro TTS do Android usando script.spokenText. Boletim e 100%
-// radio-agnostico (pedido do usuario 09/09/2026: nunca cita musica/artista/radio, ver
-// RadioBulletin.kt buildSystemInstructions) - um item pronto vale pra qualquer radio, entrar ou
-// sair de uma nunca invalida nem descarta nada (unificacao 10/09/2026, ver comentario em
-// bulletinBuffer).
-// scriptFromGemini/voiceFromGemini (10/09/2026, pedido do usuario: "bolinha verde pra 100%
-// Gemini, azul pra parcial com voz local") - alimentam o calculo de qualidade em
-// syncBulletinBufferState/RadioBulletinBufferStatusCard. Default false (nao true) e proposital:
-// um manifest antigo (salvo antes desses campos existirem, ver loadCoreBufferManifest) volta sem
-// essa informacao, e "nao sei" deve cair pra azul/pior, nunca fingir verde sem ter certeza.
+// Um item do buffer UNICO de boletins (ver bulletinBuffer/refillBulletinBuffer). Todo item vem
+// pronto (roteiro + audio) do feed remoto (BroadcastFeedRepository) - se o WAV nao existir/nao
+// for tocavel, o intervalo e cancelado sem alternativa (ver speakNextNewsBreak). Campos
+// scriptFromGemini/voiceFromGemini mantidos so por compatibilidade com manifests antigos salvos
+// em disco (loadCoreBufferManifest) - sempre false pra itens novos desde a remocao do redator/
+// voz local e Gemini (16/09/2026).
 private data class PreparedBulletin(
     val script: RadioScript,
     val file: File?,
@@ -404,28 +339,12 @@ private data class PreparedBulletin(
     val voiceFromGemini: Boolean = false,
 )
 
-private data class BulletinCandidateSelection(
-    val scripts: List<RadioScript>,
-    val inspectedCount: Int,
-)
-
-// Retorno de synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely - o `File?` sozinho ja existia,
-// so nao dizia QUAL motor produziu o audio (Gemini Flash TTS vs motor local), informacao que
-// PreparedBulletin precisam guardar pra bolinha verde/azul da UI.
-private data class VoiceSynthesisOutcome(val file: File?, val fromGemini: Boolean)
-
 class LocalTuneViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = MusicLibraryRepository(application)
     private val backupRepository = BackupRepository(application)
     private val appFolderRepository = AppFolderRepository(application)
-    private val bulletinRepository = RadioBulletinRepository(application)
+    private val broadcastFeedRepository = BroadcastFeedRepository(application)
     private val artistNewsRepository = ArtistNewsRepository(application)
-    private val voicePackageRepository = RadioVoicePackageRepository(application)
-    private val writerPackageRepository = RadioWriterPackageRepository(application)
-    // Motor experimental de voz via Gemini Flash TTS (pedido do usuario 10/09/2026) - so entra em
-    // jogo quando RadioBulletinSettings.ttsProvider == GEMINI_FLASH, ver
-    // synthesizeLocalVoiceSafely/synthesizeCoreVoiceSafely/testGeminiFlashTtsVoices abaixo.
-    private val geminiFlashTtsEngine = GeminiFlashTtsEngine(application)
     private val genreSuggestionRepository = AlbumGenreSuggestionRepository()
     private val updateCheckRepository = UpdateCheckRepository(application)
     private val lyricsRepository = LyricsRepository(application)
@@ -476,9 +395,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         override fun onSessionResuming(session: CastSession, sessionId: String) = Unit
         override fun onSessionResumeFailed(session: CastSession, error: Int) = Unit
     }
-    private var textToSpeech: TextToSpeech? = null
-    private var ttsReady = false
-    private var ttsRequested = false
     private var lastRecordedMediaId: String? = null
     private var lastPositionPersistedAtMs: Long = 0L
     private var radioNewsEnabled = false
@@ -497,9 +413,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // parado em STATE_ENDED (varios eventos chegam nesse estado) - reseta assim que a fila muda.
     private var autoplayHandledForEndedQueue = false
     private var completedRadioSongs = 0
-    private var newsBulletins: List<RadioScript> = emptyList()
-    private var bulletinReloadInFlight = false
-    private var nextBulletinIndex = 0
     private val recentBulletinStoryKeys = ArrayDeque<String>().apply {
         radioPrefs.getString(KEY_RECENT_BULLETIN_STORY_KEYS, null)
             ?.lineSequence()
@@ -519,9 +432,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var newsBreakFadeInProgress = false
     private var newsBreakSkipsAheadOnResume = false
     private var pendingVinheta = false
-    // Alterna entre as duas passagens curtas (musica > passagem > boletim > passagem > musica) -
-    // ver playPassagem(). Incrementa a cada uso, nao reseta entre boletins.
-    private var nextPassagemIndex = 0
     // Alterna entre as vinhetas de despedida (tchauzinho/ate mais) ao sair de uma radio - ver
     // playExitVinheta()/EXIT_VINHETA_RESOURCES. Incrementa a cada uso, nao reseta entre sessoes.
     private var nextExitVinhetaIndex = 0
@@ -540,16 +450,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // chamada durante a passagem tocaria a passagem duas vezes.
     private var newsBreakEnding = false
     private var announcementPlayer: MediaPlayer? = null
-    private var lastTestAudioFile: File? = null
     // Player dedicado pro "Reproduzir" do card de buffer (playReadyBufferedBulletin) - separado
-    // de announcementPlayer/lastTestAudioFile de proposito: aquele mecanismo APAGA o arquivo
-    // anterior a cada novo teste, e o arquivo de um boletim do buffer ainda pertence ao
+    // de announcementPlayer de proposito: o arquivo de um boletim do buffer ainda pertence ao
     // bulletinBuffer (vai tocar de verdade dali a pouco) - reusar o mesmo player/apagamento
     // arriscaria apagar o audio de um boletim que a radio real ainda vai consumir.
     private var previewPlayer: MediaPlayer? = null
-    // Um requestId novo por chamada a requestVoiceSynthesis() (ver la) - deixa cancelar SO o
-    // pedido certo no servico isolado quando a gente desiste de esperar.
-    private val voiceRequestIdCounter = java.util.concurrent.atomic.AtomicLong(0)
     private var announcementToken = 0
     private var announcementWatchdogJob: Job? = null
     private var libraryScanRunning = false
@@ -576,33 +481,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // (estoque real de ate 20) por uma nao saber da outra. Boletim e 100% radio-agnostico (ver
     // RadioBulletin.kt buildSystemInstructions) - nunca precisou de dois niveis pra comecar.
     private val bulletinBuffer = ArrayDeque<PreparedBulletin>()
-    private val llmGenerationMutex = Mutex()
-    private val voiceSynthesisMutex = Mutex()
     private var protectedBulletinPlaybackFileName: String? = null
-    // Achado 11/09/2026 (terceira rodada, ao vivo - usuario: "porque o audio fica morto? é um
-    // gemini verde, não podemos matar ele prematuramente"): a limpeza de .wav orfaos em
-    // saveCoreBufferManifest() so usava um TIMER (ORPHAN_CLEANUP_GRACE_MS, 5min) pra decidir se um
-    // arquivo nao-referenciado ja pode ser lixo de verdade - um CHUTE baseado no pior caso ja visto
-    // (~90s), nao uma garantia. Com a cota do Gemini estourada, generateScriptWithRetry caminha por
-    // ate 5 chaves mortas a 120s cada (GEMINI_TTS_TIMEOUT_MS) + delays entre tentativas - pior caso
-    // passa de 10 MINUTOS, o dobro da margem. O .wav so e escrito no disco (outputFile/writeWav) no
-    // fim desse caminho inteiro, e so entao a corrotina volta pro Main e registra o item no
-    // bulletinBuffer (addLast+saveCoreBufferManifest, ver refillBulletinBuffer) - ate esse
-    // registro acontecer, o arquivo existe no disco mas NAO esta em `referenced`, e qualquer OUTRA
-    // chamada concorrente a saveCoreBufferManifest() (speakNextNewsBreak consumindo outro item,
-    // fixFallbackBulletins, o polling do init{}) podia varrer a pasta e apagar um arquivo que so
-    // "parecia" orfao por ainda nao ter tido tempo de ser registrado - nunca por ser lixo de
-    // verdade. Corrigido na raiz (nao so com timer maior, que so empurra o problema pra frente):
-    // este flag fica true do INICIO ao FIM de qualquer sintese pro buffer persistente (guarda
-    // exatamente a janela sensivel), e o sweep inteiro em saveCoreBufferManifest() e pulado
-    // enquanto ele estiver true - nao importa se a sintese leva 10s ou 20min, o arquivo em
-    // producao nunca corre risco, sem depender de nenhum numero de timeout adivinhado.
-    @Volatile
-    private var coreSynthesisInFlight = false
-    // Estoque anterior ao audio: roteiros ja escritos pelo Gemini em lote, consumidos em FIFO
-    // por refillBulletinBuffer() para gastar chamadas so na sintese. So usado quando a escrita
-    // em nuvem esta ligada/configurada; redator local continua sempre 1 por vez.
-    private val cloudScriptBuffer = ArrayDeque<RadioScript>()
     // Job da correcao automatica de fallback (ver scheduleFallbackAutoFix/fixFallbackBulletins) -
     // guarda contra agendar mais de uma correcao sobreposta; roda com um pequeno delay pra dar
     // tempo de uma falha transitoria (rede, Gemini fora do ar) se resolver antes de tentar de
@@ -761,15 +640,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         private set
 
     var radioBulletinBufferState = androidx.compose.runtime.mutableStateOf(
-        RadioBulletinBufferUiState(
-            targetCount = BULLETIN_BUFFER_TARGET,
-            scriptTargetCount = CLOUD_SCRIPT_BUFFER_TARGET,
-            scriptRefillThreshold = CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD,
-        ),
+        RadioBulletinBufferUiState(targetCount = BULLETIN_BUFFER_TARGET),
     )
-        private set
-
-    var radioVoiceState = androidx.compose.runtime.mutableStateOf(loadRadioVoiceUiState())
         private set
 
     private val playerListener = object : Player.Listener {
@@ -861,7 +733,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // perceptivel na abertura.
         viewModelScope.launch {
             loadCoreBufferManifest()
-            loadCloudScriptBufferManifest()
             syncBulletinBufferState()
             refillBulletinBuffer()
         }
@@ -929,474 +800,25 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         pendingDeleteSongs = emptyList()
     }
 
-    fun setRadioBulletinPreferLocalWriter(preferLocalWriter: Boolean) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(preferLocalWriter = preferLocalWriter))
-    }
-
-    // Chave geral Gemini+OpenRouter (06/09/2026, pedido do usuario) - ver
-    // RadioBulletinSettings.cloudWriterEnabled/RadioBulletinRepository.enhanceScript. As chaves
-    // de API continuam salvas, so param de ser tentadas enquanto isso estiver desligado.
-    fun setRadioBulletinCloudWriterEnabled(enabled: Boolean) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(cloudWriterEnabled = enabled))
-    }
-
-    // Motor de SINTESE DE VOZ do boletim, experimental (10/09/2026, pedido do usuario) - ver
-    // BulletinTtsProvider/RadioBulletinTts.kt. So muda qual motor synthesizeCoreVoiceSafely
-    // tenta PRIMEIRO; o sistema atual continua sempre disponivel como fallback automatico em
-    // qualquer falha, mesmo com GEMINI_FLASH selecionado aqui.
-    fun setRadioBulletinTtsProvider(provider: BulletinTtsProvider) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(ttsProvider = provider))
-    }
-
-    fun setRadioBulletinTtsModel(model: GeminiTtsModel) {
-        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(ttsModel = model))
-    }
-
-    fun importRadioWriterPackage(uri: Uri) {
-        radioBulletinState.value = radioBulletinState.value.copy(
-            localWriterImporting = true,
-            localWriterMessage = "Importando redator local...",
-        )
-        viewModelScope.launch {
-            runCatching { writerPackageRepository.importPackage(uri) }
-                .onSuccess {
-                    radioBulletinState.value = loadRadioBulletinUiState().copy(
-                        localWriterMessage = "Redator local importado. Ele será usado no próximo boletim preparado.",
-                    )
-                    showToast("Redator local importado.")
-                }
-                .onFailure { error ->
-                    val message = error.message ?: "Não consegui importar o redator local."
-                    radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = message)
-                    showToast(message)
-                }
-        }
-    }
-
-    fun downloadRadioWriterPackage() {
-        if (radioBulletinState.value.localWriterImporting) return
-        radioBulletinState.value = radioBulletinState.value.copy(
-            localWriterImporting = true,
-            localWriterMessage = "Baixando redator local...",
-        )
-        viewModelScope.launch {
-            runCatching {
-                val packageFile = downloadGoogleDrivePackage(
-                    fileId = RADIO_WRITER_DRIVE_FILE_ID,
-                    fileName = RADIO_WRITER_DOWNLOAD_FILE_NAME,
-                    maxBytes = RADIO_WRITER_DOWNLOAD_MAX_BYTES,
-                    progressPrefix = "Baixando redator local",
-                    onProgress = { message ->
-                        radioBulletinState.value = radioBulletinState.value.copy(localWriterMessage = message)
-                    },
-                )
-                withContext(Dispatchers.Main) {
-                    radioBulletinState.value = radioBulletinState.value.copy(
-                        localWriterMessage = "Importando redator local...",
-                    )
-                }
-                writerPackageRepository.importPackage(packageFile).also {
-                    packageFile.delete()
-                }
-            }.onSuccess {
-                val suffix = if (AppFolderRepository(getApplication()).hasFolder()) {
-                    " Uma copia ficou na pasta oficial."
-                } else {
-                    ""
-                }
-                radioBulletinState.value = loadRadioBulletinUiState().copy(
-                    localWriterMessage = "Redator local baixado e importado.$suffix",
-                )
-                showToast("Redator local pronto.")
-            }.onFailure { error ->
-                val message = error.message ?: "Nao consegui baixar o redator local."
-                radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = message)
-                showToast(message)
-            }
-        }
-    }
-
-    fun clearRadioWriterPackage() {
-        writerPackageRepository.clearPackage()
-        radioBulletinState.value = loadRadioBulletinUiState().copy(localWriterMessage = "Redator local removido.")
-        showToast("Redator local removido.")
-    }
-
-    fun importRadioVoicePackage(uri: Uri) {
-        radioVoiceState.value = radioVoiceState.value.copy(
-            isImporting = true,
-            message = "Importando pacote de voz...",
-        )
-        viewModelScope.launch {
-            runCatching { voicePackageRepository.importPackage(uri) }
-                .onSuccess { status ->
-                    radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, false).apply()
-                    radioVoiceState.value = status.toUiState(
-                        message = "Pacote importado. Voz local fica desligada ate testarmos com seguranca.",
-                    )
-                    showToast("Pacote importado. Radio segue usando a voz do Android.")
-                }
-                .onFailure { error ->
-                    val message = error.message ?: "Nao consegui importar o pacote de voz."
-                    radioVoiceState.value = loadRadioVoiceUiState().copy(message = message)
-                    showToast(message)
-                }
-        }
-    }
-
-    fun downloadRadioVoicePackage() {
-        if (radioVoiceState.value.isImporting) return
-        radioVoiceState.value = radioVoiceState.value.copy(
-            isImporting = true,
-            message = "Baixando pacote de voz...",
-        )
-        viewModelScope.launch {
-            runCatching {
-                val packageFile = downloadGoogleDrivePackage(
-                    fileId = RADIO_VOICE_DRIVE_FILE_ID,
-                    fileName = RADIO_VOICE_DOWNLOAD_FILE_NAME,
-                    maxBytes = RADIO_VOICE_DOWNLOAD_MAX_BYTES,
-                    progressPrefix = "Baixando pacote de voz",
-                    onProgress = { message ->
-                        radioVoiceState.value = radioVoiceState.value.copy(message = message)
-                    },
-                )
-                withContext(Dispatchers.Main) {
-                    radioVoiceState.value = radioVoiceState.value.copy(message = "Importando pacote de voz...")
-                }
-                voicePackageRepository.importPackage(packageFile).also {
-                    packageFile.delete()
-                }
-            }.onSuccess { status ->
-                radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, false).apply()
-                val suffix = if (AppFolderRepository(getApplication()).hasFolder()) {
-                    " Copia salva na pasta oficial."
-                } else {
-                    ""
-                }
-                radioVoiceState.value = status.toUiState(
-                    message = "Pacote baixado e importado.$suffix Voz local fica desligada ate testarmos com seguranca.",
-                )
-                showToast("Pacote de voz pronto.")
-            }.onFailure { error ->
-                val message = error.message ?: "Nao consegui baixar o pacote de voz."
-                radioVoiceState.value = loadRadioVoiceUiState().copy(message = message)
-                showToast(message)
-            }
-        }
-    }
-
-    fun clearRadioVoicePackage() {
-        val status = voicePackageRepository.clearPackage()
-        radioVoiceState.value = status.toUiState(message = "Pacote de voz removido.")
-        showToast("Pacote de voz removido.")
-    }
-
-    fun setRadioVoiceEnabled(enabled: Boolean) {
-        radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, enabled).apply()
-        radioVoiceState.value = loadRadioVoiceUiState().copy(
-            message = if (enabled) "Voz local experimental ativada." else "Voz local desligada. Usando Android.",
-        )
-        // Pedido do usuario (02/09/2026): virar a chavinha no meio de uma radio ja tocando nao
-        // mudava nada nos boletins que ja estavam prontos no buffer (preparados com o valor
-        // ANTIGO de isEnabled - refillBulletinBuffer() so reconsulta a chavinha quando prepara
-        // um item novo). Descarta o que tinha e prepara de novo do zero com o valor atual, pra
-        // nao ter que esperar os boletins antigos (BULLETIN_BUFFER_TARGET) acabarem antes da voz
-        // nova (ou a volta pro Android) valer de verdade.
-        clearBulletinBuffer()
-        refillBulletinBuffer()
-    }
-
-    fun testRadioVoicePackage() {
-        if (!radioVoiceState.value.isInstalled) {
-            radioVoiceState.value = radioVoiceState.value.copy(message = "Importe um pacote antes de testar.")
-            return
-        }
-        radioVoiceState.value = radioVoiceState.value.copy(
-            isTesting = true,
-            message = "Testando voz local em processo separado...",
-        )
-        viewModelScope.launch {
-            val script = RadioScript(
-                story = com.pailer.localtune.data.NewsStory(
-                    title = "Teste de voz local",
-                    source = "Pailer FM",
-                ),
-                source = RadioScriptSource.Fallback,
-                lines = listOf(
-                    RadioScriptLine(
-                        speaker = RadioSpeaker.Female,
-                        text = "Aqui é a Fran testando a voz local do Pailer FM.",
-                    ),
-                ),
-            )
-            val result = requestLocalVoiceSynthesis(script, LOCAL_VOICE_TEST_TIMEOUT_MS)
-            if (result?.file != null) {
-                radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, true).apply()
-                radioVoiceState.value = loadRadioVoiceUiState().copy(
-                    isTesting = false,
-                    message = "Teste OK em ${"%.1f".format(result.elapsedMs / 1000.0)}s. Voz local ativada.",
-                    canReplayTest = true,
-                )
-                playTestAudio(result.file)
-            } else {
-                radioPrefs.edit().putBoolean(KEY_RADIO_VOICE_ENABLED, false).apply()
-                radioVoiceState.value = loadRadioVoiceUiState().copy(
-                    isTesting = false,
-                    message = result?.detail
-                        ?: "Teste sem resposta em ${LOCAL_VOICE_TEST_TIMEOUT_MS / 1000}s. Mantive a voz do Android.",
-                )
-            }
-        }
-    }
-
-    // Botao "Testar vozes" da secao Gemini Flash TTS (Configuracoes > Boletins, pedido do usuario
-    // 10/09/2026) - mesmo molde de testRadioVoicePackage() acima, mas chama geminiFlashTtsEngine
-    // DIRETO (sem passar pelo provider check de trySynthesizeWithGeminiFlash, que so entra em
-    // boletim de verdade) pra o usuario conseguir validar chave/modelo/vozes mesmo com "Sistema
-    // atual" ainda selecionado. Nao mexe em nenhum outro estado (nao liga voz local nem o
-    // provider) - so testa e toca.
-    fun testGeminiFlashTtsVoices() {
-        val settings = radioBulletinState.value.settings
-        if (bulletinRepository.geminiSettings().apiKeys().isEmpty()) {
-            radioBulletinState.value = radioBulletinState.value.copy(
-                geminiVoiceTestMessage = "Salve pelo menos 1 chave de API do Gemini antes de testar.",
-            )
-            return
-        }
-        radioBulletinState.value = radioBulletinState.value.copy(
-            isTestingGeminiVoice = true,
-            geminiVoiceTestMessage = "Testando vozes com ${settings.ttsModel.label}...",
-        )
-        viewModelScope.launch {
-            val script = RadioScript(
-                story = com.pailer.localtune.data.NewsStory(title = "Teste de voz Gemini", source = "Pailer FM"),
-                source = RadioScriptSource.Fallback,
-                lines = listOf(
-                    RadioScriptLine(RadioSpeaker.Female, "Você está ouvindo a Pailer FM."),
-                    RadioScriptLine(RadioSpeaker.Male, "Daqui a pouco tem mais música e mais histórias por aqui."),
-                ),
-            )
-            val startedAt = System.currentTimeMillis()
-            val result = runCatching {
-                withTimeoutOrNull(GEMINI_TTS_TEST_TIMEOUT_MS) {
-                    geminiFlashTtsEngine.synthesize(script, settings.ttsModel, persistent = false)
-                }
-            }
-            val file = result.getOrNull()
-            val elapsedS = "%.1f".format((System.currentTimeMillis() - startedAt) / 1000.0)
-            if (file != null) {
-                radioBulletinState.value = radioBulletinState.value.copy(
-                    isTestingGeminiVoice = false,
-                    geminiVoiceTestMessage = "Teste concluído em ${elapsedS}s.",
-                )
-                playTestAudio(file)
-            } else {
-                val error = result.exceptionOrNull()
-                Log.w(TAG_RADIO_VOICE, "GeminiTTS: teste de voz falhou", error)
-                radioBulletinState.value = radioBulletinState.value.copy(
-                    isTestingGeminiVoice = false,
-                    geminiVoiceTestMessage = error?.message?.let { "Falha no teste: $it" }
-                        ?: "Sem resposta em ${GEMINI_TTS_TEST_TIMEOUT_MS / 1000}s.",
-                )
-            }
-        }
-    }
-
-    fun testAndroidVoiceBulletin() {
-        radioVoiceState.value = radioVoiceState.value.copy(
-            isTestingAndroidVoice = true,
-            message = "Testando voz do Android (bate-bola)...",
-        )
-        setupTextToSpeech(getApplication())
-        viewModelScope.launch {
-            var attempts = 0
-            while (!ttsReady && attempts < TTS_READY_WAIT_STEPS) {
-                attempts += 1
-                delay(TTS_READY_WAIT_INTERVAL_MS)
-            }
-            val tts = textToSpeech
-            if (!ttsReady || tts == null) {
-                radioVoiceState.value = radioVoiceState.value.copy(
-                    isTestingAndroidVoice = false,
-                    message = "Voz do Android nao iniciou.",
-                )
-                return@launch
-            }
-            val offlineVoices = tts.voices.orEmpty()
-                .filter { it.locale.language == "pt" && !it.isNetworkConnectionRequired }
-                .sortedBy { it.name }
-            Log.d(TAG_RADIO_VOICE, "android tts voices pt (offline)=${offlineVoices.map { it.name }}")
-            val femaleVoice = offlineVoices.getOrNull(0) ?: tts.voice
-            val maleVoice = offlineVoices.getOrNull(1) ?: tts.voice
-
-            val lines = listOf(
-                RadioSpeaker.Female to "Notícia rápida: cientistas brasileiros desenvolveram uma técnica de reciclagem " +
-                    "de plástico usando bactérias marinhas.",
-                RadioSpeaker.Male to "O estudo foi publicado essa semana e promete reduzir o descarte de garrafas " +
-                    "PET em até setenta por cento nos próximos anos.",
-                RadioSpeaker.Female to "Fica a dica, e agora voltamos para a nossa programação normal.",
-            )
-            val startedAt = System.currentTimeMillis()
-            val ok = speakAndroidDialogue(tts, lines, femaleVoice, maleVoice)
-            val elapsed = System.currentTimeMillis() - startedAt
-            radioVoiceState.value = radioVoiceState.value.copy(
-                isTestingAndroidVoice = false,
-                message = if (ok) {
-                    "Voz do Android OK em ${"%.1f".format(elapsed / 1000.0)}s (2 locutores, " +
-                        "${if (offlineVoices.size >= 2) "vozes distintas" else "mesma voz, tom diferente"})."
-                } else {
-                    "Voz do Android nao respondeu em ${ANDROID_VOICE_TEST_TIMEOUT_MS / 1000}s."
-                },
-            )
-        }
-    }
-
-    private fun productionUtteranceListener(): UtteranceProgressListener = object : UtteranceProgressListener() {
-        override fun onStart(utteranceId: String?) = Unit
-
-        override fun onDone(utteranceId: String?) {
-            finishNewsBreak()
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun onError(utteranceId: String?) {
-            finishNewsBreak()
-        }
-    }
-
-    private suspend fun speakAndroidDialogue(
-        tts: TextToSpeech,
-        lines: List<Pair<RadioSpeaker, String>>,
-        femaleVoice: Voice?,
-        maleVoice: Voice?,
-    ): Boolean = withTimeoutOrNull(ANDROID_VOICE_TEST_TIMEOUT_MS) {
-        suspendCancellableCoroutine { continuation ->
-            var index = 0
-            fun speakNext() {
-                if (index >= lines.size) {
-                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
-                    if (continuation.isActive) continuation.resume(true)
-                    return
-                }
-                val (speaker, text) = lines[index]
-                val voice = if (speaker == RadioSpeaker.Female) femaleVoice else maleVoice
-                voice?.let { runCatching { tts.voice = it } }
-                tts.setPitch(if (speaker == RadioSpeaker.Female) 1.05f else 0.82f)
-                tts.setSpeechRate(0.98f)
-                val utteranceId = "android_dialogue_${index++}"
-                val accepted = runCatching {
-                    tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-                }.getOrDefault(TextToSpeech.ERROR)
-                if (accepted != TextToSpeech.SUCCESS) {
-                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
-                    if (continuation.isActive) continuation.resume(false)
-                }
-            }
-            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
-                override fun onDone(utteranceId: String?) = speakNext()
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    tts.setOnUtteranceProgressListener(productionUtteranceListener())
-                    if (continuation.isActive) continuation.resume(false)
-                }
-            })
-            continuation.invokeOnCancellation {
-                runCatching { tts.stop() }
-                tts.setOnUtteranceProgressListener(productionUtteranceListener())
-            }
-            speakNext()
-        }
-    } ?: false
-
     private fun updateRadioBulletinSettings(settings: RadioBulletinSettings) {
-        val previous = radioBulletinState.value.settings
         radioPrefs.edit()
             .putString(KEY_RADIO_BULLETIN_MODE, settings.mode.name)
-            .putBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, settings.preferLocalWriter)
-            .putBoolean(KEY_RADIO_BULLETIN_CLOUD_WRITER, settings.cloudWriterEnabled)
-            .putString(KEY_RADIO_BULLETIN_TTS_PROVIDER, settings.ttsProvider.name)
-            .putString(KEY_RADIO_BULLETIN_TTS_MODEL, settings.ttsModel.name)
             .apply()
-        if (
-            previous.mode != settings.mode ||
-            previous.preferLocalWriter != settings.preferLocalWriter ||
-            previous.cloudWriterEnabled != settings.cloudWriterEnabled
-        ) {
-            cloudScriptBuffer.clear()
-            saveCloudScriptBufferManifest()
-            syncBulletinBufferState(statusMessage = null)
-        }
         radioBulletinState.value = loadRadioBulletinUiState()
     }
 
     private fun loadRadioBulletinUiState(): RadioBulletinUiState {
         // Modo nao e mais escolha do usuario - sempre "conversa dos locutores" (Dialogue), a
         // UI de selecao foi removida. Ignora qualquer valor antigo salvo em
-        // KEY_RADIO_BULLETIN_MODE (ex.: Off/Headlines de uma instalacao anterior).
-        // Duracao do boletim tambem nao e mais preferencia do usuario - cada materia escolhe
-        // sozinha (ver RadioBulletinRepository.pickDuration) de acordo com o quanto de
-        // conteudo real tem pra render.
+        // KEY_RADIO_BULLETIN_MODE (ex.: Off/Headlines de uma instalacao anterior). Voz/redator
+        // removidos 16/09/2026 - o boletim vem pronto (roteiro + audio) do feed remoto
+        // (BroadcastFeedRepository), sem nada mais pra configurar aqui.
         val settings = RadioBulletinSettings(
             mode = RadioBulletinMode.Dialogue,
             songsBetweenBulletins = RADIO_BULLETIN_DEFAULT_INTERVAL,
-            preferLocalWriter = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_LOCAL_WRITER, true),
-            cloudWriterEnabled = radioPrefs.getBoolean(KEY_RADIO_BULLETIN_CLOUD_WRITER, true),
-            // runCatching+default protege contra valor salvo de um enum que nao existe mais
-            // (renomeado/removido numa versao futura) - cai pro default em vez de travar a tela.
-            ttsProvider = radioPrefs.getString(KEY_RADIO_BULLETIN_TTS_PROVIDER, null)
-                ?.let { saved -> runCatching { BulletinTtsProvider.valueOf(saved) }.getOrNull() }
-                ?: BulletinTtsProvider.CURRENT,
-            ttsModel = radioPrefs.getString(KEY_RADIO_BULLETIN_TTS_MODEL, null)
-                ?.let { saved -> runCatching { GeminiTtsModel.valueOf(saved) }.getOrNull() }
-                ?: GeminiTtsModel.GEMINI_2_5_FLASH,
         )
-        val status = bulletinRepository.localWriterStatus()
-        val geminiKeySettings = bulletinRepository.geminiSettings()
-        return RadioBulletinUiState(
-            settings = settings,
-            localWriterInstalled = status.isInstalled,
-            localWriterName = status.modelName,
-            localWriterDetail = status.detail,
-            geminiConfigured = geminiKeySettings.apiKeys().isNotEmpty(),
-            geminiApiKeySlotsFilled = (0 until GeminiApiKeySettings.MAX_KEYS).map { geminiKeySettings.apiKeyAt(it) != null },
-        )
+        return RadioBulletinUiState(settings = settings)
     }
-
-    // Salva/remove uma chave de API do Gemini num slot especifico (0..GeminiApiKeySettings.
-    // MAX_KEYS-1, GeminiApiKeySettings/SharedPreferences local) e atualiza a UI - pagina dedicada
-    // "Chaves do Gemini" (pedido do usuario 10/09/2026: ate 5 chaves testadas em cadeia, campo
-    // numa pagina a parte). A chave nunca passa por fora do proprio celular.
-    fun saveGeminiApiKey(index: Int, key: String) {
-        if (key.isBlank()) return
-        bulletinRepository.geminiSettings().setApiKey(index, key)
-        radioBulletinState.value = loadRadioBulletinUiState()
-        showToast("Chave do Gemini salva.")
-    }
-
-    fun clearGeminiApiKey(index: Int) {
-        bulletinRepository.geminiSettings().clearApiKey(index)
-        radioBulletinState.value = loadRadioBulletinUiState()
-        showToast("Chave do Gemini removida.")
-    }
-
-    private fun loadRadioVoiceUiState(): RadioVoiceUiState =
-        voicePackageRepository.status().toUiState()
-
-    private fun com.pailer.localtune.data.RadioVoicePackageStatus.toUiState(message: String? = null): RadioVoiceUiState =
-        RadioVoiceUiState(
-            isInstalled = isInstalled,
-            isImporting = false,
-            isTesting = false,
-            isEnabled = isInstalled && radioPrefs.getBoolean(KEY_RADIO_VOICE_ENABLED, false),
-            packageName = packageName,
-            femaleSpeaker = femaleSpeaker,
-            maleSpeaker = maleSpeaker,
-            detail = detail,
-            message = message,
-        )
 
     private suspend fun scanLibrary(includeDeviceGenres: Boolean, showLoading: Boolean) {
         if (libraryScanRunning) return
@@ -3138,33 +2560,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.seekTo(positionMs)
     }
 
-    private fun setupTextToSpeech(context: Context) {
-        if (ttsRequested) return
-        ttsRequested = true
-        textToSpeech = TextToSpeech(context) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
-            if (ttsReady) {
-                textToSpeech?.language = Locale("pt", "BR")
-                textToSpeech?.setSpeechRate(0.98f)
-                textToSpeech?.setPitch(0.88f)
-            }
-        }.apply {
-            setOnUtteranceProgressListener(productionUtteranceListener())
-        }
-    }
-
     private fun startRadioNewsMode(radioName: String) {
-        setupTextToSpeech(getApplication())
         radioNewsEnabled = true
         completedRadioSongs = 0
-        // NAO limpa newsBulletins/bulletinBuffer nem reseta nextBulletinIndex - o buffer (roda
-        // desde a abertura do app) e 100% radio-agnostico de proposito (pedido do usuario
-        // 03/09/2026: "posso entrar em qualquer radio e ainda assim o boletim funcionar"; boletim
-        // nunca cita musica/radio, ver RadioBulletin.kt buildSystemInstructions), entao o
-        // trabalho ja feito (RSS + redator local + voz) sobrevive a troca de radio e a fila
-        // continua exatamente de onde estava (unificacao 10/09/2026 - antes cada radio
-        // "recomecava a fila do zero" por simplicidade, o que na pratica descartava boletins
-        // prontos so por causa de timing).
+        // NAO limpa bulletinBuffer - o buffer (roda desde a abertura do app) e 100%
+        // radio-agnostico de proposito (pedido do usuario 03/09/2026: "posso entrar em qualquer
+        // radio e ainda assim o boletim funcionar"; boletim nunca cita musica/radio), entao o
+        // trabalho ja baixado do feed remoto sobrevive a troca de radio e a fila continua
+        // exatamente de onde estava (unificacao 10/09/2026 - antes cada radio "recomecava a fila
+        // do zero" por simplicidade, o que na pratica descartava boletins prontos so por causa de
+        // timing).
         speakingNews = false
         newsBreakEnding = false
         currentNewsHeadline = ""
@@ -3174,57 +2579,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         playbackSource = "Rádio $radioName"
         armSleepTimer()
 
-        viewModelScope.launch {
-            ensureNewsBulletinsLoaded()
-            // No-op se o buffer ja estiver cheio (caso comum: preparo de fundo desde a abertura
-            // do app ja alcancou o alvo antes do usuario entrar numa radio).
-            refillBulletinBuffer()
-        }
-    }
-
-    // Carrega newsBulletins (historias RSS convertidas em roteiro base) se ainda nao tiver -
-    // usado tanto pelo preparo de fundo (sem radio nenhuma) quanto por
-    // startRadioNewsMode (reaproveita se o preparo de fundo ja carregou). radioName so entra no
-    // contexto por compatibilidade de assinatura - loadScripts()/buildDialogueLines() no modo
-    // Dialogue (unico usado hoje) nunca colocam nome de radio na fala em si.
-    private suspend fun ensureNewsBulletinsLoaded(radioName: String = "") {
-        if (newsBulletins.isNotEmpty()) return
-        val settings = radioBulletinState.value.settings
-        newsBulletins = runCatching {
-            bulletinRepository.loadScripts(settings, radioName)
-        }.getOrDefault(emptyList())
-    }
-
-    private fun reloadNewsBulletinsIfNeeded() {
-        if (bulletinReloadInFlight) return
-        bulletinReloadInFlight = true
-        val settings = radioBulletinState.value.settings
-        val radioName = activeRadioName
-        viewModelScope.launch {
-            val reloaded = runCatching {
-                bulletinRepository.loadScripts(settings, radioName)
-            }.getOrDefault(emptyList())
-            if (reloaded.isNotEmpty()) {
-                newsBulletins = reloaded
-                Log.d(TAG_RADIO_VOICE, "boletim: recarga recuperou ${reloaded.size} historias")
-                refillBulletinBuffer()
-            }
-            bulletinReloadInFlight = false
-        }
-    }
-
-    // Dispara reload de RSS sempre que o round-robin (nextBulletinIndex) completa uma volta
-    // inteira pelas newsBulletins - chamado logo apos incrementar nextBulletinIndex nos pontos
-    // que consomem uma materia base (refillBulletinBuffer, boletim ao vivo de
-    // emergencia). Sem isso, newsBulletins so carregava UMA vez por sessao (ver
-    // ensureNewsBulletinsLoaded) e a mesma lista de ~16 materias ficava se repetindo palavra por
-    // palavra indefinidamente enquanto a radio tocasse por horas - pedido do usuario
-    // (05/09/2026): noticia do Sirius (ciencia aberta) repetindo varias vezes na mesma sessao.
-    private fun reloadNewsBulletinsIfCycleComplete() {
-        if (newsBulletins.isNotEmpty() && nextBulletinIndex % newsBulletins.size == 0) {
-            Log.d(TAG_RADIO_VOICE, "boletim: completou uma volta pelas ${newsBulletins.size} materias - recarregando RSS")
-            reloadNewsBulletinsIfNeeded()
-        }
+        // Buffer (100% alimentado pelo feed remoto, ver refillBulletinBuffer) roda desde a
+        // abertura do app - no-op aqui se ja estiver cheio.
+        refillBulletinBuffer()
     }
 
     private fun stopRadioNewsMode() {
@@ -3241,7 +2598,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         cancelSleepTimer()
         announcementPlayer?.release()
         announcementPlayer = null
-        textToSpeech?.stop()
         // Radio pode ser desligada no meio do fade de checkForEarlyNewsBreak (ver la) - restaura
         // o volume senao a musica fica muda dependendo de onde o fade parou. Sempre 1f (nao
         // radioVolume()) e reseta o mute - cada sessao de radio nova comeca sem mute.
@@ -3287,9 +2643,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             onFinished()
             return
         }
-        // Multiplica por radioVolume() (nao aplica o volume cru) - preserva a proporcao
-        // vinheta(1.0)/passagem(PASSAGEM_VOLUME) quando nao mutado, zera os dois quando o
-        // usuario mutou no mini player (ver toggleRadioMute).
+        // Multiplica por radioVolume() (nao aplica o volume cru) - zera a vinheta junto quando
+        // o usuario mutou no mini player (ver toggleRadioMute).
         val applied = volume * radioVolume()
         player.setVolume(applied, applied)
         player.setOnCompletionListener {
@@ -3310,39 +2665,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun normalizeRadioKey(name: String): String = name.lowercase().filter { it.isLetterOrDigit() }
 
-    private fun canUseCloudScriptBatch(settings: RadioBulletinSettings): Boolean =
-        settings.mode == RadioBulletinMode.Dialogue &&
-            settings.preferLocalWriter &&
-            settings.cloudWriterEnabled &&
-            radioBulletinState.value.geminiConfigured
-
-    private fun takeUpcomingBaseScriptSelection(count: Int): BulletinCandidateSelection {
-        if (newsBulletins.isEmpty()) return BulletinCandidateSelection(emptyList(), inspectedCount = 0)
-        val reservedKeys = currentReservedBulletinStoryKeys()
-        val selected = mutableListOf<RadioScript>()
-        var inspected = 0
-        while (inspected < newsBulletins.size && selected.size < count) {
-            val candidate = newsBulletins[(nextBulletinIndex + inspected) % newsBulletins.size]
-            val key = candidate.newsReservationKey()
-            if (key.isNotBlank() && key !in reservedKeys) {
-                selected += candidate
-                reservedKeys += key
-            }
-            inspected += 1
-        }
-        if (selected.size < count) {
-            Log.d(
-                TAG_RADIO_VOICE,
-                "boletim: lote Gemini selecionou ${selected.size}/$count noticias novas apos inspecionar $inspected/${newsBulletins.size}; recarga RSS deve ampliar a janela",
-            )
-        }
-        return BulletinCandidateSelection(selected, inspected)
-    }
-
     private fun currentReservedBulletinStoryKeys(): MutableSet<String> {
         val reserved = recentBulletinStoryKeys.toMutableSet()
         bulletinBuffer.forEach { item -> item.script.newsReservationKey().takeIf { it.isNotBlank() }?.let(reserved::add) }
-        cloudScriptBuffer.forEach { script -> script.newsReservationKey().takeIf { it.isNotBlank() }?.let(reserved::add) }
         return reserved
     }
 
@@ -3374,51 +2699,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             .apply()
     }
 
-    private fun advanceBulletinIndex(consumed: Int) {
-        repeat(consumed) {
-            nextBulletinIndex += 1
-            reloadNewsBulletinsIfCycleComplete()
-        }
-    }
-
-    private fun shouldRefillCloudScriptBuffer(settings: RadioBulletinSettings): Boolean =
-        canUseCloudScriptBatch(settings) &&
-            cloudScriptBuffer.size <= CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD &&
-            cloudScriptBuffer.size < CLOUD_SCRIPT_BUFFER_TARGET
-
-    private suspend fun refillCloudScriptBufferIfNeeded(settings: RadioBulletinSettings) {
-        if (!canUseCloudScriptBatch(settings)) return
-        if (!shouldRefillCloudScriptBuffer(settings)) return
-        while (cloudScriptBuffer.size < CLOUD_SCRIPT_BUFFER_TARGET && !bulletinPrepPaused) {
-            if (newsBulletins.isEmpty()) return
-            val freeSlots = (CLOUD_SCRIPT_BUFFER_TARGET - cloudScriptBuffer.size).coerceAtLeast(0)
-            val batchSize = minOf(CLOUD_SCRIPT_BATCH_SIZE, freeSlots)
-            if (batchSize <= 0) return
-            val selection = takeUpcomingBaseScriptSelection(batchSize)
-            val candidates = selection.scripts
-            if (candidates.isEmpty()) {
-                if (selection.inspectedCount > 0) advanceBulletinIndex(selection.inspectedCount)
-                reloadNewsBulletinsIfNeeded()
-                return
-            }
-            val written = llmGenerationMutex.withLock {
-                bulletinRepository.prewriteCloudScripts(
-                    scripts = candidates,
-                    settings = settings,
-                    radioName = activeRadioName,
-                    limit = batchSize,
-                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
-                )
-            }
-            if (written.isEmpty()) return
-            written.forEach(::rememberRecentBulletinStory)
-            cloudScriptBuffer.addAll(written)
-            advanceBulletinIndex(selection.inspectedCount)
-            saveCloudScriptBufferManifest()
-            syncBulletinBufferState(statusMessage = null)
-        }
-    }
-
     // Mantem bulletinBuffer com BULLETIN_BUFFER_TARGET itens prontos (roteiro decorado + WAV
     // sintetizado, se a voz local/Gemini estiver ativa) - roda o tempo todo, independente de
     // radio ativa ou nao (pedido do usuario 03/09/2026), e SOBREVIVE a troca de radio (pedido do
@@ -3429,162 +2709,77 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // (bulletinPrepJob ativo), o buffer ja esta cheio, ou o preparo esta pausado, e um no-op -
     // seguro chamar de qualquer lugar (abertura do app, transicao de faixa, fim de boletim,
     // reload de feed).
+    // Simplificado 16/09/2026 (ADR a documentar): o unico produtor de boletim agora e o feed
+    // remoto (BroadcastFeedRepository) - a central de broadcast fora do app ja escreve e
+    // sintetiza tudo. Sem boletim aprovado novo, a vaga fica vazia e a rodada para (sem RSS,
+    // sem redator local/Gemini, sem sintese de voz local/Gemini local). Ver antiga versao desta
+    // funcao no historico do git pra referencia do pipeline local que existia antes.
     private fun refillBulletinBuffer() {
         if (bulletinPrepPaused) return
         if (bulletinPrepJob?.isActive == true) return
-        val settingsAtStart = radioBulletinState.value.settings
-        val needsBulletinAudio = bulletinBuffer.size < BULLETIN_BUFFER_TARGET
-        val needsCloudScripts = shouldRefillCloudScriptBuffer(settingsAtStart)
-        if (!needsBulletinAudio && !needsCloudScripts) return
-        if (newsBulletins.isEmpty()) {
-            reloadNewsBulletinsIfNeeded()
-            return
-        }
+        if (bulletinBuffer.size >= BULLETIN_BUFFER_TARGET) return
         bulletinPrepJob = viewModelScope.launch {
             try {
-                if (newsBulletins.isEmpty()) ensureNewsBulletinsLoaded()
-                refillCloudScriptBufferIfNeeded(radioBulletinState.value.settings)
-                if (bulletinBuffer.size >= BULLETIN_BUFFER_TARGET) {
-                    syncBulletinBufferState(isPreparing = false, statusMessage = null)
-                    return@launch
-                }
                 while (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused) {
-                    if (newsBulletins.isEmpty()) {
-                        // RSS falhou ou ainda nao carregou - nada pra preparar agora; desiste
-                        // sem erro (reloadNewsBulletinsIfNeeded/refillBulletinBuffer tentam de
-                        // novo no proximo gatilho).
-                        break
-                    }
                     val bufferPositionBeforeThisItem = bulletinBuffer.size
                     syncBulletinBufferState(
                         isPreparing = true,
-                        statusMessage = "Preparando boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...",
+                        statusMessage = "Buscando boletim aprovado no feed Pailer FM...",
+                        progressPercent = 5,
                     )
-                    // Catch-all defensivo: nada aqui deveria lancar sem ja logar (enhanceScript
-                    // encapsula o redator local em runCatching, requestLocalVoiceSynthesis
-                    // encapsula a chamada ao servico de voz), mas se algo inesperado escapar
-                    // mesmo assim, melhor logar com stacktrace completo e parar essa rodada de
-                    // preparo do que deixar a excecao subir e derrubar o job silenciosamente -
-                    // pedido do usuario (03/09/2026): "pra caso algo der erro a gente saiba o
-                    // que". CancellationException segue pro finally normalmente (nao e erro).
                     try {
-                        val settings = radioBulletinState.value.settings
-                        refillCloudScriptBufferIfNeeded(settings)
                         Log.d(
                             TAG_RADIO_VOICE,
-                            "boletim: preparando posicao=$bufferPositionBeforeThisItem redator=${settings.preferLocalWriter} vozLocal=${radioVoiceState.value.isEnabled} roteirosProntos=${cloudScriptBuffer.size}",
+                            "boletim: buscando posicao=$bufferPositionBeforeThisItem",
                         )
-                        val (script, scriptFromGemini) = if (canUseCloudScriptBatch(settings) && cloudScriptBuffer.isNotEmpty()) {
-                            val bufferedScript = cloudScriptBuffer.removeFirst()
-                            saveCloudScriptBufferManifest()
-                            bufferedScript.withPhilosophicalCloser() to true
-                        } else {
-                            val index = nextBulletinIndex % newsBulletins.size
-                            val baseScript = newsBulletins[index]
-                            nextBulletinIndex += 1
-                            reloadNewsBulletinsIfCycleComplete()
-                            var usedCloudWriter = false
-                            // Boletim e 100% radio-agnostico (pedido do usuario 09/09/2026, ver
-                            // RadioBulletin.kt buildSystemInstructions) - activeRadioName so entra
-                            // aqui por compatibilidade de assinatura, nunca aparece na fala.
-                            val enhanced = llmGenerationMutex.withLock {
-                                bulletinRepository.enhanceScript(
-                                    baseScript, settings, activeRadioName,
-                                    onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
-                                    onProgressPercent = { percent ->
-                                        syncBulletinBufferState(statusMessage = radioBulletinBufferState.value.statusMessage, progressPercent = percent)
-                                    },
-                                    onWriterUsed = { usedCloudWriter = it },
-                                )
-                            }
-                            enhanced.withPhilosophicalCloser() to usedCloudWriter
+                        // withTimeoutOrNull aqui (alem do timeout interno de conexao do
+                        // BroadcastFeedRepository) porque hang de DNS/handshake em algumas
+                        // redes Android nao respeita connectTimeout do HttpURLConnection -
+                        // sem isso, uma rede ruim travava a rodada INTEIRA do buffer, descoberto
+                        // ao vivo em teste 16/09/2026.
+                        val remoteBulletin = withTimeoutOrNull(REMOTE_FEED_TIMEOUT_MS) {
+                            broadcastFeedRepository.downloadNextApprovedBulletin(
+                                targetDir = coreBufferDir,
+                                reservedKeys = currentReservedBulletinStoryKeys(),
+                            )
                         }
-                        // coreSynthesisInFlight cobre TODA a janela sensivel (ver comentario na
-                        // declaracao do campo) - do inicio da sintese ate o item estar de verdade
-                        // registrado em bulletinBuffer logo abaixo. try/finally garante que ele
-                        // volta pra false mesmo se a corrotina for cancelada no meio.
-                        coreSynthesisInFlight = true
-                        val voiceOutcome = try {
-                            if (radioVoiceState.value.isEnabled) {
-                                syncBulletinBufferState(statusMessage = "Sintetizando voz do boletim ${bufferPositionBeforeThisItem + 1}/$BULLETIN_BUFFER_TARGET...")
-                                // synthesizeCoreVoiceSafely (nao synthesizeLocalVoiceSafely) de
-                                // proposito: o buffer unico e persistido em disco (saveCoreBufferManifest/
-                                // loadCoreBufferManifest, filesDir) - o audio PRECISA ir pro mesmo
-                                // filesDir persistente, senao sobrevive na memoria mas some do disco
-                                // (cacheDir efemero) no primeiro restart do processo.
-                                voiceSynthesisMutex.withLock {
-                                    synthesizeCoreVoiceSafely(
-                                        script, BULLETIN_PREP_TIMEOUT_MS,
-                                        onProgress = { message -> syncBulletinBufferState(statusMessage = message) },
-                                        onProgressPercent = { percent -> syncBulletinBufferState(progressPercent = percent) },
-                                    )
-                                }
-                            } else {
-                                null
-                            }
-                        } finally {
-                            coreSynthesisInFlight = false
+                        if (remoteBulletin == null) {
+                            // Feed sem boletim novo pra essa vaga. Desiste sem erro; os proximos
+                            // gatilhos (abertura do app, troca de faixa, fim de boletim) tentam
+                            // de novo.
+                            syncBulletinBufferState(isPreparing = false, statusMessage = null)
+                            break
                         }
-                        val file = voiceOutcome?.file
-                        val voiceFromGemini = voiceOutcome?.fromGemini ?: false
-                        if (file == null) {
-                            Log.w(TAG_RADIO_VOICE, "boletim: voz local nao preparou audio; buffer guarda so o roteiro")
-                        }
-                        rememberRecentBulletinStory(script)
-                        bulletinBuffer.addLast(PreparedBulletin(script, file, scriptFromGemini = scriptFromGemini, voiceFromGemini = voiceFromGemini))
+                        rememberRecentBulletinStory(remoteBulletin.script)
+                        bulletinBuffer.addLast(
+                            PreparedBulletin(
+                                script = remoteBulletin.script,
+                                file = remoteBulletin.audioFile,
+                                scriptFromGemini = false,
+                                voiceFromGemini = false,
+                            ),
+                        )
                         // Persiste AGORA que o item esta de verdade no buffer - sem isso, um
                         // processo morto logo depois (comum no Android, app em segundo plano)
                         // perdia boletins prontos que ainda nao tinham sido salvos em disco.
                         saveCoreBufferManifest()
-                        Log.d(TAG_RADIO_VOICE, "boletim: buffer agora com ${bulletinBuffer.size}/$BULLETIN_BUFFER_TARGET (audio=${file != null})")
-                        // file == null tambem agenda a correcao (11/09/2026) - roteiro OK mas a
-                        // sintese de voz falhou pra essa materia; sem isso esse item ficava
-                        // "pronto" no buffer pra sempre e só virava TTS Android na hora de tocar,
-                        // ver fixFallbackBulletins().
-                        if (script.source == RadioScriptSource.Fallback || file == null) scheduleFallbackAutoFix()
+                        Log.d(TAG_RADIO_VOICE, "boletim: baixado do feed aprovado id=${remoteBulletin.id} arquivo=${remoteBulletin.audioFile.name}")
+                        Log.d(TAG_RADIO_VOICE, "boletim: buffer agora com ${bulletinBuffer.size}/$BULLETIN_BUFFER_TARGET")
                         syncBulletinBufferState(isPreparing = false, statusMessage = null)
-                        // Cooldown termico entre boletins consecutivos (pedido do usuario
-                        // 03/09/2026, junto de subir threads pro maximo do aparelho/8): sessoes
-                        // de geracao seguida mostraram o prefill do redator degradando de 7.3 pra
-                        // 5.6 tok/s ao longo do dia (throttling termico, ja visto tambem na
-                        // sintese de voz - 2t=410s/4t=496s). Da um respiro pro SoC esfriar antes
-                        // de emendar a proxima geracao pesada. So espera se ainda falta preparar
-                        // mais item (senao fica parado a toa depois do ultimo, sem nada que va se
-                        // beneficiar do respiro). Pulado quando Gemini OU OpenRouter escreveram
-                        // essa (usedCloudWriter) - pedido do usuario (04/09/2026, estendido
-                        // 05/09/2026 pro OpenRouter): a escrita saiu da nuvem, so sobra a sintese
-                        // de voz local sozinha (bem mais leve que LLM local + sintese juntos, a
-                        // causa original do cooldown). Continua normal se caiu pro redator local
-                        // Qwen3 (sem nenhuma chave configurada, ou os dois de nuvem falharam nessa
-                        // hora) - ver ADR-021.
-                        if (bulletinBuffer.size < BULLETIN_BUFFER_TARGET && !bulletinPrepPaused && !scriptFromGemini) {
-                            val cooldownStart = System.currentTimeMillis()
-                            while (System.currentTimeMillis() - cooldownStart < COOLDOWN_BETWEEN_BULLETINS_MS && !bulletinPrepPaused) {
-                                val remainingS = ((COOLDOWN_BETWEEN_BULLETINS_MS - (System.currentTimeMillis() - cooldownStart)) / 1000)
-                                    .coerceAtLeast(0)
-                                syncBulletinBufferState(statusMessage = "Aguardando o aparelho esfriar antes do próximo boletim... ${remainingS}s")
-                                delay(COOLDOWN_STATUS_TICK_MS)
-                            }
-                            syncBulletinBufferState(statusMessage = null)
-                        }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Throwable) {
-                        Log.e(TAG_RADIO_VOICE, "boletim: erro inesperado preparando item $bufferPositionBeforeThisItem do buffer", e)
+                        Log.e(TAG_RADIO_VOICE, "boletim: erro inesperado baixando item $bufferPositionBeforeThisItem do buffer", e)
                         syncBulletinBufferState(
                             isPreparing = false,
-                            statusMessage = "Erro ao preparar boletim: ${e.message ?: e::class.simpleName} (ver logcat, tag $TAG_RADIO_VOICE).",
+                            statusMessage = "Erro ao baixar boletim: ${e.message ?: e::class.simpleName} (ver logcat, tag $TAG_RADIO_VOICE).",
                         )
                         break
                     }
                 }
             } finally {
                 // Roda tambem em cancelamento (pauseBulletinPreparation/resetBulletinBuffer) -
-                // garante que a UI nunca fique presa mostrando "escrevendo" depois que o job
-                // parou. Cancelamento de coroutine e cooperativo: se o preparo estiver travado
-                // numa chamada nativa bloqueante (JNI do redator local/voz), o cancel() so
-                // encerra o job assim que essa chamada devolver o controle - risco ja conhecido
-                // de falta de isolamento de processo do redator local (ver ADR-002).
+                // garante que a UI nunca fique presa mostrando "buscando" depois que o job parou.
                 syncBulletinBufferState(isPreparing = false, statusMessage = null)
             }
         }
@@ -3601,19 +2796,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         bulletinPrepJob = null
         bulletinBuffer.forEach { it.file?.delete() }
         bulletinBuffer.clear()
-        cloudScriptBuffer.clear()
         saveCoreBufferManifest()
-        saveCloudScriptBufferManifest()
         syncBulletinBufferState(isPreparing = false, statusMessage = null)
     }
 
     // Pasta privada do app em filesDir (NAO cacheDir) - sobrevive a "limpar cache" e a
     // reinicio/morte do processo, so some se o usuario fizer "Limpar dados" do app. Sem
-    // permissao nenhuma envolvida (filesDir e sempre privado ao proprio app). Mesmo nome que
-    // LocalRadioVoiceEngine usa pra escrever os .wav do nucleo (CORE_BUFFER_DIR_NAME).
+    // permissao nenhuma envolvida (filesDir e sempre privado ao proprio app).
     private val coreBufferDir: File
         get() = getApplication<Application>().filesDir
-            .resolve(LocalRadioVoiceEngine.CORE_BUFFER_DIR_NAME).apply { mkdirs() }
+            .resolve(CORE_BUFFER_DIR_NAME).apply { mkdirs() }
 
     // Grava o estado atual do bulletinBuffer em disco - pedido do usuario (03/09/2026): boletins
     // ja escritos nao podiam sumir so porque o app reiniciou ou o Android limpou o cache. Tambem
@@ -3660,69 +2852,20 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             coreBufferDir.resolve(CORE_BUFFER_MANIFEST_FILE).writeText(array.toString())
-            // Achado 11/09/2026 (terceira rodada, ao vivo - usuario: "é um gemini verde, não
-            // podemos matar ele prematuramente"): antes disso, o sweep abaixo so se protegia com um
-            // TIMER (ORPHAN_CLEANUP_GRACE_MS) - um chute de "tempo de sobra" baseado no pior caso ja
-            // visto, nao uma garantia. O .wav so aparece no disco no FIM da sintese (writeWav) e so
-            // entao a corrotina registra o item em bulletinBuffer (ver refillBulletinBuffer) - com a
-            // cota do Gemini estourada, esse caminho pode passar de 10 minutos (5 chaves mortas a
-            // GEMINI_TTS_TIMEOUT_MS=120s cada), o DOBRO do timer antigo de 5min. Qualquer chamada
-            // concorrente a este metodo nesse meio tempo (speakNextNewsBreak consumindo outro item,
-            // fixFallbackBulletins, o polling do init{}) varria a pasta e podia apagar um arquivo
-            // que so "parecia" orfao por ainda nao ter tido chance de ser registrado - nunca lixo de
-            // verdade. Corrigido pulando o sweep INTEIRO enquanto coreSynthesisInFlight (ver
-            // declaracao do campo) estiver true - garantia real, nao depende de nenhum numero de
-            // timeout adivinhado; o timer velho (ORPHAN_CLEANUP_GRACE_MS) fica como reforco extra
-            // pra limpar orfaos de verdade deixados por um processo morto no meio da sintese (nesse
-            // caso o flag reseta pra false no proximo processo, entao o timer ainda cobre esse
-            // cenario raro).
-            if (!coreSynthesisInFlight) {
-                val referenced = (bulletinBuffer.mapNotNull { it.file?.name } +
-                    listOfNotNull(protectedBulletinPlaybackFileName)).toSet()
-                val now = System.currentTimeMillis()
-                coreBufferDir.listFiles { file ->
-                    file.name != CORE_BUFFER_MANIFEST_FILE &&
-                        file.name != CLOUD_SCRIPT_BUFFER_MANIFEST_FILE &&
-                        file.name !in referenced &&
-                        (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
-                }?.forEach { it.delete() }
-            }
+            // Varre a pasta e apaga .wav orfao (ja consumido/removido do buffer, ou baixado mas
+            // nunca registrado por alguma falha). ORPHAN_CLEANUP_GRACE_MS da folga suficiente pra
+            // um download em andamento (BroadcastFeedRepository) terminar antes de ser considerado
+            // lixo - bem menor hoje do que quando precisava cobrir sintese local/Gemini de varios
+            // minutos (removida 16/09/2026).
+            val referenced = (bulletinBuffer.mapNotNull { it.file?.name } +
+                listOfNotNull(protectedBulletinPlaybackFileName)).toSet()
+            val now = System.currentTimeMillis()
+            coreBufferDir.listFiles { file ->
+                file.name != CORE_BUFFER_MANIFEST_FILE &&
+                    file.name !in referenced &&
+                    (now - file.lastModified()) > ORPHAN_CLEANUP_GRACE_MS
+            }?.forEach { it.delete() }
         }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao salvar manifest do buffer em disco", it) }
-    }
-
-    // Guarda em disco o estoque de roteiros Gemini ainda sem audio. Esse buffer nasce antes da
-    // sintese, entao deixar so em memoria seria desperdiçar chamada de API se o Android matar o
-    // processo, alem de impedir auditoria da qualidade do texto gerado. Fica no mesmo filesDir
-    // privado dos boletins prontos, mas em JSON separado do manifest dos .wav.
-    private fun saveCloudScriptBufferManifest() {
-        runCatching {
-            val array = JSONArray()
-            cloudScriptBuffer.forEach { script ->
-                array.put(
-                    JSONObject().apply {
-                        put("title", script.story.title)
-                        put("source", script.story.source)
-                        put("summary", script.story.summary)
-                        put("scriptSource", script.source.name)
-                        put("duration", script.duration.name)
-                        put(
-                            "lines",
-                            JSONArray().apply {
-                                script.lines.forEach { line ->
-                                    put(
-                                        JSONObject().apply {
-                                            put("speaker", line.speaker.name)
-                                            put("text", line.text)
-                                        },
-                                    )
-                                }
-                            },
-                        )
-                    },
-                )
-            }
-            coreBufferDir.resolve(CLOUD_SCRIPT_BUFFER_MANIFEST_FILE).writeText(array.toString())
-        }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao salvar estoque de roteiros Gemini", it) }
     }
 
     // Le o manifest salvo (se existir) e repopula bulletinBuffer - chamado uma vez na abertura do
@@ -3778,49 +2921,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao restaurar buffer do disco", it) }
     }
 
-    // Restaura o estoque FIFO de roteiros Gemini salvo antes da sintese. Trunca no alvo atual
-    // para evitar carregar lixo/crescimento de versoes futuras, mas preserva a ordem exata.
-    private fun loadCloudScriptBufferManifest() {
-        runCatching {
-            val manifestFile = coreBufferDir.resolve(CLOUD_SCRIPT_BUFFER_MANIFEST_FILE)
-            if (!manifestFile.exists()) return
-            val array = JSONArray(manifestFile.readText())
-            val restored = (0 until array.length()).mapNotNull { index ->
-                runCatching {
-                    val json = array.getJSONObject(index)
-                    val story = com.pailer.localtune.data.NewsStory(
-                        title = json.getString("title"),
-                        source = json.getString("source"),
-                        summary = json.optString("summary"),
-                    )
-                    val linesJson = json.getJSONArray("lines")
-                    val lines = (0 until linesJson.length()).map { lineIndex ->
-                        val lineJson = linesJson.getJSONObject(lineIndex)
-                        RadioScriptLine(
-                            speaker = RadioSpeaker.valueOf(lineJson.getString("speaker")),
-                            text = lineJson.getString("text"),
-                        )
-                    }
-                    RadioScript(
-                        story = story,
-                        lines = lines,
-                        source = runCatching {
-                            RadioScriptSource.valueOf(json.optString("scriptSource", RadioScriptSource.LocalLlm.name))
-                        }.getOrDefault(RadioScriptSource.LocalLlm),
-                        duration = runCatching {
-                            com.pailer.localtune.data.RadioBulletinDuration.valueOf(
-                                json.optString("duration", com.pailer.localtune.data.RadioBulletinDuration.Normal.name),
-                            )
-                        }.getOrDefault(com.pailer.localtune.data.RadioBulletinDuration.Normal),
-                    )
-                }.getOrNull()
-            }.take(CLOUD_SCRIPT_BUFFER_TARGET)
-            cloudScriptBuffer.clear()
-            cloudScriptBuffer.addAll(restored)
-            Log.d(TAG_RADIO_VOICE, "boletim: restaurados ${cloudScriptBuffer.size}/${array.length()} roteiros Gemini do disco")
-        }.onFailure { Log.w(TAG_RADIO_VOICE, "boletim: falha ao restaurar estoque de roteiros Gemini", it) }
-    }
-
     private fun syncBulletinBufferState(
         isPreparing: Boolean = radioBulletinBufferState.value.isPreparing,
         statusMessage: String? = radioBulletinBufferState.value.statusMessage,
@@ -3828,28 +2928,17 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // statusMessage=null pra "limpar" nao deixa um percentual velho grudado na tela.
         progressPercent: Int? = if (statusMessage == null) null else radioBulletinBufferState.value.progressPercent,
     ) {
-        val activeSources = bulletinBuffer.map { it.script.source }
-        // Achado 11/09/2026 (segunda rodada): confere it.file?.exists() == true de verdade, nao so
-        // "file != null"/flag congelada de quando o item foi sintetizado - um arquivo pode ter
-        // sumido depois (corrida do sweep de orfaos, ver purgeVanishedBulletinAudio) e sem essa
-        // checagem a bolinha ficava verde mentindo que da pra tocar audio de verdade, exatamente o
-        // sintoma que o usuario reportou ("todas as bolinhas verdes" mas toca TTS Android na hora).
-        val activeFullGemini = bulletinBuffer.map { (it.scriptFromGemini && it.voiceFromGemini) && it.file?.exists() == true }
+        // Redator/roteiro em nuvem removido (16/09/2026) - todo item do buffer agora vem do feed
+        // remoto (RadioScriptSource.BroadcastFeed), entao script/fallback/Gemini nunca mais
+        // variam; os campos correspondentes de RadioBulletinBufferUiState ficam nos defaults ate
+        // a tela "Boletins da radio" ser removida (estagio seguinte da limpeza).
         radioBulletinBufferState.value = radioBulletinBufferState.value.copy(
             readyCount = bulletinBuffer.size,
-            scriptReadyCount = cloudScriptBuffer.size,
-            scriptTargetCount = CLOUD_SCRIPT_BUFFER_TARGET,
-            scriptRefillThreshold = CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD,
             isPreparing = isPreparing,
             isPaused = bulletinPrepPaused,
             statusMessage = statusMessage,
             progressPercent = progressPercent,
             hasPlayableAudio = bulletinBuffer.any { it.file?.exists() == true },
-            fallbackSlots = activeSources.withIndex().filter { (_, source) -> source == RadioScriptSource.Fallback }
-                .map { (index, _) -> index }.toSet(),
-            hasFallback = activeSources.any { it == RadioScriptSource.Fallback },
-            fullGeminiSlots = activeFullGemini.withIndex().filter { (_, isFullGemini) -> isFullGemini }
-                .map { (index, _) -> index }.toSet(),
         )
     }
 
@@ -3991,8 +3080,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     // Desfaz o fade/gatilho antecipado quando speakNextNewsBreak() acaba desistindo de falar
-    // (ttsReady ainda false, controller sumiu, feeds vazios) - sem isso a musica ficava travada
-    // pausada ou tocando em volume 0 pro resto da faixa.
+    // (buffer sem audio pronto, controller sumiu) - sem isso a musica ficava travada pausada ou
+    // tocando em volume 0 pro resto da faixa.
     private fun cancelEarlyNewsBreakIfPending() {
         if (!newsBreakSkipsAheadOnResume) return
         newsBreakSkipsAheadOnResume = false
@@ -4000,7 +3089,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun PreparedBulletin.playableAudioFile(): File? =
-        file?.takeIf { it.exists() && it.length() > LocalRadioVoiceEngine.WAV_HEADER_SIZE }
+        file?.takeIf { it.exists() && it.length() > WAV_HEADER_SIZE }
 
     private fun dequeueBufferedBulletinForPlayback(): Pair<PreparedBulletin?, Int> {
         var skippedWithoutAudio = 0
@@ -4010,7 +3099,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 return candidate to skippedWithoutAudio
             }
             skippedWithoutAudio += 1
-            candidate.file?.takeIf { !it.exists() || it.length() <= LocalRadioVoiceEngine.WAV_HEADER_SIZE }?.delete()
+            candidate.file?.takeIf { !it.exists() || it.length() <= WAV_HEADER_SIZE }?.delete()
         }
         return null to skippedWithoutAudio
     }
@@ -4030,7 +3119,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun speakNextNewsBreak() {
-        if (!ttsReady || speakingNews) {
+        if (speakingNews) {
             cancelEarlyNewsBreakIfPending()
             return
         }
@@ -4060,47 +3149,28 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // BULLETIN_BUFFER_TARGET itens prontos, reposto assim que um sai).
         refillBulletinBuffer()
 
-        val bulletin: RadioScript
-        val readyFile: File?
-        if (prepared != null) {
-            bulletin = prepared.script
-            rememberRecentBulletinStory(bulletin)
-            readyFile = protectedReadyFile?.takeIf { it.exists() && it.length() > LocalRadioVoiceEngine.WAV_HEADER_SIZE }
-            Log.d(
-                TAG_RADIO_VOICE,
-                "boletim: consumindo do buffer (audio=${readyFile != null}, arquivo=${readyFile?.name}, bytes=${readyFile?.length() ?: 0}, titulo='${bulletin.displayText}', restam ${bulletinBuffer.size})",
-            )
-        } else {
-            if (radioVoiceState.value.isEnabled) {
-                Log.w(TAG_RADIO_VOICE, "boletim: nenhum audio pronto no buffer; cancelando entrada para nao usar TTS Android")
-                clearProtectedBulletinPlaybackFile(protectedReadyFile)
-                cancelEarlyNewsBreakIfPending()
-                return
-            }
-            if (newsBulletins.isEmpty()) {
-                // Feeds RSS podem ter falhado todos na carga inicial (rede instavel/DNS/feed
-                // fora do ar - ver NewsBulletinRepository.loadStories, falha e ignorada
-                // silenciosamente por feed) e a lista ficava vazia pro resto da sessao, sem log e
-                // sem nova tentativa - o boletim simplesmente nunca mais tocava. Loga pra dar pra
-                // diagnosticar; reloadNewsBulletinsIfNeeded ja tenta de novo em segundo plano.
-                Log.w(TAG_RADIO_VOICE, "boletim: buffer e newsBulletins vazios - tentando recarregar")
-                reloadNewsBulletinsIfNeeded()
-                clearProtectedBulletinPlaybackFile(protectedReadyFile)
-                cancelEarlyNewsBreakIfPending()
-                return
-            }
-            // Buffer vazio (sessao acabou de comecar, feed ainda carregando, ou consumo mais
-            // rapido do que o preparo consegue acompanhar) - monta um boletim ao vivo com o
-            // contexto real de agora (sem enhanceScript/redator local, que e lento demais pra
-            // essa emergencia; so o fallback determinístico + decoracao).
-            Log.w(TAG_RADIO_VOICE, "boletim: buffer vazio; montando boletim ao vivo")
-            val index = nextBulletinIndex % newsBulletins.size
-            val baseBulletin = newsBulletins[index]
-            nextBulletinIndex += 1
-            reloadNewsBulletinsIfCycleComplete()
-            bulletin = baseBulletin.withPhilosophicalCloser()
-            rememberRecentBulletinStory(bulletin)
-            readyFile = null
+        // Sem alternativa: sem boletim aprovado pronto no buffer (baixado do feed remoto,
+        // ver refillBulletinBuffer), a entrada simplesmente e cancelada e a musica segue -
+        // sem redator/voz local, sem TTS Android, sem boletim "ao vivo" de emergencia
+        // (simplificado 16/09/2026).
+        if (prepared == null) {
+            Log.w(TAG_RADIO_VOICE, "boletim: nenhum audio pronto no buffer; cancelando entrada")
+            clearProtectedBulletinPlaybackFile(protectedReadyFile)
+            cancelEarlyNewsBreakIfPending()
+            return
+        }
+        val bulletin = prepared.script
+        rememberRecentBulletinStory(bulletin)
+        val readyFile = protectedReadyFile?.takeIf { it.exists() && it.length() > WAV_HEADER_SIZE }
+        Log.d(
+            TAG_RADIO_VOICE,
+            "boletim: consumindo do buffer (audio=${readyFile != null}, arquivo=${readyFile?.name}, bytes=${readyFile?.length() ?: 0}, titulo='${bulletin.displayText}', restam ${bulletinBuffer.size})",
+        )
+        if (readyFile == null) {
+            Log.w(TAG_RADIO_VOICE, "boletim: item do buffer sem audio tocavel; cancelando entrada")
+            clearProtectedBulletinPlaybackFile(protectedReadyFile)
+            cancelEarlyNewsBreakIfPending()
+            return
         }
 
         speakingNews = true
@@ -4115,59 +3185,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // nao pode desmutar a radio sozinho.
         player.volume = radioVolume()
 
-        // Ponte curta antes do boletim (musica > passagem > boletim) - alterna entre as duas
-        // faixas, ver playPassagem(). Cobre os dois caminhos abaixo (audio pronto e fallback
-        // TTS Android) porque entra antes da bifurcacao.
-        playPassagem {
-            if (!speakingNews) return@playPassagem
-            if (readyFile != null && prepared != null) {
-                Log.d(TAG_RADIO_VOICE, "boletim: tocando audio do buffer arquivo=${readyFile.name} bytes=${readyFile.length()}")
-                playAnnouncementFile(
-                    readyFile,
-                    onError = { restoreBufferedBulletinToFront(prepared, "erro no MediaPlayer") },
-                ) {
-                    clearProtectedBulletinPlaybackFile(readyFile)
-                    finishNewsBreak()
-                }
-                armAnnouncementWatchdog()
-                return@playPassagem
-            }
-
-            if (radioVoiceState.value.isEnabled) {
-                Log.w(TAG_RADIO_VOICE, "boletim: sem audio pronto com voz ligada; cancelando TTS Android")
-                clearProtectedBulletinPlaybackFile(readyFile)
-                finishNewsBreak()
-                return@playPassagem
-            }
-
-            Log.d(TAG_RADIO_VOICE, "boletim: sem audio pronto e voz desligada; usando TTS Android")
-            val tts = textToSpeech
-            val accepted = if (tts != null && ttsReady) {
-                runCatching {
-                    tts.speak(bulletin.spokenText, TextToSpeech.QUEUE_FLUSH, null, NEWS_UTTERANCE_ID)
-                }.getOrDefault(TextToSpeech.ERROR)
-            } else {
-                TextToSpeech.ERROR
-            }
-            if (accepted != TextToSpeech.SUCCESS) {
-                Log.w(TAG_RADIO_VOICE, "tts fallback rejected bulletin - resuming playback")
-                clearProtectedBulletinPlaybackFile(readyFile)
-                finishNewsBreak()
-            } else {
-                Log.d(TAG_RADIO_VOICE, "boletim: falando via TTS Android")
-                armAnnouncementWatchdog()
-            }
+        // Sem passagem antes do boletim (pedido do usuario 16/09/2026): o audio baixado do
+        // feed remoto ja vem com sua propria transicao embutida (produzida pela central de
+        // broadcast) - tocar a passagem do app por cima duplicava a transicao.
+        Log.d(TAG_RADIO_VOICE, "boletim: tocando audio do buffer arquivo=${readyFile.name} bytes=${readyFile.length()}")
+        playAnnouncementFile(
+            readyFile,
+            onError = { restoreBufferedBulletinToFront(prepared, "erro no MediaPlayer") },
+        ) {
+            clearProtectedBulletinPlaybackFile(readyFile)
+            finishNewsBreak()
         }
-    }
-
-    // Passagem curta entre musica e boletim (e vice-versa) - roda em sequencia pelas faixas
-    // de PASSAGEM_RESOURCES (res/raw, ver vinhetas/README.md) pra nao repetir sempre a mesma.
-    // Reaproveita playVinhetaResource() (mesmo MediaPlayer.create de recurso, sem gap pra
-    // tocar em seguida). Volume reduzido -8dB (pedido do usuario, tocava alto demais).
-    private fun playPassagem(onFinished: () -> Unit) {
-        val resId = PASSAGEM_RESOURCES[nextPassagemIndex % PASSAGEM_RESOURCES.size]
-        nextPassagemIndex++
-        playVinhetaResource(resId, volume = PASSAGEM_VOLUME, onFinished)
+        armAnnouncementWatchdog()
     }
 
     private fun armAnnouncementWatchdog() {
@@ -4180,7 +3209,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             Log.w(TAG_RADIO_VOICE, "announcement watchdog fired - forcing playback resume")
             runCatching { announcementPlayer?.release() }
             announcementPlayer = null
-            runCatching { textToSpeech?.stop() }
             if (pendingVinheta) finishVinhetas(activeRadioName) else finishNewsBreak()
         }
     }
@@ -4202,83 +3230,25 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         if (!speakingNews || newsBreakEnding) return
         newsBreakEnding = true
         currentNewsHeadline = ""
-        // Ponte curta depois do boletim (boletim > passagem > musica) antes de retomar.
-        // speakingNews so vira false depois da passagem tocar - enquanto isso o watchdog
-        // (armAnnouncementWatchdog, disparado por playVinhetaResource) continua cobrindo essa
-        // janela, senao uma passagem travada nunca seria forcada a liberar a musica de volta.
-        playPassagem {
-            newsBreakEnding = false
-            speakingNews = false
-            if (resumeAfterNews) {
-                resumeAfterNews = false
-                // checkForEarlyNewsBreak() pausou a musica ~5s antes do fim dela pra dar lugar
-                // ao boletim (ver la) - retomar ela agora so tocaria esses ultimos segundos (ja
-                // silenciados pelo fade), entao pula direto pra proxima faixa da fila em vez de
-                // dar play na que acabou de "terminar".
-                val skipToNextTrack = newsBreakSkipsAheadOnResume
-                newsBreakSkipsAheadOnResume = false
-                viewModelScope.launch {
-                    if (skipToNextTrack) controller?.seekToNextMediaItem()
-                    controller?.play()
-                }
-            }
-            controller?.let { updatePlayerState(it) }
-        }
-    }
-
-    // So pros botoes de teste em Configuracoes: ao contrario do playAnnouncementFile do boletim
-    // ao vivo (que sempre apaga o WAV depois de tocar - ver RADIO_PIPELINE.md), este mantem o
-    // arquivo no disco pra permitir repetir o mesmo teste sem sintetizar de novo (pedido do
-    // usuario - sintese local pode levar bastante tempo, ver BULLETIN_PREP_TIMEOUT_MS).
-    private fun playTestAudio(file: java.io.File, onFinished: () -> Unit = {}) {
-        if (lastTestAudioFile != null && lastTestAudioFile != file) {
-            lastTestAudioFile?.delete()
-        }
-        lastTestAudioFile = file
-        announcementPlayer?.release()
-        announcementPlayer = null
-        runCatching {
-            MediaPlayer().apply {
-                setDataSource(file.absolutePath)
-                setOnCompletionListener {
-                    it.release()
-                    if (announcementPlayer === it) announcementPlayer = null
-                    onFinished()
-                }
-                setOnErrorListener { player, _, _ ->
-                    player.release()
-                    if (announcementPlayer === player) announcementPlayer = null
-                    onFinished()
-                    true
-                }
-                prepare()
-                start()
-                announcementPlayer = this
-            }
-        }.onFailure { onFinished() }
-    }
-
-    // Toca a passagem antes e depois, igual o boletim ao vivo (speakNextNewsBreak/
-    // finishNewsBreak) - pedido do usuario pra poder ouvir o teste exatamente como sai na
-    // radio de verdade, nao so a voz pelada.
-    private fun playTestAudioWithPassagem(file: java.io.File, onFinished: () -> Unit = {}) {
-        playPassagem {
-            playTestAudio(file) {
-                playPassagem { onFinished() }
+        // Sem passagem depois do boletim (pedido do usuario 16/09/2026, mesmo motivo do
+        // lado de entrada em speakNextNewsBreak) - retoma a musica direto assim que o audio
+        // do boletim termina.
+        newsBreakEnding = false
+        speakingNews = false
+        if (resumeAfterNews) {
+            resumeAfterNews = false
+            // checkForEarlyNewsBreak() pausou a musica ~5s antes do fim dela pra dar lugar
+            // ao boletim (ver la) - retomar ela agora so tocaria esses ultimos segundos (ja
+            // silenciados pelo fade), entao pula direto pra proxima faixa da fila em vez de
+            // dar play na que acabou de "terminar".
+            val skipToNextTrack = newsBreakSkipsAheadOnResume
+            newsBreakSkipsAheadOnResume = false
+            viewModelScope.launch {
+                if (skipToNextTrack) controller?.seekToNextMediaItem()
+                controller?.play()
             }
         }
-    }
-
-    fun replayLastTestAudio() {
-        val file = lastTestAudioFile
-        if (file == null || !file.exists()) {
-            radioVoiceState.value = radioVoiceState.value.copy(
-                message = "Nenhum audio de teste pra repetir, gere um teste primeiro.",
-                canReplayTest = false,
-            )
-            return
-        }
-        playTestAudioWithPassagem(file)
+        controller?.let { updatePlayerState(it) }
     }
 
     // Toca o boletim pronto na posicao `index` do buffer direto na tela de Configuracoes, sem
@@ -4385,166 +3355,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             onFinished()
         }
     }
-
-    // Tenta o motor experimental Gemini Flash TTS ANTES do sistema atual, so quando o usuario
-    // ligou isso em Configuracoes (ver RadioBulletinSettings.ttsProvider/RadioBulletinTts.kt,
-    // pedido do usuario 10/09/2026). Retorna null pra QUALQUER motivo (provider != GEMINI_FLASH,
-    // sem chave, timeout, erro HTTP, resposta invalida, decode falhando) - o caller (synthesize
-    // LocalVoiceSafely/synthesizeCoreVoiceSafely abaixo) sempre cai pro sistema atual nesse caso,
-    // o boletim nunca fica sem audio por causa desse experimento. `timeoutMs` e o MESMO orcamento
-    // que o caller ja receberia pro motor local (BULLETIN_PREP_TIMEOUT_MS em uso real) - nao
-    // inventa um teto novo, so limita o total gasto tentando o Gemini antes de desistir.
-    private suspend fun trySynthesizeWithGeminiFlash(
-        script: RadioScript,
-        persistent: Boolean,
-        timeoutMs: Long,
-        onProgress: (String) -> Unit,
-        onProgressPercent: (Int) -> Unit,
-    ): File? {
-        val settings = radioBulletinState.value.settings
-        if (settings.ttsProvider != BulletinTtsProvider.GEMINI_FLASH) return null
-        return runCatching {
-            withTimeoutOrNull(timeoutMs) {
-                // index/total nao e mais progresso POR FALA (10/09/2026: virou 1 chamada
-                // multi-speaker pro boletim inteiro, ver GeminiFlashTtsEngine.synthesize) - so
-                // dispara com (0, total) antes de mandar a requisicao e (total, total) quando ela
-                // volta, entao a mensagem fica generica em vez de "fala X de Y".
-                geminiFlashTtsEngine.synthesize(script, settings.ttsModel, persistent) { index, total ->
-                    val message = if (index >= total) "Sintetizando vozes (Gemini): finalizando..." else "Sintetizando vozes (Gemini): gerando áudio do boletim..."
-                    onProgress(message)
-                    if (total > 0) onProgressPercent(index * 100 / total)
-                }
-            }
-        }.onFailure {
-            Log.w(TAG_RADIO_VOICE, "GeminiTTS: falling back to current TTS", it)
-        }.getOrNull()
-    }
-
-    private suspend fun requestLocalVoiceSynthesis(
-        script: RadioScript,
-        timeoutMs: Long,
-        onProgress: (String) -> Unit = {},
-        onProgressPercent: (Int) -> Unit = {},
-    ): LocalVoiceSynthesisResult? =
-        requestVoiceSynthesis(timeoutMs, "full lines=${script.lines.size}", onProgress, onProgressPercent) { context, receiver, requestId ->
-            RadioVoiceSynthesisService.intent(context, script, receiver, requestId)
-        }
-
-    // Buffer do boletim (ver refillBulletinBuffer) - o audio vai pra filesDir (nao cacheDir
-    // efemero), pra sobreviver a reinicio do app/processo (ver
-    // LocalRadioVoiceEngine.synthesizeCore/loadCoreBufferManifest).
-    private suspend fun synthesizeCoreVoiceSafely(
-        script: RadioScript,
-        timeoutMs: Long = LOCAL_VOICE_TIMEOUT_MS,
-        onProgress: (String) -> Unit = {},
-        onProgressPercent: (Int) -> Unit = {},
-    ): VoiceSynthesisOutcome {
-        trySynthesizeWithGeminiFlash(script, persistent = true, timeoutMs, onProgress, onProgressPercent)
-            ?.let { return VoiceSynthesisOutcome(it, fromGemini = true) }
-        val file = requestVoiceSynthesis(timeoutMs, "core lines=${script.lines.size}", onProgress, onProgressPercent) { context, receiver, requestId ->
-            RadioVoiceSynthesisService.persistentIntent(context, script, receiver, requestId)
-        }?.file
-        return VoiceSynthesisOutcome(file, fromGemini = false)
-    }
-
-    // Base compartilhada por requestLocalVoiceSynthesis/synthesizeCoreVoiceSafely - so muda o
-    // Intent que dispara o RadioVoiceSynthesisService, o protocolo de resposta (ResultReceiver,
-    // progresso, timeout) e o mesmo. onProgressPercent e separado de onProgress (nao muda a
-    // assinatura usada pelos testes de Configuracoes) - so quem quiser o numero
-    // (refillBulletinBuffer, pedido do usuario 03/09/2026) passa os dois; index/total por fala ja
-    // vem do RadioVoiceSynthesisService (RESULT_PROGRESS), so nao ha stage sem numero real aqui.
-    private suspend fun requestVoiceSynthesis(
-        timeoutMs: Long,
-        logLabel: String,
-        onProgress: (String) -> Unit,
-        onProgressPercent: (Int) -> Unit = {},
-        buildIntent: (Context, ResultReceiver, requestId: Long) -> Intent,
-    ): LocalVoiceSynthesisResult? =
-        withTimeoutOrNull(timeoutMs) {
-            suspendCancellableCoroutine { continuation ->
-                val context = getApplication<Application>()
-                val startedAt = System.currentTimeMillis()
-                // Identifica esse pedido pro servico isolado poder cancelar SO ele se a gente
-                // desistir de esperar (ver invokeOnCancellation abaixo) - pedido do usuario
-                // (09/09/2026): sem isso, desistir da espera (timeout, boletim descartado) nao
-                // parava a sintese de verdade no processo isolado, que continuava rodando sozinha
-                // e disputando CPU com o proximo pedido (achado em campo: boletim cancelado ainda
-                // sintetizando quando o seguinte comecava).
-                val requestId = voiceRequestIdCounter.incrementAndGet()
-                val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
-                    override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-                        if (!continuation.isActive) return
-                        if (resultCode == RadioVoiceSynthesisService.RESULT_PROGRESS) {
-                            val index = resultData?.getInt(RadioVoiceSynthesisService.EXTRA_PROGRESS_INDEX) ?: 0
-                            val total = resultData?.getInt(RadioVoiceSynthesisService.EXTRA_PROGRESS_TOTAL) ?: 0
-                            Log.d(TAG_RADIO_VOICE, "voice progress $index/$total")
-                            onProgress("Sintetizando vozes: fala $index de $total...")
-                            if (total > 0) onProgressPercent(index * 100 / total)
-                            return
-                        }
-                        val elapsedMs = resultData
-                            ?.getLong(RadioVoiceSynthesisService.EXTRA_ELAPSED_MS, 0L)
-                            ?.takeIf { it > 0L }
-                            ?: (System.currentTimeMillis() - startedAt)
-                        val detail = resultData
-                            ?.getString(RadioVoiceSynthesisService.EXTRA_DETAIL)
-                            .orEmpty()
-                        val file = resultData
-                            ?.getString(RadioVoiceSynthesisService.EXTRA_OUTPUT_PATH)
-                            ?.let(::File)
-                            ?.takeIf { it.exists() && it.length() > 44 }
-                        val result = if (resultCode == RadioVoiceSynthesisService.RESULT_OK && file != null) {
-                            LocalVoiceSynthesisResult(
-                                file = file,
-                                detail = detail.ifBlank { "Audio local gerado." },
-                                elapsedMs = elapsedMs,
-                            )
-                        } else {
-                            LocalVoiceSynthesisResult(
-                                file = null,
-                                detail = detail.ifBlank { "Servico de voz nao gerou audio." },
-                                elapsedMs = elapsedMs,
-                            )
-                        }
-                        Log.d(
-                            TAG_RADIO_VOICE,
-                            "voice result code=$resultCode detail='${result.detail}' elapsed=${result.elapsedMs}ms file=${file?.length() ?: 0}",
-                        )
-                        continuation.resume(result)
-                    }
-                }
-                Log.d(TAG_RADIO_VOICE, "request voice $logLabel timeout=${timeoutMs}ms requestId=$requestId")
-                continuation.invokeOnCancellation {
-                    Log.w(TAG_RADIO_VOICE, "voice request cancelled after ${System.currentTimeMillis() - startedAt}ms requestId=$requestId")
-                    runCatching {
-                        context.startService(RadioVoiceSynthesisService.cancelIntent(context, requestId))
-                    }.onFailure {
-                        Log.w(TAG_RADIO_VOICE, "failed to send cancel to voice service requestId=$requestId", it)
-                    }
-                }
-                runCatching {
-                    context.startService(buildIntent(context, receiver, requestId))
-                }.onFailure {
-                    Log.e(TAG_RADIO_VOICE, "failed to start local voice service", it)
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            LocalVoiceSynthesisResult(
-                                file = null,
-                                detail = "Nao consegui iniciar o servico de voz local: ${it.message.orEmpty()}",
-                                elapsedMs = System.currentTimeMillis() - startedAt,
-                            ),
-                        )
-                    }
-                }
-            }
-        }
-
-    private fun String.toSingleLineScript(): RadioScript =
-        RadioScript(
-            story = com.pailer.localtune.data.NewsStory(title = this, source = "Pailer FM"),
-            source = RadioScriptSource.Fallback,
-            lines = listOf(RadioScriptLine(RadioSpeaker.Female, this)),
-        )
 
     private fun connectToPlaybackService() {
         val context = getApplication<Application>()
@@ -4948,9 +3758,6 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controllerFuture?.let(MediaController::releaseFuture)
         announcementPlayer?.release()
         previewPlayer?.release()
-        lastTestAudioFile?.delete()
-        textToSpeech?.stop()
-        textToSpeech?.shutdown()
         controller = null
         super.onCleared()
     }
@@ -4967,33 +3774,15 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_PROFILE_PHOTO_PATH = "profile_photo_path"
         const val PROFILE_PHOTO_FILE_NAME = "profile.jpg"
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
-        const val KEY_RADIO_BULLETIN_LOCAL_WRITER = "radio_bulletin_local_writer"
-        const val KEY_RADIO_BULLETIN_CLOUD_WRITER = "radio_bulletin_cloud_writer"
-        const val KEY_RADIO_BULLETIN_TTS_PROVIDER = "radio_bulletin_tts_provider"
-        const val KEY_RADIO_BULLETIN_TTS_MODEL = "radio_bulletin_tts_model"
-        const val KEY_RADIO_VOICE_ENABLED = "radio_voice_enabled"
         const val KEY_RECENT_BULLETIN_STORY_KEYS = "recent_bulletin_story_keys"
-        const val RADIO_WRITER_DRIVE_FILE_ID = "1n_wXv28L61dGM0oH0DyhPKbi71VsBe8F"
-        const val RADIO_VOICE_DRIVE_FILE_ID = "1kYRm3Yy4STSGwo_X-mHbuCdiBinnNPco"
-        const val RADIO_WRITER_DOWNLOAD_FILE_NAME = "redator_local.zip"
-        const val RADIO_VOICE_DOWNLOAD_FILE_NAME = "pacote_de_vozes.zip"
-        const val RADIO_WRITER_DOWNLOAD_MAX_BYTES = 3000L * 1024L * 1024L
-        const val RADIO_VOICE_DOWNLOAD_MAX_BYTES = 350L * 1024L * 1024L
         const val DOWNLOAD_PROGRESS_STEP_BYTES = 2L * 1024L * 1024L
         const val DOWNLOAD_PROGRESS_STEP_MS = 700L
         const val CORE_BUFFER_MANIFEST_FILE = "manifest.json"
-        const val CLOUD_SCRIPT_BUFFER_MANIFEST_FILE = "cloud_script_buffer.json"
-        // Pausa entre boletins consecutivos do preparo automatico pra deixar o SoC esfriar - ver
-        // comentario em refillBulletinBuffer. Status atualiza a cada COOLDOWN_STATUS_TICK_MS pra
-        // usuario acompanhar a contagem regressiva.
-        // Reduzido de 180s pra 60s (06/09/2026, pedido do usuario) - com o cache de prefixo do
-        // redator local (ver LocalLlamaTextGenerator/ensurePrefixCacheNative), o prefill caiu de
-        // ~230s pra ~30s por boletim, entao o mesmo throttling termico que motivou os 180s
-        // originais (ADR-020, medido ANTES do cache existir) deve pesar menos agora. Ainda existe
-        // risco de acumular calor em sessoes longas - se voltar a aparecer throttling visivel
-        // (decode caindo bem abaixo de ~2 tok/s), subir esse valor de novo.
-        const val COOLDOWN_BETWEEN_BULLETINS_MS = 60_000L
-        const val COOLDOWN_STATUS_TICK_MS = 15_000L
+        // Movidos de LocalRadioVoiceEngine (removida 16/09/2026 junto da sintese de voz local) -
+        // CORE_BUFFER_DIR_NAME ainda e o destino dos .wav baixados do feed remoto
+        // (BroadcastFeedRepository), WAV_HEADER_SIZE ainda valida esses arquivos.
+        const val CORE_BUFFER_DIR_NAME = "radio_bulletins_ready"
+        const val WAV_HEADER_SIZE = 44
         // Respiro antes de scheduleFallbackAutoFix() tentar de novo sozinho (ver fixFallbackBulletins)
         // - evita loop apertado batendo no Gemini/redator local sem parar quando a causa da falha
         // (sem internet, chave invalida, os dois writers fora do ar) ainda nao se resolveu; da
@@ -5002,36 +3791,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val MAX_HISTORY_ITEMS = 80
         const val POSITION_SAVE_INTERVAL_MS = 3000L
         const val RADIO_BULLETIN_DEFAULT_INTERVAL = 3
-        const val TTS_READY_WAIT_STEPS = 10
-        const val TTS_READY_WAIT_INTERVAL_MS = 180L
-        const val LOCAL_VOICE_TIMEOUT_MS = 12_000L
-        // Pre-geracao roda em segundo plano durante a musica anterior ao boletim (minutos
-        // disponiveis), entao pode esperar bem mais que o timeout usado na hora H do boletim.
-        // Historico Piper/Kokoro (obsoleto, motor trocado pra Supertonic): ~60-65s e ~152s
-        // respectivamente - valores abaixo nao se aplicam mais.
-        // Atualizacao (03/09/2026): com Supertonic o timeout de 175s estava CORTANDO a sintese
-        // em segundo plano antes de terminar (log de campo mostrou 410s com numThreads=2 /
-        // 496s com numThreads=4, RTF≈5,6 no aparelho) -
-        // o boletim ao vivo caia sistematicamente pro fallback TTS do Android mesmo com buffer
-        // (BULLETIN_BUFFER_TARGET) tendo musicas de sobra pra preparar, porque quem matava o job
-        // era esse timeout, nao falta de tempo real. Subido pro mesmo teto do teste (600s), depois
-        // pra 660s (11min, pedido do usuario 03/09/2026) pra dar mais folga ao redator local
-        // terminar sem estourar e cair no fallback deterministico (que usa frase fixa - ver
-        // FallbackRadioScriptWriter) - folga aqui nao custa nada, roda em segundo plano.
-        // Subido de novo, 660s pra 1200s/20min (09/09/2026): desde que o boletim virou
-        // radio-agnostico (ver refillBulletinBuffer/synthesizeCoreVoiceSafely), essa MESMA chamada
-        // sintetiza as 6 falas completas + bed de uma vez, em vez de so 2 falas rapidas no
-        // encaixe por radio - achado em campo: 660001ms medido, TERMINOU DE SINTETIZAR (progress
-        // 6/6) mas foi cortado 1ms DEPOIS do teto, perdendo um boletim inteiro ja pronto. Aparelho
-        // tambem estava com throttling termico visivel na hora (linhas de ate 220s cada, bem acima
-        // do normal) - a folga extra cobre tanto o trabalho a mais quanto sessoes de throttling.
-        const val BULLETIN_PREP_TIMEOUT_MS = 1_200_000L
 
-        // Quantos boletins prontos (roteiro + audio, se a voz local estiver ligada) o app
-        // mantem em reserva o tempo todo - ver refillBulletinBuffer()/ADR-019. Preparo roda um
-        // de cada vez em segundo plano bem antes de precisar, entao BULLETIN_PREP_TIMEOUT_MS
-        // acima deixou de ser um aperto real (so importa se o consumo for mais rapido que o
-        // preparo consegue repor, ex.: songsBetweenBulletins = 1).
+        // Quantos boletins aprovados o app mantem baixados em reserva o tempo todo - ver
+        // refillBulletinBuffer()/ADR-019. So importa se o consumo for mais rapido que o feed
+        // remoto consegue repor (ex.: songsBetweenBulletins = 1).
         // Subido de 3 pra 5 (pedido do usuario 04/09/2026, junto da diversificacao de feeds em
         // NewsBulletinRepository) - mais folga de boletins prontos pra cobrir a variedade nova
         // de temas sem esbarrar em timeout de preparo. Ver ADR-021.
@@ -5039,21 +3802,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // do boletim ficar 100% radio-agnostico. Buffer UNICO (unificado 10/09/2026, ver
         // comentario em bulletinBuffer) - 10 e o estoque real, nao 10 por "nivel".
         const val BULLETIN_BUFFER_TARGET = 10
-        const val CLOUD_SCRIPT_BATCH_SIZE = 10
-        const val CLOUD_SCRIPT_BUFFER_TARGET = 20
-        const val CLOUD_SCRIPT_BUFFER_REFILL_THRESHOLD = 10
         const val RECENT_BULLETIN_STORY_KEY_LIMIT = 80
 
-        // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() (achado ao
-        // vivo 10/09/2026) - maior que o pior caso ja observado de uma sintese em andamento (~90s
-        // com a cota do Gemini no talo, retry por ate 8 chaves) com folga generosa.
-        const val ORPHAN_CLEANUP_GRACE_MS = 5 * 60 * 1000L
+        // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() - so precisa
+        // cobrir um download do feed remoto em andamento (REMOTE_FEED_TIMEOUT_MS, 15s) com folga;
+        // reduzido de 5min pra 1min em 16/09/2026 junto da remocao da sintese local/Gemini (que
+        // podia levar ate 10min no pior caso).
+        const val ORPHAN_CLEANUP_GRACE_MS = 60 * 1000L
 
-        // ~-5.2dB em amplitude linear (10^(-5.2/20)) - subido de 0.398 (-8dB, pedido do usuario
-        // 02/09/2026 porque tocava alto demais) pra 0.55 (pedido do usuario 09/09/2026: "aumenta
-        // um pouco o volume das transicoes").
-        const val PASSAGEM_VOLUME = 0.55f
-        val PASSAGEM_RESOURCES = listOf(R.raw.passagem_1, R.raw.passagem_2, R.raw.passagem_3)
         // Vinhetas de despedida ao sair de uma radio (pedido do usuario 15/09/2026) - alternam
         // em sequencia a cada uso, ver playExitVinheta()/nextExitVinhetaIndex. Tocam no volume
         // cheio (1.0, igual radio_intro/complemento de genero), nao no volume reduzido das
@@ -5071,17 +3827,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // faixa mesmo com o jitter do polling de posicao (ver init{} no topo da classe).
         const val NEWS_BREAK_LEAD_MS = 5_000L
         const val NEWS_BREAK_FADE_MS = 2_500L
-        const val LOCAL_VOICE_TEST_TIMEOUT_MS = 35_000L
-        // 1 chamada multi-speaker (10/09/2026: nao e mais por fala, ver
-        // GeminiFlashTtsEngine.synthesize) x ate GeminiApiKeySettings.MAX_KEYS (8, subiu de 5 no
-        // mesmo dia - pedido do usuario) tentativas x GEMINI_TTS_TIMEOUT_MS (120s,
-        // GeminiFlashTtsEngine) - sem folga extra, cobre exatamente o pior caso (todas as 8
-        // chaves demorando o maximo antes de falhar), sem travar o botao de teste indefinidamente.
-        const val GEMINI_TTS_TEST_TIMEOUT_MS = 960_000L
-        const val ANDROID_VOICE_TEST_TIMEOUT_MS = 25_000L
+        // Rede folgada (Wi-Fi ruim, DNS lento) alem do timeout interno de 12s do
+        // BroadcastFeedRepository - ver comentario no ponto de chamada em refillBulletinBuffer.
+        const val REMOTE_FEED_TIMEOUT_MS = 15_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val TAG_REMOTE_PLAYBACK = "PailerRemote"
-        const val NEWS_UTTERANCE_ID = "pailer_player_news_break"
 
         // Chave = nome da radio normalizado (lowercase, so letras/digitos) — ver
         // normalizeRadioKey(). Nomes vem de MusicLibraryRepository (GENRE_DISPLAY_NAMES e

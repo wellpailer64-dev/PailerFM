@@ -5,10 +5,15 @@
 > O app já funciona e está em uso diário. Nada de "clean architecture deluxe" que mate a rádio no processo.
 
 App Android pessoal de música local que simula uma **rádio FM**: fila de músicas com
-abertura em vinheta gravada e boletins de notícia narrados por locutores virtuais
-(TTS 100% offline).
+abertura em vinheta gravada e boletins de notícia narrados por locutores virtuais.
 
-Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [TTS](TTS.md) · [STATE_MACHINE](STATE_MACHINE.md) · [APP_FOLDER](APP_FOLDER.md) · [DECISIONS](DECISIONS.md) · [TODO](TODO.md) · [RELEASE](RELEASE.md)
+**16/09/2026:** o boletim deixou de ser gerado dentro do app. Redator (local/Gemini),
+busca de RSS e síntese de voz (local/Gemini/TTS Android) foram removidos - hoje o app só
+baixa boletins já prontos (roteiro + áudio) de um feed publicado por uma central de
+broadcast externa (`BroadcastFeedRepository`). Ver ADR-034/ADR-035 em
+[DECISIONS.md](DECISIONS.md) e a seção "Feed remoto" em [RADIO_PIPELINE.md](RADIO_PIPELINE.md).
+
+Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [BROADCAST_METADATA](BROADCAST_METADATA.md) · [BROADCAST_LOCAL_WORKBENCH](BROADCAST_LOCAL_WORKBENCH.md) · [STATE_MACHINE](STATE_MACHINE.md) · [APP_FOLDER](APP_FOLDER.md) · [DECISIONS](DECISIONS.md) · [TODO](TODO.md) · [RELEASE](RELEASE.md)
 
 ## Stack
 
@@ -17,8 +22,7 @@ Outros docs: [RADIO_PIPELINE](RADIO_PIPELINE.md) · [TTS](TTS.md) · [STATE_MACH
 | Linguagem | Kotlin, coroutines |
 | UI | Jetpack Compose (BOM 2024.06.00), Material 3, Navigation Compose |
 | Áudio | Media3 / ExoPlayer 1.3.1 (`MediaSessionService`) |
-| TTS offline | sherpa-onnx (`app/libs/sherpa-onnx-static-link-onnxruntime-1.13.6.aar`), motores VITS/Piper/Kokoro/Supertonic |
-| Fallback de voz | `android.speech.tts.TextToSpeech` (TTS do sistema, pt-BR) |
+| Boletim | `BroadcastFeedRepository` baixa `.wav` + roteiro prontos de um feed Cloudflare (`HttpURLConnection` puro) |
 | Metadados | jaudiotagger 3.0.1 + MediaStore |
 | Build | compileSdk 34, targetSdk 33, minSdk 26, ABI `arm64-v8a`, JVM 17 |
 
@@ -31,16 +35,13 @@ app/src/main/java/com/pailer/localtune/
 │   ├── LocalTuneApp.kt              # TODAS as telas (~3.4k linhas — monólito conhecido)
 │   └── theme/Theme.kt
 ├── player/
-│   ├── LocalTuneViewModel.kt        # hub de estado (~1.5k linhas — monólito conhecido)
-│   ├── MusicPlaybackService.kt      # MediaSessionService + ExoPlayer + ações do widget
-│   ├── RadioVoiceSynthesisService.kt# síntese TTS em processo separado (:radio_voice)
-│   └── LocalRadioVoiceEngine.kt     # wrapper sherpa-onnx OfflineTts + escritor WAV manual
+│   ├── LocalTuneViewModel.kt        # hub de estado (~3.7k linhas — monólito conhecido)
+│   └── MusicPlaybackService.kt      # MediaSessionService + ExoPlayer + ações do widget
 ├── data/
 │   ├── LocalSong.kt                 # modelos (LocalSong, LocalAlbum, LocalArtist, LocalRadio)
 │   ├── MusicLibraryRepository.kt    # MediaStore + cache JSON + rádios + overrides de metadado
-│   ├── RadioBulletin.kt             # roteiros de boletim + writers (fallback / LLM opcional)
-│   ├── NewsBulletinRepository.kt    # manchetes via RSS (g1)
-│   ├── RadioVoicePackageRepository.kt # pacote .zip de vozes: import, validação, manifest
+│   ├── RadioBulletin.kt             # data classes do roteiro (RadioScript/RadioScriptLine/...)
+│   ├── BroadcastFeedRepository.kt   # baixa boletim aprovado (roteiro+audio) do feed Cloudflare
 │   └── AlbumGenreSuggestionRepository.kt
 ├── util/
 │   └── DayPeriod.kt                 # manhã/tarde/noite por hora, compartilhado UI + widget
@@ -52,17 +53,16 @@ app/src/main/java/com/pailer/localtune/
 
 ### Responsabilidades por arquivo
 
-- **LocalTuneViewModel** — dono de todo estado observável pela UI (6 `mutableStateOf`:
+- **LocalTuneViewModel** — dono de todo estado observável pela UI (`mutableStateOf`:
   `LibraryUiState`, `LibraryContentUiState`, `PlayerUiState`, `MetadataUiState`,
-  `RadioBulletinUiState`, `RadioVoiceUiState`). Conecta ao `MediaController`, coordena
-  modo rádio, boletins, metadados e favoritos.
+  `RadioBulletinUiState`, `RadioBulletinBufferUiState`). Conecta ao `MediaController`,
+  coordena modo rádio, boletins, metadados e favoritos.
 - **MusicPlaybackService** — `MediaSessionService`: cria o `ExoPlayer`, expõe a sessão
   (notificação/lockscreen), trata ações PLAY_PAUSE/NEXT/PREVIOUS vindas dos widgets e
   re-renderiza os widgets a cada evento do player.
-- **RadioVoiceSynthesisService** — roda no processo `:radio_voice`. Recebe um script por
-  Intent (+ `ResultReceiver`), sintetiza e devolve caminho de WAV. Ver [TTS.md](TTS.md).
-- **LocalRadioVoiceEngine** — carrega `OfflineTts` conforme o motor do pacote, gera as falas,
-  concatena amostras com gaps de silêncio e escreve o WAV à mão.
+- **BroadcastFeedRepository** — lê o `manifest.json` publicado pela central de broadcast
+  externa, baixa o próximo boletim aprovado ainda não usado (roteiro + `.wav`), valida
+  tamanho/hash. Única fonte de conteúdo de boletim hoje - ver [RADIO_PIPELINE.md](RADIO_PIPELINE.md).
 - **Repositórios** (`data/`) — sem estado global compartilhado; I/O em `Dispatchers.IO`.
 
 ## Fluxos principais
@@ -101,21 +101,21 @@ library_cache.json ◄───────────────────�
   "Rádio recente". Sessões evitam repetir a sequência anterior
   (ver [RADIO_PIPELINE.md](RADIO_PIPELINE.md)).
 
-### Voz local
+### Boletim (feed remoto)
 
 ```
-ViewModel ── startService(Intent + texts/speakers + ResultReceiver) ──► :radio_voice
-                                                              RadioVoiceSynthesisService
+refillBulletinBuffer() ── BroadcastFeedRepository.downloadNextApprovedBulletin() ──► Cloudflare
                                                                        │
-                                                        LocalRadioVoiceEngine (sherpa)
+                                                    baixa .wav + roteiro, valida tamanho/hash
                                                                        │
-        ViewModel ◄──── ResultReceiver(path do WAV, detail, elapsed) ──┘
-             │
-             ▼
-     MediaPlayer toca o WAV (anúncio) e deleta o arquivo ao terminar
+                                              bulletinBuffer.addLast(PreparedBulletin)
+                                                                       │
+                                                                       ▼
+                                     MediaPlayer toca o WAV (anúncio) e deleta ao terminar
 ```
 
-Detalhes completos: [TTS.md](TTS.md).
+Sem boletim aprovado novo, a vaga do buffer fica vazia e a rádio simplesmente não insere
+boletim naquele intervalo - sem alternativa. Detalhes completos: [RADIO_PIPELINE.md](RADIO_PIPELINE.md).
 
 ### Vinhetas de abertura da rádio
 
@@ -135,18 +135,13 @@ música de uma sessão nova. Mapa rádio → complemento:
 | `SharedPreferences("metadata_overrides")` | correções de tag e unificações de artista |
 | `filesDir/library_cache.json` | cache da biblioteca |
 | `filesDir/lyrics/<songId>.lrc` + `index.json` | letras (colada/editada, tag embutida cacheada, LRCLIB) — ADR-023 |
-| `filesDir/radio_voice_package/` + `package.ready` | pacote de voz instalado |
-| `filesDir/radio_voice_import/` | temporário durante import do .zip |
-| `cacheDir/radio_voice_*.wav` | áudio dos anúncios (deletado após tocar) |
+| `filesDir/radio_bulletins_ready/` + `manifest.json` | buffer de boletins baixados do feed remoto (roteiro + `.wav`) |
 
 ## Pontos de atenção conhecidos (não são bugs novos, são dívida documentada)
 
-1. **Monólitos**: `LocalTuneApp.kt` (~3.4k linhas) e `LocalTuneViewModel.kt` (~1.5k linhas).
+1. **Monólitos**: `LocalTuneApp.kt` (~8.9k linhas) e `LocalTuneViewModel.kt` (~3.7k linhas).
    Split planejado — ver [TODO.md](TODO.md).
-2. **Estado do boletim em vars soltas** (`speakingNews`, `resumeAfterNews`,
-   `nextBulletinIndex`, ...) com races conhecidas — catalogadas em
-   [STATE_MACHINE.md](STATE_MACHINE.md).
-3. **Engine TTS recarregado a cada request** (sem cache persistente entre boletins) e
-   requests simultâneos no serviço não serializados — ver [DECISIONS.md](DECISIONS.md) ADR-003.
-4. **Sem testes automatizados**. As funções puras (limites de palavras, filtros,
-   anti-repetição de sessão) são os primeiros alvos quando isso mudar.
+2. **Estado do boletim em vars soltas** (`speakingNews`, `resumeAfterNews`, ...) com races
+   conhecidas — catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md).
+3. **Sem testes automatizados**. As funções puras (anti-repetição de sessão, normalização
+   de chave de dedup do feed remoto) são os primeiros alvos quando isso mudar.

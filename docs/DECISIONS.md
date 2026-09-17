@@ -1722,3 +1722,132 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   a alternativa seria voltar a distribuir por link/WhatsApp manual (fluxo de antes) ou
   montar um backend/proxy autenticado só pra expor a info de release (fora de escopo por
   ora, não implementado).
+
+## ADR-034 — Feed remoto de boletins aprovados (Cloudflare) vira fonte prioritária do buffer
+
+- **Contexto:** a central local de broadcast (`_broadcast-boletins-local/`, ver
+  [CONTROL_PANEL.md](../_broadcast-boletins-local/CONTROL_PANEL.md)) já produz boletins,
+  passa por revisão humana e, ao aprovar, publica um feed estático
+  (`manifest.json` + áudio `.wav` + roteiro `.json`) num Cloudflare Worker
+  (`pailer-fm-boletins.well-pailer64.workers.dev`) via botão `Publicar Cloudflare` /
+  Wrangler (16/09/2026). Até aqui, esse feed não tinha nenhum consumidor: o app
+  continuava gerando todo boletim sozinho (RSS → redator → síntese local/Gemini).
+  Pedido do usuário: fechar o circuito - o que é aprovado na central deve chegar tocável
+  no app sem passar de novo por redator/síntese.
+- **Decisão:** novo `BroadcastFeedRepository` (`data/BroadcastFeedRepository.kt`) que lê o
+  `manifest.json` publicado e, para o primeiro item `status == "approved"` ainda não
+  reservado no buffer local (mesma chave de dedup de `currentReservedBulletinStoryKeys()`,
+  normalizada por `normalizedRemoteKey()` - acento/pontuação não contam como boletim
+  diferente), baixa o `.wav` e o roteiro (`script.path`) para `coreBufferDir` (a mesma
+  pasta persistente do buffer atual, sobrevive a reinício do app). Confere o áudio baixado
+  por tamanho (`bytes`) e, se o manifest trouxer, por `sha256`, antes de aceitar o arquivo
+  como usável; sem roteiro publicado, cai numa única fala de fallback ("Boletim aprovado
+  da Pailer FM: <título>"). Novo `RadioScriptSource.BroadcastFeed` (`RadioBulletin.kt`)
+  marca a origem para instrumentação/depuração futura.
+- **Prioridade no buffer:** em `refillBulletinBuffer()` (`LocalTuneViewModel.kt`), cada
+  vaga livre tenta primeiro `broadcastFeedRepository.downloadNextApprovedBulletin()` antes
+  de gastar RSS/redator/síntese local. Um flag local por rodada
+  (`remoteFeedExhaustedThisPass`) evita bater na rede de novo assim que o feed volta vazio
+  nessa passagem - as vagas restantes seguem direto pro caminho local (RSS → redator →
+  síntese), sem esperar timeout de rede a cada item. Item aprovado entra no buffer como
+  `PreparedBulletin` normal (`scriptFromGemini = false`, `voiceFromGemini = false` - o
+  trabalho de redação/voz já foi feito na central, não na nuvem) e participa do
+  `dequeueBufferedBulletinForPlayback()` e da limpeza de órfãos igual qualquer outro item.
+- **Falha segura:** qualquer erro de rede/parse em `downloadNextApprovedBulletin()` é
+  capturado (`runCatching` + log `PailerBroadcastFeed`) e devolve `null` - o app nunca
+  trava nem mostra erro pro usuário final, só segue pro preparo local normal. Isso também
+  cobre o caso de feed remoto indisponível quando RSS também falhou: antes, buffer vazio +
+  RSS vazio desistia da rodada; agora só desiste depois de tentar o feed remoto também.
+- **Não mudar sem avisar antes:** o feed é só leitura (GET, sem token/autenticação) - a
+  central publica, o app só consome. Se a URL do Worker mudar (novo domínio/projeto
+  Cloudflare), atualizar `BASE_URL`/`MANIFEST_URL` em `BroadcastFeedRepository.kt`.
+
+## ADR-035 — Dois bugs reais do feed remoto corrigidos ao vivo + remoção total do redator/voz local
+
+- **Contexto:** no dia seguinte à ADR-034 (16/09/2026), o usuário testou o feed remoto no
+  aparelho de verdade (celular plugado, `adb logcat` acompanhando). Dois bugs apareceram
+  na prática, ambos corrigidos na hora. Logo depois, o usuário decidiu que TUDO relacionado
+  a gerar boletim dentro do app (redator local/Gemini, voz local/Gemini, RSS, TTS Android)
+  devia sair - a central de broadcast externa já cobre esse trabalho por completo agora.
+- **Bug 1 - dedup de `reservationKey` quebrada em `BroadcastFeedRepository.kt`:** a chave
+  era montada normalizando a string `"fonte|título"` INTEIRA de uma vez
+  (`normalizedRemoteKey()`, que troca todo caractere não-alfanumérico por espaço) - o `|`
+  separador virava espaço junto com os outros, produzindo uma chave sem delimitador
+  nenhum entre as duas partes. `RadioScript.newsReservationKey()` (LocalTuneViewModel.kt)
+  normaliza fonte e título SEPARADAMENTE e só depois junta com `|` literal - os dois
+  formatos nunca batiam, então a comparação `reservationKey in reservedKeys` nunca dava
+  match e o mesmo boletim aprovado era baixado repetidas vezes (visto ao vivo: o buffer
+  inteiro de 10 vagas encheu com 10 cópias do mesmo `id`). Corrigido normalizando fonte e
+  título separadamente antes de juntar com `|`, reproduzindo exatamente a fórmula do
+  ViewModel.
+- **Bug 2 - hang de rede não respeitava timeout algum:** `downloadNextApprovedBulletin()`
+  usa `HttpURLConnection` puro com `connectTimeout`/`readTimeout` de 12s, e o chamador
+  ainda envolvia a chamada inteira num `withTimeoutOrNull(REMOTE_FEED_TIMEOUT_MS)` (15s) -
+  mesmo assim, uma rede com DNS/handshake lento travou a chamada por mais de 5 minutos ao
+  vivo, congelando a rodada INTEIRA do buffer (nem item remoto nem qualquer fallback
+  avançava). Causa raiz: `HttpURLConnection.connect()`/`getInputStream()` são chamadas
+  bloqueantes de Java puro sem ponto de suspensão - cancelar a coroutine
+  (`withTimeoutOrNull`) não interrompe essa thread sozinha, ela só retorna quando a
+  chamada de rede devolver o controle de verdade. Corrigido com um watchdog manual:
+  `BroadcastFeedRepository` guarda a `HttpURLConnection` ativa num campo `@Volatile`, e
+  registra `coroutineContext.job.invokeOnCompletion { if (cause is CancellationException)
+  activeConnection?.disconnect() }` no início de `downloadNextApprovedBulletin()` - quando
+  o `withTimeoutOrNull` do chamador cancela a coroutine, o handler força um
+  `disconnect()` de verdade na conexão presa, que aí sim lança `IOException` e libera a
+  thread. Sem isso, `withTimeoutOrNull` sozinho é enganoso pra qualquer chamada de rede
+  bloqueante deste projeto (mesmo padrão usado em `NewsBulletinRepository`/Gemini, agora
+  removidos - ver abaixo).
+- **Decisão (mudança grande, mesmo dia):** pedido explícito do usuário - "não teremos mais
+  essas configurações internas da rádio de redator local, de pacote de vozes,
+  acompanhamento de buffer... porque agora essa tarefa vai ser deixada toda pra fora".
+  Confirmado via pergunta direta: (1) sem boletim aprovado no feed, a vaga fica vazia -
+  **nenhum fallback local, nunca** (antes: RSS→redator→síntese ou TTS Android); (2) tela
+  "Boletins da rádio" some inteira das Configurações, sem ficar nem um card de status.
+- **O que foi removido (arquivos inteiros):**
+  - Redator: `RadioWriterPackageRepository.kt` (pacote do LLM local + `LocalLlamaTextGenerator`
+    + JNI), `app/src/main/cpp/pailer_llama_jni.cpp` + `CMakeLists.txt`, blocos
+    `externalNativeBuild`/`ndk.abiFilters` do alvo nativo em `app/build.gradle.kts` (o
+    `ndk.abiFilters` do app em si fica, ainda restringe ABI do APK).
+  - RSS: `NewsBulletinRepository.kt` (só tinha esse consumidor - `ArtistNewsRepository.kt`
+    é feature separada de notícia de artista, não depende dele).
+  - Voz: `LocalRadioVoiceEngine.kt`, `RadioVoiceSynthesisService.kt` (+ entrada
+    `<service>` no `AndroidManifest.xml`, processo `:radio_voice`), `RadioVoicePackageRepository.kt`,
+    `GeminiFlashTtsEngine.kt`, `RadioBulletinTts.kt` (`BulletinTtsProvider`/`GeminiTtsModel`/
+    `GeminiTtsVoices`), dependência do AAR `sherpa-onnx-static-link-onnxruntime-1.13.6` (arquivo
+    apagado + linha do `build.gradle.kts`).
+  - `RadioBulletin.kt` ficou só com os data classes compartilhados (`RadioBulletinSettings`
+    sem `preferLocalWriter`/`cloudWriterEnabled`/`ttsProvider`/`ttsModel`, `NewsStory`,
+    `RadioScript`/`RadioScriptLine`/`RadioSpeaker`, `RadioScriptSource`) - toda a
+    maquinaria de escrita (`RadioScriptWriter`, `RadioBulletinRepository`,
+    `RemoteGeminiRadioScriptWriter`, `OptionalLocalLlmRadioScriptWriter`,
+    `FallbackRadioScriptWriter`, prompt builders, parsers, bancos de texto por tema,
+    `withPhilosophicalCloser()`) e `GeminiApiKeySettings` (último consumidor era a TTS)
+    foram removidos.
+  - `docs/TTS.md` apagado (documentava só a máquina removida).
+  - Tela "Boletins da rádio" inteira em `LocalTuneApp.kt`: `RadioBulletinSettingsPanel`,
+    `RadioBulletinBufferStatusCard`, `GeminiApiKeysSettingsPanel`, `RadioBulletinChoiceRow`,
+    entradas `SettingsPage.RadioBulletins`/`.GeminiApiKeys`, o item de nav "Boletins" em
+    "Radio Settings".
+- **`refillBulletinBuffer()` simplificado (`LocalTuneViewModel.kt`):** cada vaga livre
+  tenta `broadcastFeedRepository.downloadNextApprovedBulletin()`; `null` faz a rodada
+  inteira desistir (`break`) sem tentar mais nada. `speakNextNewsBreak()` idem: sem áudio
+  tocável no buffer, cancela a entrada incondicionalmente (removida a checagem
+  `radioVoiceState.value.isEnabled` que só fazia sentido quando existia alternativa de
+  TTS Android para "voz desligada").
+- **Achado no meio do caminho - guard esquecido:** `speakNextNewsBreak()` começava com
+  `if (!ttsReady || speakingNews) return` - `ttsReady` só virava `true` depois do callback
+  assíncrono de `setupTextToSpeech()` (TextToSpeech do Android). Removendo TTS sem tirar
+  esse guard, boletim NUNCA mais tocaria (guard sempre falso pra sempre) mesmo com WAV
+  pronto no buffer - pego e corrigido antes de compilar, guard virou só `if (speakingNews)`.
+- **O que ficou de propósito, mesmo sem UI pra acionar:** `pauseBulletinPreparation()`/
+  `resumeBulletinPreparation()`/`resetBulletinBuffer()`/`fixFallbackBulletins()`/
+  `playReadyBufferedBulletin()` continuam declaradas no ViewModel (não removidas) - só
+  perderam todo caller de UI. Ficam como API interna morta, não removidas por segurança/
+  tempo (remover exigiria reabrir `refillBulletinBuffer()` de novo, risco desnecessário no
+  fim de uma sessão já grande). `RadioScriptSource.LocalLlm`/`.Fallback` também continuam
+  no enum (só `BroadcastFeed` é alcançável na prática hoje) - simplificar pra um valor só
+  fica pra uma limpeza futura, exige tocar na deserialização do manifest em disco.
+- **Verificação:** cada estágio (buffer/playback → redator/RSS → voz/tela) compilou e foi
+  instalado no aparelho de verdade entre um estágio e o próximo (mesmo fluxo de
+  `adb install -r` + `logcat` desta sessão) - nenhum estágio quebrou o build na primeira
+  tentativa depois do estágio 1.

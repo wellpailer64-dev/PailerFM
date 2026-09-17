@@ -227,9 +227,7 @@ import androidx.media3.common.Player
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
-import com.pailer.localtune.data.BulletinTtsProvider
 import com.pailer.localtune.data.DuplicateArtistGroup
-import com.pailer.localtune.data.GeminiTtsModel
 import com.pailer.localtune.data.LocalAlbum
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
@@ -252,9 +250,7 @@ import com.pailer.localtune.player.AppFolderUiState
 import com.pailer.localtune.player.BackupUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
-import com.pailer.localtune.player.RadioBulletinBufferUiState
 import com.pailer.localtune.player.RadioBulletinUiState
-import com.pailer.localtune.player.RadioVoiceUiState
 import com.pailer.localtune.player.UpdateUiState
 import com.pailer.localtune.player.UserProfileUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
@@ -310,8 +306,6 @@ private enum class SettingsPage {
     AlbumArtists,
     TagWriter,
     Artists,
-    RadioBulletins,
-    GeminiApiKeys,
     AlbumArtwork,
     Backup,
     RadioDislikedSongs,
@@ -538,20 +532,10 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             viewModel.deletePendingSongsDirectly()
         }
     }
-    val voicePackageLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let(viewModel::importRadioVoicePackage)
-    }
     val profilePhotoLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let(viewModel::importProfilePhoto)
-    }
-    val writerPackageLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        uri?.let(viewModel::importRadioWriterPackage)
     }
     val backupCreateLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json")
@@ -651,8 +635,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         if (profile.appliedVersion > 0) artworkMemoryCache.evictAll()
     }
     val radioBulletins = viewModel.radioBulletinState.value
-    val radioBulletinBuffer = viewModel.radioBulletinBufferState.value
-    val radioVoice = viewModel.radioVoiceState.value
     val songs = content.songs
     val albums = content.albums
     val artists = content.artists
@@ -1169,9 +1151,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             page = settingsPage,
             metadata = metadata,
             albumArtwork = albumArtwork,
-            radioBulletins = radioBulletins,
-            radioBulletinBuffer = radioBulletinBuffer,
-            radioVoice = radioVoice,
             profile = profile,
             batteryProtected = viewModel.isIgnoringBatteryOptimizations(),
             onRequestBatteryExemption = {
@@ -1195,28 +1174,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onCloseArtworkSearch = viewModel::closeArtworkSearch,
             onSelectArtworkCandidate = viewModel::selectArtworkCandidate,
             onApplyArtwork = requestApplyArtwork,
-            onSetRadioBulletinPreferLocalWriter = viewModel::setRadioBulletinPreferLocalWriter,
-            onSetRadioBulletinCloudWriterEnabled = viewModel::setRadioBulletinCloudWriterEnabled,
-            onSetRadioBulletinTtsProvider = viewModel::setRadioBulletinTtsProvider,
-            onSetRadioBulletinTtsModel = viewModel::setRadioBulletinTtsModel,
-            onTestGeminiFlashTtsVoices = viewModel::testGeminiFlashTtsVoices,
-            onImportRadioWriterPackage = { writerPackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
-            onDownloadRadioWriterPackage = viewModel::downloadRadioWriterPackage,
-            onClearRadioWriterPackage = viewModel::clearRadioWriterPackage,
-            onSaveGeminiApiKey = viewModel::saveGeminiApiKey,
-            onClearGeminiApiKey = viewModel::clearGeminiApiKey,
-            onImportRadioVoicePackage = { voicePackageLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
-            onDownloadRadioVoicePackage = viewModel::downloadRadioVoicePackage,
-            onClearRadioVoicePackage = viewModel::clearRadioVoicePackage,
-            onSetRadioVoiceEnabled = viewModel::setRadioVoiceEnabled,
-            onTestRadioVoicePackage = viewModel::testRadioVoicePackage,
-            onReplayTestAudio = viewModel::replayLastTestAudio,
-            onTestAndroidVoice = viewModel::testAndroidVoiceBulletin,
-            onPauseBulletinPreparation = viewModel::pauseBulletinPreparation,
-            onResumeBulletinPreparation = viewModel::resumeBulletinPreparation,
-            onResetBulletinBuffer = viewModel::resetBulletinBuffer,
-            onFixFallbackBulletins = viewModel::fixFallbackBulletins,
-            onPlayReadyBulletin = viewModel::playReadyBufferedBulletin,
             onChooseProfilePhoto = { profilePhotoLauncher.launch(arrayOf("image/*")) },
             onSaveProfile = viewModel::saveUserProfile,
             hasHiddenRadios = viewModel.hasHiddenRadios(),
@@ -1758,7 +1715,7 @@ private fun RemoteDeviceSheet(
 // Filtros internos da aba Biblioteca (pedido do usuario 10/09/2026: Artistas/Albuns/Musicas/
 // Categorias deixaram de ser abas proprias na barra inferior e viraram um seletor DENTRO da
 // Biblioteca). Pilulas simples, no mesmo estilo de superficie arredondada ja usado em outros
-// cards do app (ver PailerSurfaceHigh/RoundedCornerShape em RadioBulletinBufferStatusCard).
+// cards do app (PailerSurfaceHigh/RoundedCornerShape).
 @Composable
 private fun LibrarySectionTabs(
     selected: LibrarySection,
@@ -1802,9 +1759,6 @@ private fun SettingsDrawer(
     page: SettingsPage,
     metadata: MetadataUiState,
     albumArtwork: AlbumArtworkUiState,
-    radioBulletins: RadioBulletinUiState,
-    radioBulletinBuffer: RadioBulletinBufferUiState,
-    radioVoice: RadioVoiceUiState,
     profile: UserProfileUiState,
     batteryProtected: Boolean,
     onRequestBatteryExemption: () -> Unit,
@@ -1824,28 +1778,6 @@ private fun SettingsDrawer(
     onCloseArtworkSearch: () -> Unit,
     onSelectArtworkCandidate: (ArtworkCandidate) -> Unit,
     onApplyArtwork: (LocalAlbum) -> Unit,
-    onSetRadioBulletinPreferLocalWriter: (Boolean) -> Unit,
-    onSetRadioBulletinCloudWriterEnabled: (Boolean) -> Unit,
-    onSetRadioBulletinTtsProvider: (BulletinTtsProvider) -> Unit,
-    onSetRadioBulletinTtsModel: (GeminiTtsModel) -> Unit,
-    onTestGeminiFlashTtsVoices: () -> Unit,
-    onImportRadioWriterPackage: () -> Unit,
-    onDownloadRadioWriterPackage: () -> Unit,
-    onClearRadioWriterPackage: () -> Unit,
-    onSaveGeminiApiKey: (Int, String) -> Unit,
-    onClearGeminiApiKey: (Int) -> Unit,
-    onImportRadioVoicePackage: () -> Unit,
-    onDownloadRadioVoicePackage: () -> Unit,
-    onClearRadioVoicePackage: () -> Unit,
-    onSetRadioVoiceEnabled: (Boolean) -> Unit,
-    onTestRadioVoicePackage: () -> Unit,
-    onReplayTestAudio: () -> Unit,
-    onTestAndroidVoice: () -> Unit,
-    onPauseBulletinPreparation: () -> Unit,
-    onResumeBulletinPreparation: () -> Unit,
-    onResetBulletinBuffer: () -> Unit,
-    onFixFallbackBulletins: () -> Unit,
-    onPlayReadyBulletin: (Int) -> Unit,
     onChooseProfilePhoto: () -> Unit,
     onSaveProfile: (String, String) -> Unit,
     hasHiddenRadios: Boolean = false,
@@ -1910,7 +1842,6 @@ private fun SettingsDrawer(
                         )
                         SettingsPage.RadioSettings -> RadioSettingsPanel(
                             onBack = { onPageChange(SettingsPage.Main) },
-                            onOpenRadioBulletins = { onPageChange(SettingsPage.RadioBulletins) },
                             hasHiddenRadios = hasHiddenRadios,
                             onRestoreHiddenRadios = onRestoreHiddenRadios,
                             hasRadioDislikedSongs = radioDislikedSongs.isNotEmpty(),
@@ -1964,39 +1895,6 @@ private fun SettingsDrawer(
                             onBack = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onScan = onScanArtists,
                             onUnifyArtist = onUnifyArtist,
-                        )
-                        SettingsPage.RadioBulletins -> RadioBulletinSettingsPanel(
-                            radioBulletins = radioBulletins,
-                            bulletinBuffer = radioBulletinBuffer,
-                            radioVoice = radioVoice,
-                            onBack = { onPageChange(SettingsPage.RadioSettings) },
-                            onSetPreferLocalWriter = onSetRadioBulletinPreferLocalWriter,
-                            onSetCloudWriterEnabled = onSetRadioBulletinCloudWriterEnabled,
-                            onSetTtsProvider = onSetRadioBulletinTtsProvider,
-                            onSetTtsModel = onSetRadioBulletinTtsModel,
-                            onTestGeminiVoice = onTestGeminiFlashTtsVoices,
-                            onImportWriterPackage = onImportRadioWriterPackage,
-                            onDownloadWriterPackage = onDownloadRadioWriterPackage,
-                            onClearWriterPackage = onClearRadioWriterPackage,
-                            onOpenGeminiApiKeys = { onPageChange(SettingsPage.GeminiApiKeys) },
-                            onImportVoicePackage = onImportRadioVoicePackage,
-                            onDownloadVoicePackage = onDownloadRadioVoicePackage,
-                            onClearVoicePackage = onClearRadioVoicePackage,
-                            onSetVoiceEnabled = onSetRadioVoiceEnabled,
-                            onTestVoicePackage = onTestRadioVoicePackage,
-                            onReplayTestAudio = onReplayTestAudio,
-                            onTestAndroidVoice = onTestAndroidVoice,
-                            onPauseBulletinPreparation = onPauseBulletinPreparation,
-                            onResumeBulletinPreparation = onResumeBulletinPreparation,
-                            onResetBulletinBuffer = onResetBulletinBuffer,
-                            onFixFallbackBulletins = onFixFallbackBulletins,
-                            onPlayReadyBulletin = onPlayReadyBulletin,
-                        )
-                        SettingsPage.GeminiApiKeys -> GeminiApiKeysSettingsPanel(
-                            slotsFilled = radioBulletins.geminiApiKeySlotsFilled,
-                            onBack = { onPageChange(SettingsPage.RadioBulletins) },
-                            onSaveKey = onSaveGeminiApiKey,
-                            onClearKey = onClearGeminiApiKey,
                         )
                         SettingsPage.AlbumArtwork -> AlbumArtworkSettingsPanel(
                             state = albumArtwork,
@@ -2103,7 +2001,6 @@ private fun SettingsMainPanel(
 @Composable
 private fun RadioSettingsPanel(
     onBack: () -> Unit,
-    onOpenRadioBulletins: () -> Unit,
     hasHiddenRadios: Boolean,
     onRestoreHiddenRadios: () -> Unit,
     hasRadioDislikedSongs: Boolean,
@@ -2133,14 +2030,7 @@ private fun RadioSettingsPanel(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        SettingsActionRow(
-            title = "Boletins",
-            subtitle = "Noticias, vozes e redator",
-            icon = Icons.Filled.GraphicEq,
-            onClick = onOpenRadioBulletins,
-        )
         if (hasHiddenRadios) {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
             SettingsActionRow(
                 title = "Radios ocultas",
                 subtitle = "Restaurar radios apagadas",
@@ -2149,7 +2039,7 @@ private fun RadioSettingsPanel(
             )
         }
         if (hasRadioDislikedSongs) {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            if (hasHiddenRadios) HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
             SettingsActionRow(
                 title = "Faixas bloqueadas",
                 subtitle = "Liberar musicas da radio",
@@ -2384,809 +2274,6 @@ private fun LibraryMaintenanceSettingsPanel(
                 icon = Icons.Filled.VisibilityOff,
                 onClick = onRestoreHiddenLibraryItems,
             )
-        }
-    }
-}
-
-@Composable
-private fun RadioBulletinSettingsPanel(
-    radioBulletins: RadioBulletinUiState,
-    bulletinBuffer: RadioBulletinBufferUiState,
-    radioVoice: RadioVoiceUiState,
-    onBack: () -> Unit,
-    onSetPreferLocalWriter: (Boolean) -> Unit,
-    onSetCloudWriterEnabled: (Boolean) -> Unit,
-    onSetTtsProvider: (BulletinTtsProvider) -> Unit,
-    onSetTtsModel: (GeminiTtsModel) -> Unit,
-    onTestGeminiVoice: () -> Unit,
-    onImportWriterPackage: () -> Unit,
-    onDownloadWriterPackage: () -> Unit,
-    onClearWriterPackage: () -> Unit,
-    onOpenGeminiApiKeys: () -> Unit,
-    onImportVoicePackage: () -> Unit,
-    onDownloadVoicePackage: () -> Unit,
-    onClearVoicePackage: () -> Unit,
-    onSetVoiceEnabled: (Boolean) -> Unit,
-    onTestVoicePackage: () -> Unit,
-    onReplayTestAudio: () -> Unit,
-    onTestAndroidVoice: () -> Unit,
-    onPauseBulletinPreparation: () -> Unit,
-    onResumeBulletinPreparation: () -> Unit,
-    onResetBulletinBuffer: () -> Unit,
-    onFixFallbackBulletins: () -> Unit,
-    onPlayReadyBulletin: (Int) -> Unit,
-) {
-    val settings = radioBulletins.settings
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
-            .padding(horizontal = 18.dp, vertical = 22.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
-            }
-            Text(
-                "Boletins da radio",
-                modifier = Modifier.weight(1f),
-                color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        Spacer(Modifier.height(18.dp))
-        Text(
-            "A cada ${settings.songsBetweenBulletins} musicas",
-            color = MaterialTheme.colorScheme.primary,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-        )
-        Text(
-            "A radio prepara a noticia enquanto a programacao toca e entra com um bloco curto entre as faixas.",
-            modifier = Modifier.padding(top = 6.dp, bottom = 18.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        RadioBulletinBufferStatusCard(
-            bulletinBuffer = bulletinBuffer,
-            onPause = onPauseBulletinPreparation,
-            onResume = onResumeBulletinPreparation,
-            onReset = onResetBulletinBuffer,
-            onFixFallback = onFixFallbackBulletins,
-            onPlay = onPlayReadyBulletin,
-        )
-        Spacer(Modifier.height(20.dp))
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-        Spacer(Modifier.height(16.dp))
-
-        Text("Redator local", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        RadioBulletinChoiceRow(
-            title = radioBulletins.localWriterName,
-            subtitle = radioBulletins.localWriterDetail,
-            selected = settings.preferLocalWriter,
-            onClick = { onSetPreferLocalWriter(!settings.preferLocalWriter) },
-        )
-        Text(
-            text = if (radioBulletins.localWriterInstalled) {
-                "Quando o pacote estiver ativo, ele escreve o dialogo curto no aparelho antes do boletim tocar."
-            } else {
-                "Enquanto o pacote nao existir, o app usa um roteiro leve de seguranca e continua tocando normalmente."
-            },
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
-        radioBulletins.localWriterMessage?.let { message ->
-            Text(
-                text = message,
-                modifier = Modifier.padding(top = 8.dp),
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        Spacer(Modifier.height(10.dp))
-        val writerDownloading = radioBulletins.localWriterImporting &&
-            radioBulletins.localWriterMessage?.contains("Baixando") == true
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!radioBulletins.localWriterInstalled) {
-                Button(
-                    onClick = onDownloadWriterPackage,
-                    enabled = !radioBulletins.localWriterImporting,
-                ) {
-                    if (writerDownloading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.onPrimary,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                    }
-                    Text(if (radioBulletins.localWriterImporting) "Baixando..." else "Baixar")
-                }
-            }
-            Button(
-                onClick = onImportWriterPackage,
-                enabled = !radioBulletins.localWriterImporting,
-            ) {
-                if (radioBulletins.localWriterImporting && !writerDownloading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                }
-                Text(if (radioBulletins.localWriterImporting && !writerDownloading) "Importando..." else "Importar arquivo")
-            }
-            if (radioBulletins.localWriterInstalled) {
-                TextButton(onClick = onClearWriterPackage) {
-                    Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-        Spacer(Modifier.height(16.dp))
-        // Chave geral do Gemini (06/09/2026, pedido do usuario): desligada, o app ignora as
-        // chaves salvas e so o redator local escreve - liga/desliga sem precisar apagar chave
-        // nenhuma. Ver RadioBulletinSettings.cloudWriterEnabled/RadioBulletinRepository.
-        // enhanceScript.
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = PailerSurface.copy(alpha = 0.9f),
-            shape = RoundedCornerShape(8.dp),
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth().padding(12.dp),
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        text = "Redação em nuvem",
-                        color = MaterialTheme.colorScheme.onBackground,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Text(
-                        text = if (radioBulletins.settings.cloudWriterEnabled) {
-                            "Ligado: o Gemini escreve primeiro (mais rapido), redator local so entra se ele falhar."
-                        } else {
-                            "Desligado: so o redator local escreve, mesmo com chave salva. As chaves continuam guardadas."
-                        },
-                        modifier = Modifier.padding(top = 3.dp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                Switch(
-                    checked = radioBulletins.settings.cloudWriterEnabled,
-                    onCheckedChange = onSetCloudWriterEnabled,
-                )
-            }
-        }
-
-        if (radioBulletins.settings.cloudWriterEnabled) {
-            Spacer(Modifier.height(20.dp))
-            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-            Spacer(Modifier.height(16.dp))
-            // Campo de chave movido pra pagina propria (pedido do usuario 10/09/2026: "o campo de
-            // chaves... tem que ser uma página a parte") - suporta ate GeminiApiKeySettings.
-            // MAX_KEYS (8) chaves testadas em cadeia, ver GeminiApiKeysSettingsPanel. Mesmo pool
-            // usado pelo redator (aqui) e pelo Gemini Flash TTS experimental (secao abaixo).
-            val filledKeyCount = radioBulletins.geminiApiKeySlotsFilled.count { it }
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                color = PailerSurface.copy(alpha = 0.9f),
-                shape = RoundedCornerShape(8.dp),
-                onClick = onOpenGeminiApiKeys,
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            "Chaves do Gemini",
-                            color = MaterialTheme.colorScheme.onBackground,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = if (radioBulletins.geminiConfigured) {
-                                "$filledKeyCount de ${radioBulletins.geminiApiKeySlotsFilled.size} salvas - escreve o boletim e (se ligado) sintetiza a voz. Se uma falhar, tenta a próxima em ordem."
-                            } else {
-                                "Opcional: cole até ${radioBulletins.geminiApiKeySlotsFilled.size} chaves de API gratuitas do Gemini. Sem chave, usa o redator local direto."
-                            },
-                            modifier = Modifier.padding(top = 3.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowForward,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-        Spacer(Modifier.height(16.dp))
-        // Motor de SINTESE DE VOZ do boletim (Fran/Nico) - diferente das secoes acima, que sao
-        // sobre quem ESCREVE o roteiro. Experimental (10/09/2026, pedido do usuario): coexiste
-        // com o motor local de sempre, nunca o substitui - qualquer falha do Gemini cai pro
-        // sistema atual sozinha (ver LocalTuneViewModel.trySynthesizeWithGeminiFlash).
-        Text("Voz dos boletins", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        RadioBulletinChoiceRow(
-            title = "Sistema atual",
-            subtitle = "Motor local de sempre (Supertonic) - nada muda.",
-            selected = settings.ttsProvider == BulletinTtsProvider.CURRENT,
-            onClick = { onSetTtsProvider(BulletinTtsProvider.CURRENT) },
-        )
-        RadioBulletinChoiceRow(
-            title = "Gemini Flash TTS · Experimental",
-            subtitle = "Sintetiza Fran e Nico na nuvem via Gemini pra avaliar a qualidade. " +
-                "Se falhar, o boletim cai pro sistema atual sozinho.",
-            selected = settings.ttsProvider == BulletinTtsProvider.GEMINI_FLASH,
-            onClick = { onSetTtsProvider(BulletinTtsProvider.GEMINI_FLASH) },
-        )
-        if (settings.ttsProvider == BulletinTtsProvider.GEMINI_FLASH) {
-            Spacer(Modifier.height(6.dp))
-            Text(
-                "Modelo",
-                modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            GeminiTtsModel.entries.forEach { model ->
-                RadioBulletinChoiceRow(
-                    title = model.label,
-                    subtitle = model.modelId,
-                    selected = settings.ttsModel == model,
-                    onClick = { onSetTtsModel(model) },
-                )
-            }
-            if (!radioBulletins.geminiConfigured) {
-                Text(
-                    text = "Precisa de pelo menos 1 chave de API do Gemini salva (seção \"Chaves do Gemini\" acima) pra funcionar. Sem ela, o boletim usa o sistema atual direto.",
-                    modifier = Modifier.padding(top = 4.dp),
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            radioBulletins.geminiVoiceTestMessage?.let { message ->
-                Text(
-                    text = message,
-                    modifier = Modifier.padding(top = 8.dp),
-                    color = MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = onTestGeminiVoice,
-                enabled = !radioBulletins.isTestingGeminiVoice,
-            ) {
-                if (radioBulletins.isTestingGeminiVoice) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                }
-                Text(if (radioBulletins.isTestingGeminiVoice) "Testando..." else "Testar vozes")
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-        Spacer(Modifier.height(16.dp))
-        Text("Voz local", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = PailerSurface.copy(alpha = 0.9f),
-            shape = RoundedCornerShape(8.dp),
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            text = if (radioVoice.isInstalled) radioVoice.packageName else "Voz padrao do Android",
-                            color = MaterialTheme.colorScheme.onBackground,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = if (radioVoice.isInstalled) {
-                                "${radioVoice.femaleSpeaker.ifBlank { "Locutora" }} / ${radioVoice.maleSpeaker.ifBlank { "Locutor" }}"
-                            } else {
-                                radioVoice.detail
-                            },
-                            modifier = Modifier.padding(top = 3.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    if (radioVoice.isInstalled) {
-                        Switch(
-                            checked = radioVoice.isEnabled,
-                            onCheckedChange = onSetVoiceEnabled,
-                        )
-                    }
-                }
-                radioVoice.message?.let { message ->
-                    Text(
-                        text = message,
-                        modifier = Modifier.padding(top = 8.dp),
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-                Spacer(Modifier.height(10.dp))
-                val voiceDownloading = radioVoice.isImporting && radioVoice.message?.contains("Baixando") == true
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (!radioVoice.isInstalled) {
-                        Button(
-                            onClick = onDownloadVoicePackage,
-                            enabled = !radioVoice.isImporting && !radioVoice.isTesting,
-                        ) {
-                            if (voiceDownloading) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.onPrimary,
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(if (radioVoice.isImporting) "Baixando..." else "Baixar")
-                        }
-                    }
-                    Button(
-                        onClick = onImportVoicePackage,
-                        enabled = !radioVoice.isImporting && !radioVoice.isTesting,
-                    ) {
-                        if (radioVoice.isImporting && !voiceDownloading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                        }
-                        Text(if (radioVoice.isImporting && !voiceDownloading) "Importando..." else "Importar arquivo")
-                    }
-                    if (radioVoice.isInstalled) {
-                        Button(
-                            onClick = onTestVoicePackage,
-                            enabled = !radioVoice.isTesting,
-                        ) {
-                            if (radioVoice.isTesting) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.onPrimary,
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(if (radioVoice.isTesting) "Testando..." else "Testar ${radioVoice.packageName}")
-                        }
-                    }
-                }
-                if (radioVoice.isInstalled) {
-                    Spacer(Modifier.height(8.dp))
-                    // Testar o redator local/boletim acontece pelo card do buffer (ver
-                    // RadioBulletinBufferStatusCard "Reproduzir boletim pronto") - pedido do
-                    // usuario (03/09/2026): um caminho de teste so, ja que o preparo automatico
-                    // do buffer serve como teste em si (e evita duas geracoes concorrentes
-                    // disputando CPU, uma pelo botao manual e outra pelo preparo de fundo).
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(onClick = onClearVoicePackage) {
-                            Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        if (radioVoice.canReplayTest) {
-                            TextButton(onClick = onReplayTestAudio) {
-                                Text("Tocar de novo", color = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Spacer(Modifier.height(10.dp))
-        Button(
-            onClick = onTestAndroidVoice,
-            enabled = !radioVoice.isTestingAndroidVoice,
-        ) {
-            if (radioVoice.isTestingAndroidVoice) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.onPrimary,
-                )
-                Spacer(Modifier.width(8.dp))
-            }
-            Text(if (radioVoice.isTestingAndroidVoice) "Testando..." else "Testar voz do Android")
-        }
-        Text(
-            text = "Por seguranca, pacote importado nao liga sozinho. Se algo falhar, deixe desligado e a radio usa a voz do Android.",
-            modifier = Modifier.padding(top = 8.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
-    }
-}
-
-// Pagina propria pras chaves de API do Gemini (pedido do usuario 10/09/2026: "o campo de
-// chaves... tem que ser uma página a parte, clicar e ir pra página de chaves") - ate
-// GeminiApiKeySettings.MAX_KEYS (8) chaves, testadas em cadeia por generateWithRetry (RadioBulletin.kt)
-// e GeminiFlashTtsEngine.generateLineWithRetry: se a 1a salva falhar, tenta a proxima em ordem.
-// UM pool so pro redator e pro Gemini Flash TTS experimental (mesma secao "Voz dos boletins" na
-// tela anterior). Nunca mostra a chave de volta depois de salva (mesmo padrao ja usado pro campo
-// unico antigo) - so "salva"/"remover" por slot.
-@Composable
-private fun GeminiApiKeysSettingsPanel(
-    slotsFilled: List<Boolean>,
-    onBack: () -> Unit,
-    onSaveKey: (Int, String) -> Unit,
-    onClearKey: (Int) -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .verticalScroll(rememberScrollState(), flingBehavior = rememberSoftFlingBehavior())
-            .padding(horizontal = 18.dp, vertical = 22.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "Voltar", tint = MaterialTheme.colorScheme.onBackground)
-            }
-            Text(
-                "Chaves do Gemini",
-                modifier = Modifier.weight(1f),
-                color = MaterialTheme.colorScheme.onBackground,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "Usada pra escrever o roteiro do boletim e, se ligado, pra sintetizar a voz (Gemini " +
-                "Flash TTS). Se a 1ª chave falhar (ex.: cota esgotada), a próxima salva é " +
-                "tentada automaticamente, na ordem abaixo.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Spacer(Modifier.height(20.dp))
-        slotsFilled.forEachIndexed { index, filled ->
-            if (index > 0) {
-                Spacer(Modifier.height(14.dp))
-                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-                Spacer(Modifier.height(14.dp))
-            }
-            Text("Chave ${index + 1}", color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(8.dp))
-            if (filled) {
-                Text(
-                    "Salva.",
-                    modifier = Modifier.padding(bottom = 8.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TextButton(onClick = { onClearKey(index) }) {
-                    Text("Remover", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            } else {
-                var keyInput by remember { mutableStateOf("") }
-                MetadataTextField(
-                    value = keyInput,
-                    onValueChange = { keyInput = it },
-                    label = "Chave de API do Gemini",
-                    placeholder = "AIza...",
-                )
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        onSaveKey(index, keyInput)
-                        keyInput = ""
-                    },
-                    enabled = keyInput.isNotBlank(),
-                ) {
-                    Text("Salvar chave")
-                }
-            }
-        }
-    }
-}
-
-// Status do buffer de boletins prontos (ADR-019) em tempo real - pedido do usuario
-// (03/09/2026): acompanhar quantos boletins ja estao prontos/sendo escritos, alem de poder
-// pausar (cancela o preparo e nao deixa comecar outro) e resetar (apaga o que tem e comeca de
-// novo) o preparo em segundo plano.
-@Composable
-private fun RadioBulletinBufferStatusCard(
-    bulletinBuffer: RadioBulletinBufferUiState,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    onReset: () -> Unit,
-    onFixFallback: () -> Unit,
-    onPlay: (Int) -> Unit,
-) {
-    // Amarelo por convencao (nem erro/vermelho, nem normal/primary) pra bolinha de fallback -
-    // roteiro generico/repetitivo (RadioScriptSource.Fallback, ver LocalTuneViewModel.
-    // syncBulletinBufferState) em vez do bate-bola de verdade escrito por LLM. Pedido do usuario
-    // (05/09/2026): "deixamos a bolinha na cor amarela" pra identificar de relance.
-    val fallbackColor = Color(0xFFFFC107)
-    // Verde SO quando script E voz vieram 100% do Gemini (fullGeminiSlots, ver
-    // LocalTuneViewModel.syncBulletinBufferState) - pedido do usuario 10/09/2026: "bolinha verde
-    // pra 100% Gemini, azul pra parcial com voz local". Distingue tambem de vermelho piscando
-    // (bolinha em preparo) - antes as duas usavam a mesma cor primary, so a pulsacao de alpha
-    // diferenciava; agora a cor sozinha ja diz "pronto" vs "escrevendo agora" de relance.
-    val geminiColor = Color(0xFF4CAF50)
-    // Azul e o estado NORMAL de "pronto" agora (fallback a parte) - cobre desde quem nunca ligou
-    // nenhum recurso Gemini ate quem so conseguiu parte (script OU voz, nao os dois) na nuvem.
-    // So fica verde quando os dois pedacos vieram do Gemini (ver geminiColor acima).
-    val partialColor = Color(0xFF2196F3)
-    // Pulso lento (1400ms, mais devagar que o "radioLivePulse"/"playerLivePulse" de 820ms usados
-    // em "ao vivo" pela UI) na bolinha que esta sendo escrita agora - pedido do usuario
-    // (03/09/2026): quer ver visualmente qual boletim esta em andamento, piscando devagar.
-    val pulseTransition = rememberInfiniteTransition(label = "bulletinBufferPulse")
-    val pulse by pulseTransition.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1400),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "bulletinBufferPulseAlpha",
-    )
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        color = PailerSurface.copy(alpha = 0.9f),
-        shape = RoundedCornerShape(8.dp),
-    ) {
-        Column(Modifier.padding(12.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "Boletins em buffer",
-                        color = MaterialTheme.colorScheme.onBackground,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Text(
-                        text = "${bulletinBuffer.readyCount}/${bulletinBuffer.targetCount} prontos" +
-                            (if (bulletinBuffer.scriptTargetCount > 0) " · ${bulletinBuffer.scriptReadyCount}/${bulletinBuffer.scriptTargetCount} roteiros" else "") +
-                            (if (bulletinBuffer.hasFallback) " · ${bulletinBuffer.fallbackSlots.size} em fallback" else "") +
-                            if (bulletinBuffer.isPaused) " · pausado" else "",
-                        modifier = Modifier.padding(top = 3.dp),
-                        color = when {
-                            bulletinBuffer.isPaused -> MaterialTheme.colorScheme.error
-                            bulletinBuffer.hasFallback -> fallbackColor
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                if (bulletinBuffer.isPreparing) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            }
-            // Um "ponto" por vaga do buffer: preenchido = pronto (clicavel, toca aquele boletim
-            // especifico), translucido = sendo escrito agora, vazio = ainda por fazer - da pra
-            // acompanhar de relance sem ler numero. Antes so o botao abaixo tocava o primeiro item
-            // - pedido do usuario (03/09/2026): "os outros que ficam pronto, nao sei como
-            // reproduzir eles" - agora cada bolinha preenchida toca a posicao correspondente.
-            Row(
-                modifier = Modifier.padding(top = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                repeat(bulletinBuffer.targetCount) { slot ->
-                    val filled = slot < bulletinBuffer.readyCount
-                    val preparing = !filled && slot == bulletinBuffer.readyCount && bulletinBuffer.isPreparing
-                    val clickable = filled && !bulletinBuffer.isPlayingPreview
-                    val isFallback = filled && slot in bulletinBuffer.fallbackSlots
-                    val isFullGemini = filled && slot in bulletinBuffer.fullGeminiSlots
-                    Box(
-                        modifier = Modifier
-                            .size(14.dp)
-                            .then(if (preparing) Modifier.alpha(pulse) else Modifier)
-                            .clip(CircleShape)
-                            .then(if (clickable) Modifier.clickable { onPlay(slot) } else Modifier)
-                            .background(
-                                when {
-                                    isFallback -> fallbackColor
-                                    isFullGemini -> geminiColor
-                                    filled -> partialColor
-                                    preparing -> MaterialTheme.colorScheme.primary
-                                    else -> Color.White.copy(alpha = 0.14f)
-                                },
-                            ),
-                    )
-                }
-            }
-            if (bulletinBuffer.scriptTargetCount > 0) {
-                Text(
-                    text = "Roteiros Gemini em estoque",
-                    modifier = Modifier.padding(top = 10.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Row(
-                    modifier = Modifier.padding(top = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    repeat(bulletinBuffer.scriptTargetCount) { slot ->
-                        val filled = slot < bulletinBuffer.scriptReadyCount
-                        Box(
-                            modifier = Modifier
-                                .size(9.dp)
-                                .clip(CircleShape)
-                                .background(
-                                    if (filled) Color.White.copy(alpha = 0.9f) else Color.White.copy(alpha = 0.13f),
-                                ),
-                        )
-                    }
-                }
-            }
-            bulletinBuffer.statusMessage?.let { message ->
-                // Mensagens de erro (RadioBulletinRepository.enhanceScript ou o catch generico
-                // de refillBulletinBuffer) comecam com "Erro"/"falhou" de proposito - destaca em
-                // vermelho pra ficar visivel na hora, sem precisar abrir o logcat.
-                val isError = message.startsWith("Erro", ignoreCase = true) || message.contains("falhou", ignoreCase = true)
-                // Percentual real - na escrita vem do callback nativo por token do redator local
-                // (ver LlamaProgressListener), na sintese de voz vem do servico (ver
-                // RadioBulletinBufferUiState.progressPercent).
-                val text = bulletinBuffer.progressPercent?.let { percent -> "$message ($percent%)" } ?: message
-                Text(
-                    text = text,
-                    modifier = Modifier.padding(top = 8.dp),
-                    color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = if (isError) FontWeight.SemiBold else FontWeight.Normal,
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-            // Botoes compactos (padding/icone/texto reduzidos) dentro de um Row com scroll
-            // horizontal - com os 3 (Pausar/Retomar, Resetar, Corrigir fallback) no tamanho
-            // padrao do Material3 a soma nao cabia na largura da tela e o texto do 3o botao
-            // quebrava letra por linha (achado 05/09/2026, ao vivo no aparelho). O scroll e so
-            // rede de seguranca pra telas ainda mais estreitas/fonte grande - com o tamanho
-            // reduzido os 3 cabem normalmente sem precisar rolar.
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                val compactPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                if (bulletinBuffer.isPaused) {
-                    Button(onClick = onResume, contentPadding = compactPadding) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Retomar", style = MaterialTheme.typography.labelMedium)
-                    }
-                } else {
-                    Button(onClick = onPause, contentPadding = compactPadding) {
-                        Icon(Icons.Filled.Pause, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Pausar", style = MaterialTheme.typography.labelMedium)
-                    }
-                }
-                TextButton(onClick = onReset, contentPadding = compactPadding) {
-                    Icon(
-                        Icons.Filled.Refresh,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        "Resetar",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                }
-                // So acende quando ha pelo menos 1 bolinha amarela (ver fallbackColor acima) -
-                // remove so os itens em fallback dos buffers e deixa o preparo normal repor essas
-                // vagas priorizando o Gemini de novo (ver LocalTuneViewModel.fixFallbackBulletins).
-                // A mesma correcao roda sozinha em segundo plano assim que um fallback novo entra
-                // no buffer (scheduleFallbackAutoFix) - este botao e so o atalho manual, pra nao
-                // esperar o ciclo automatico.
-                if (bulletinBuffer.hasFallback) {
-                    TextButton(onClick = onFixFallback, contentPadding = compactPadding) {
-                        Icon(
-                            Icons.Filled.Build,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = fallbackColor,
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text("Corrigir", color = fallbackColor, style = MaterialTheme.typography.labelMedium)
-                    }
-                }
-            }
-            // Reproduz o primeiro boletim ja pronto direto aqui, sem precisar entrar numa radio
-            // pra testar (pedido do usuario 03/09/2026) - linha propria (nao cabia junto de
-            // Pausar/Resetar sem estourar a largura da tela, empurrando o Resetar pra fora - bug
-            // visto ao vivo 03/09/2026) - so acende quando tem pelo menos 1 pronto. Virou o
-            // caminho PRINCIPAL de teste do redator local (03/09/2026): substituiu o antigo botao
-            // "Testar noticia real", que gerava sob demanda sem passar pelo llmGenerationMutex e
-            // podia rodar concorrente com o preparo de fundo, disputando CPU/threads.
-            OutlinedButton(
-                onClick = { onPlay(0) },
-                enabled = bulletinBuffer.hasPlayableAudio && !bulletinBuffer.isPlayingPreview,
-                modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
-            ) {
-                if (bulletinBuffer.isPlayingPreview) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                } else {
-                    Icon(Icons.Filled.GraphicEq, contentDescription = null, modifier = Modifier.size(18.dp))
-                }
-                Spacer(Modifier.width(6.dp))
-                Text(if (bulletinBuffer.isPlayingPreview) "Tocando..." else "Reproduzir boletim pronto")
-            }
-        }
-    }
-}
-
-@Composable
-private fun RadioBulletinChoiceRow(
-    title: String,
-    subtitle: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(18.dp)
-                .clip(CircleShape)
-                .background(if (selected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.14f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (selected) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(Color.Black),
-                )
-            }
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.SemiBold)
-            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
     }
 }

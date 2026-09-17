@@ -8,6 +8,19 @@ Este documento descreve **como a rádio funciona hoje**, de ponta a ponta: o que
 fala, quem gera, onde cacheia, quem reproduz e quem libera. As races conhecidas estão
 catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md).
 
+**16/09/2026 — mudança grande:** o redator local (Qwen3/llama.cpp), o redator via Gemini,
+a busca de RSS, a síntese de voz local (Supertonic/sherpa-onnx), a Gemini Flash TTS e o
+fallback de TTS do Android foram todos **removidos**. Todo boletim hoje vem pronto
+(roteiro + áudio) do feed remoto publicado pela central de broadcast externa — ver seção
+"Feed remoto de boletins aprovados" abaixo e ADR-034/ADR-035 em
+[DECISIONS.md](DECISIONS.md). As seções deste documento que descreviam esse pipeline
+antigo foram removidas; o que resta abaixo já reflete o app pós-remoção.
+
+Para a central de broadcast externa (fora deste app) que escreve/sintetiza os boletins,
+com nomes de arquivos e metadata estruturada, ver
+[BROADCAST_METADATA.md](BROADCAST_METADATA.md) e
+[BROADCAST_LOCAL_WORKBENCH.md](BROADCAST_LOCAL_WORKBENCH.md).
+
 ## O conceito de "Rádio"
 
 Não existe stream de rede: uma rádio é uma **fila derivada da biblioteca local** com
@@ -64,12 +77,10 @@ playRadioSession()                          [LocalTuneViewModel]
   ├─ startRadioNewsMode(radioName)
   │    ├─ zera contadores/flags do boletim (bulletinBuffer NAO e tocado - unico, 100%
   │    │  radio-agnostico, sobrevive a troca de radio, ver ADR-024)
-  │    ├─ setupTextToSpeech()               (fallback; ver TTS.md)
-  │    └─ carrega boletins em background:
-  │         RadioBulletinRepository.loadScripts() → refillBulletinBuffer()
+  │    └─ refillBulletinBuffer()
   │         (no-op se ja estiver cheio - o buffer roda desde a abertura do app,
   │         independente de radio ativa; enche pra BULLETIN_BUFFER_TARGET=10 itens
-  │         prontos, ver ADR-024)
+  │         baixados do feed remoto, ver ADR-024/ADR-035)
   ├─ controller.setMediaItems + prepare      (autoPlay=false se vai tocar vinheta)
   └─ playRadioVinhetas(radioName)            (só quando startIndex == 0, entrada nova)
         ├─ playVinhetaResource(R.raw.radio_intro)
@@ -82,11 +93,11 @@ onMediaItemTransition(reason = AUTO)        [Player.Listener]
   ├─ a cada settings.songsBetweenBulletins (padrão 3):
   │    speakNextNewsBreak()
   │      ├─ dequeueBufferedBulletinForPlayback() → pega o 1º item com WAV tocável
-  │      │  (itens sem áudio são pulados e regenerados)
+  │      │  (itens sem áudio são pulados e descartados)
   │      ├─ protege temporariamente o nome do WAV escolhido contra a limpeza de órfãos
   │      ├─ refillBulletinBuffer() (repõe já)
-  │      ├─ voz ligada: só toca WAV pronto; sem WAV, cancela a entrada para não usar TTS Android
-  │      │  voz desligada: pode montar boletim ao vivo e falar via TTS Android
+  │      ├─ buffer vazio ou sem WAV tocável → cancela a entrada, música segue (sem
+  │      │  alternativa nenhuma - ver "Feed remoto" abaixo)
   │      ├─ resumeAfterNews = player.isPlaying; player.pause()
   │      ├─ playPassagem() → MediaPlayer toca o WAV do buffer (filesDir/radio_bulletins_ready/radio_core_*.wav)
   │      │  → playPassagem() de novo → finishNewsBreak() → retoma playback
@@ -103,164 +114,55 @@ Skip manual não conta nem cancela nada — ver races R3/R6 em [STATE_MACHINE.md
 > música. Só acontece na entrada nova (`startIndex == 0`, botão "Entrar"); pular pra uma
 > faixa específica da sessão ao vivo não replay a vinheta.
 
-## Fontes de notícia
+## Feed remoto de boletins aprovados (Cloudflare) — única fonte
 
-`NewsBulletinRepository.loadStories()` (ver ADR-014):
+Cada vaga livre de `refillBulletinBuffer()` baixa o próximo boletim já aprovado na
+central local de broadcast (`_broadcast-boletins-local/`, processo separado deste app) e
+publicado no Cloudflare (`BroadcastFeedRepository`, ver ADR-034/ADR-035 em
+[DECISIONS.md](DECISIONS.md)). Esse boletim já vem com roteiro e voz prontos da central —
+o app só baixa `.wav` + roteiro, confere tamanho/hash e entra direto no `bulletinBuffer`
+(`RadioScriptSource.BroadcastFeed`). Dedup contra boletins recentes via
+`newsReservationKey()` (título+fonte normalizados), a mesma chave usada internamente pelo
+buffer — a lógica de normalização em `BroadcastFeedRepository` precisa continuar
+reproduzindo essa fórmula exatamente (ver ADR-035, bug de dedup corrigido 16/09/2026).
 
-- 5 feeds RSS/Atom buscados **em paralelo** (`coroutineScope` + `async`/`awaitAll` —
-  sequencial custava a soma dos timeouts): g1 Mundo, g1 Ciência e saúde, Super (Abril,
-  curiosidades/ciência/história), Olhar Digital (tecnologia/novidades), BBC Brasil
-  (mundo, ângulo diferente do g1) — metade g1, metade fora, de propósito (o boletim
-  saía repetitivo demais só com g1);
-- Até 4 manchetes por feed, dedup por título, limite total de 8;
-- Captura título **e resumo** (`<description>`/`<summary>`, até 220 caracteres,
-  HTML/entities limpos) — o resumo alimenta o roteirista com conteúdo de verdade da
-  matéria, não só a manchete;
-- Timeout de rede 4,5 s por feed; feed que falhar é ignorado silenciosamente.
+**Sem alternativa quando o feed está vazio:** se `downloadNextApprovedBulletin()` não
+devolve nada (feed sem item novo) ou o WAV baixado não é tocável, a vaga do buffer fica
+vazia e, na hora do intervalo, `speakNextNewsBreak()` simplesmente cancela a entrada e a
+música segue — sem RSS, sem redator local/Gemini, sem síntese de voz local/Gemini, sem
+TTS do Android (tudo isso foi removido em 16/09/2026; ver ADR de remoção em
+DECISIONS.md). Rede fora do ar também nunca trava o app: qualquer falha em
+`BroadcastFeedRepository` é capturada e tratada como "sem boletim novo".
 
-## Escritores de roteiro (`RadioBulletin.kt`)
-
-Interface `RadioScriptWriter` com duas implementações:
-
-| Escritor | Quando é usado | Comportamento |
-|---|---|---|
-| `OptionalLocalLlmRadioScriptWriter` | modo Dialogue + pacote LLM instalado (`filesDir/radio_writer/model.ready`) | Usa Qwen3 1.7B GGUF via `llama.cpp` para reescrever o próximo boletim em JSON curto; qualquer falha, demora ou JSON inválido cai no fallback. |
-| `FallbackRadioScriptWriter` | sempre disponível | Bate-bola entre Fran (otimista) e Nico (pessimista), com abertura citando a última música, resumo da matéria pelo Nico, provocação/contra provocação, reflexão existencialista/absurdista do Nico e chamada da próxima música com curiosidade — ver ADR-014 — ou headline curta (2 falas, só Fran). |
-
-Modo é sempre `Dialogue` (diálogo completo, tenta redator local primeiro) — a seleção de
-modo (`Off`/`Headlines`/`Dialogue`) foi removida da UI (tela "Boletins da radio"); o enum
-`RadioBulletinMode` continua existindo em `RadioBulletin.kt` mas `Off`/`Headlines` não são
-mais alcançáveis por preferência do usuário.
-
-O pacote do redator local é importado pela tela de boletins. Ele fica fora do APK por
-tamanho: o pacote recomendado é `dist/Pailer-Radio-Writer-Qwen3-1.7B-Q4KM-v1.zip`
-(~1,03 GB), com `manifest.json` + `Qwen3-1.7B-Q4_K_M.gguf`.
-
-### Bate-bola Fran/Nico (ADR-014)
-
-`FallbackRadioScriptWriter.buildDialogueLines()` classifica o tema da notícia (título +
-resumo, por palavra-chave — política, economia, ciência/tecnologia, saúde, cultura pop,
-esporte, clima, curiosidade, mundo/conflito ou geral) e monta as falas com bancos de
-texto próprios por tema para cada personagem, em vez de reações genéricas soltas.
-O Nico agora resume ou explica a matéria antes de criticar, usando o resumo real do RSS
-quando existe. A opinião dos dois parte de uma leitura de mundo mais forte: capitalismo
-tardio, jogo imperialista, corporativismo, lobby, indústria cultural, plataformas e
-mercado financeiro aparecem como bagagem cultural, não como bordão repetido em toda fala.
-Extrai também um "gancho" (primeiro percentual, valor em R$ ou número grande do texto)
-para referenciar algo concreto da matéria. O bate-bola em si (`buildDialogueLines`) termina
-na contra-provocação do Nico — a "chamada de volta pra rádio" não faz mais parte dessa
-função, ver fechamento filosófico abaixo.
-
-### Fechamento filosófico + chamada de música (`withPhilosophicalCloser`)
-
-Depois que o roteiro-base (fallback ou redator local) é gerado, `LocalTuneViewModel` cola
-1 ou 2 falas novas via `RadioScript.withPhilosophicalCloser()` (`RadioBulletin.kt`),
-aplicada **depois** da geração — igual `withLastPlayedIntro` — porque só se sabe qual é a
-próxima faixa da fila em tempo de reprodução, nunca em `loadScripts()`:
-
-1. **Nico** traz uma reflexão existencialista/absurdista. Desde 02/09/2026 (ver ADR-002,
-   atualização), quando o roteiro veio do **redator local** o comentário já vem pronto
-   como a 5ª fala pedida em `buildPrompt()` — gerado em cima da matéria específica, não
-   sorteado — e `withPhilosophicalCloser` só reaproveita essa fala. Só sorteia do banco
-   fixo (`NICO_REFLECTIONS_LIGHT`/`NICO_REFLECTIONS_DEEP`, por peso conforme
-   `RadioScript.duration`) quando o roteiro veio do fallback determinístico ou o LLM não
-   entregou a 5ª fala dessa vez — nesse caso continua Camus/Sartre/Nietzsche/Beckett (só
-   citação literal segura) ou Kafka/Cioran (por tema, não por citação).
-2. **Fran** reage e chama a próxima música, citando o artista (resolvido espiando a
-   fila real do `Player`, `getMediaItemAt`) e uma curiosidade **sempre genérica de
-   gênero/época** (nunca específica do artista — decisão deliberada: o redator local é
-   pequeno demais pra arriscar inventar dado sobre banda pouco conhecida da biblioteca,
-   mesma regra de "não invente fatos" que já vale pras notícias). Cadeia gênero → época →
-   genérico em `musicTrivia()`. Sem faixa seguinte conhecida, degrada pra frase genérica
-   sem citar artista.
-
-Aplicado nos dois pontos de chamada de `withLastPlayedIntro` (pré-síntese e fallback ao
-vivo) — essencial pra o áudio pré-sintetizado e o fallback de texto ficarem consistentes.
-Só roda no modo `Dialogue` (não no `Headlines`).
-
-Na hora de tocar ou preparar o boletim, `LocalTuneViewModel` injeta a última faixa ouvida
-na primeira fala: "Você acaba de ouvir X, de Y, e vamos às notícias." Isso acontece só no
-contexto de reprodução, porque os roteiros-base são carregados quando a rádio começa e a
-música anterior só é conhecida no intervalo.
-
-Para não travar a entrada da rádio, `loadScripts()` continua carregando roteiros-base via
-fallback determinístico. O redator local entra em `refillBulletinBuffer()` (ADR-019,
-unificado em ADR-024), preparando **até `BULLETIN_BUFFER_TARGET` (10) boletins com
-antecedência** em segundo plano (um de cada vez, nunca mais de um motor de voz carregado
-ao mesmo tempo). Cada versão gerada fica cacheada como texto e, se a voz estiver ligada,
-também como áudio, num buffer único (`bulletinBuffer`) reposto assim que um item é
-consumido. Esse buffer roda **desde a abertura do app**, independente de rádio ativa ou
-não, e **sobrevive a troca/saída de rádio** (ADR-024) - boletim é 100% radio-agnostico,
-então trocar de rádio nunca cancela um preparo em andamento nem descarta o que já está
-pronto. Assim o app evita gerar dez notícias de uma vez (o buffer já vem pronto de fundo)
-mas também não fica refém de "só 1 música de antecedência" - qualquer soluço pontual de
-síntese tem folga de até 10 boletins pra se resolver antes de faltar áudio pronto.
-
-Regra de segurança em produção (11/09/2026): com a voz dos boletins ligada, a rádio não
-pode transformar um boletim verde/Gemini em TTS Android. Se não houver WAV tocável no
-momento do intervalo, a entrada é cancelada e o buffer tenta se corrigir/repor em segundo
-plano. O TTS Android só fica como fallback quando a voz dos boletins está desligada pelo
-usuário ou em caminhos manuais/legados específicos. A voz preparada é parte do valor do
-boletim, não um detalhe descartável.
-
-O botão de teste de boletim também usa o caminho real: busca uma notícia RSS no momento,
-monta o roteiro, aplica o redator local se estiver disponível, sintetiza e toca o resultado.
-Não usa mais um texto fixo de demonstração.
-
-Diferença chave da versão antiga: o número de falas é decidido **pela duração**, não
-cortado depois por `fitFor()` — antes um script fixo de 3 falas podia perder a última
-inteira se estourasse o limite de palavras, quebrando a participação igual dos dois:
-
-| Duração | Falas (base + fechamento) | Estrutura |
-|---|---|---|
-| Short | 4 + 2 | última música + manchete da Fran → Nico resume/explica com leitura crítica → Fran provoca sem ingenuidade → Nico contra provoca → reflexão do Nico → Fran chama a próxima música com curiosidade |
-| Normal | 4 + 2 | mesma estrutura, com mais margem de palavras para resumo e comentário |
-| Long | 5 + 2 | + uma fala extra do Nico contextualizando consequência/gancho antes da provocação |
-
-`fitFor()` continua como rede de segurança (apara palavras se algum banco de texto sair
-grande), mas não deve mais precisar cortar linha inteira em uso normal.
-
-Duração → limite de palavras aplicado por `fitFor()`:
-
-| Duração | Segundos alvo | Máx. palavras |
-|---|---|---|
-| Short | 20 | 155 |
-| Normal | 30 | 190 |
-| Long | 45 | 235 |
-
-Cada fala vira uma linha `RadioScriptLine(speaker, text)` — o speaker define qual voz
-do pacote sintetiza aquela linha (ver [TTS.md](TTS.md)). `RadioSpeaker.Female` = Fran
-(voz Supertonic F2), `RadioSpeaker.Male` = Nico (voz Supertonic M1) — ver ADR-018. O
-`fitFor()` acima só se aplica às falas base; as 2 falas do fechamento filosófico
-(`withPhilosophicalCloser`) têm seu próprio limite de palavras e não contam nesse
-orçamento.
+`RadioScript`/`RadioScriptLine`/`RadioSpeaker`/`RadioScriptSource` (em `RadioBulletin.kt`)
+continuam existindo como os tipos de dados do roteiro — só não há mais nenhum código
+neste app que ESCREVA um `RadioScript` do zero; `BroadcastFeedRepository` monta o objeto a
+partir do JSON publicado pela central.
 
 ## Arquivos temporários e limpeza
 
-- WAVs de anúncio: `cacheDir/radio_voice_<timestamp>.wav`;
-- WAVs persistentes do buffer: `filesDir/radio_bulletins_ready/radio_core_*.wav`;
+- WAVs persistentes do buffer (baixados do feed remoto): `filesDir/radio_bulletins_ready/
+  broadcast_<id>.wav`;
 - Quando um boletim sai do buffer para tocar, o nome do arquivo fica em
   `protectedBulletinPlaybackFileName` até o `MediaPlayer` concluir; isso impede que
   `saveCoreBufferManifest()` trate o WAV recém-selecionado como órfão só porque ele já
   saiu da fila.
 - WAV de boletim automático é deletado no `onCompletion`. Em erro do `MediaPlayer`, o app
   tenta devolver o item para a frente do buffer se o arquivo ainda for tocável, para não
-  perder trabalho caro de escrita/síntese.
-- **Órfãos conhecidos:** se o ViewModel estourar o timeout de 12 s (`withTimeoutOrNull`)
-  ou for destruído antes do callback, o serviço ainda escreve o WAV e ninguém deleta.
-  Correção planejada — ver [TODO.md](TODO.md).
+  perder um download já feito.
+- Limpeza de órfãos (`saveCoreBufferManifest()`) roda a cada mudança do buffer, com
+  `ORPHAN_CLEANUP_GRACE_MS` (1 min, reduzido de 5 min em 16/09/2026 — só precisa cobrir
+  um download em andamento, não mais uma síntese local de vários minutos).
 
 ## Quem manda no áudio durante um anúncio
 
 - Música: pausada explicitamente antes da fala (`player.pause()`), retomada depois —
   no caso da vinheta de entrada, a música nem começa (`autoPlay=false`) até ela acabar;
-- Anúncio local (sherpa) e vinhetas gravadas dividem o mesmo `MediaPlayer` dedicado
+- Vinhetas gravadas e o áudio do boletim dividem o mesmo `MediaPlayer` dedicado
   (`announcementPlayer`) e o mesmo watchdog de 90 s — um por vez, release do anterior
   antes do novo;
-- Anúncio automático com voz ligada: `MediaPlayer` precisa tocar o WAV do buffer. Se o
-  WAV não estiver tocável, a entrada é cancelada e a música volta; não cai para TTS
-  Android.
-- Anúncio fallback com voz desligada: TTS do sistema com `QUEUE_FLUSH`; vinhetas não têm
-  fallback de TTS — se o `MediaPlayer` falhar, pula direto pra música;
+- Anúncio automático: `MediaPlayer` precisa tocar o WAV do buffer. Se o WAV não estiver
+  tocável, a entrada é cancelada e a música volta — sem alternativa nenhuma (TTS do
+  Android removido 16/09/2026, ver seção "Feed remoto" acima);
 - Widgets/notificação continuam operando o player de música normalmente — é daí que
   nascem as races de "música por cima da locução" (R2 em [STATE_MACHINE.md](STATE_MACHINE.md)).

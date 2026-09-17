@@ -51,22 +51,6 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                arguments += listOf(
-                    "-DLLAMA_BUILD_TESTS=OFF",
-                    "-DLLAMA_BUILD_EXAMPLES=OFF",
-                    "-DLLAMA_BUILD_TOOLS=OFF",
-                    "-DLLAMA_BUILD_SERVER=OFF",
-                    "-DLLAMA_BUILD_APP=OFF",
-                    "-DLLAMA_BUILD_COMMON=OFF",
-                    "-DLLAMA_CURL=OFF",
-                    "-DGGML_OPENMP=OFF",
-                )
-            }
-        }
     }
 
     signingConfigs {
@@ -119,13 +103,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
-    }
-
     kotlinOptions {
         jvmTarget = "17"
     }
@@ -165,7 +142,6 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.6.0")
     implementation("io.coil-kt:coil-gif:2.6.0")
 
-    implementation(files("libs/sherpa-onnx-static-link-onnxruntime-1.13.6.aar"))
     implementation("com.google.guava:guava:33.2.0-android")
     implementation("net.jthink:jaudiotagger:3.0.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
