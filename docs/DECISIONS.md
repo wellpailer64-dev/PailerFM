@@ -1669,7 +1669,7 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   GitHub Release com assinaturas diferentes) acontecer de novo na próxima vez que os dois
   caminhos forem usados pro mesmo destinatário.
 
-## ADR-033 — Auto-atualização in-app (código pronto, ATIVAÇÃO PENDENTE — repo precisa virar público)
+## ADR-033 — Auto-atualização in-app (ATIVADA 17/09/2026 — repo virou público)
 
 - **Contexto:** usuário pediu (15/09/2026) pra quem já tem o app instalado receber um popup
   de "nova versão disponível" e atualizar direto pelo app (baixa + abre o instalador
@@ -1709,19 +1709,38 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
      qualquer leitura anônima em repo privado, prereleases ou não. Sem autenticação não dá
      pra checar releases; e colocar um token no app é inseguro (qualquer um extrai de um
      APK distribuído).
-- **PENDENTE - decisão do usuário:** perguntei se quer tornar o repositório público (única
-  forma de checagem anônima funcionar sem servidor próprio nem token exposto). Usuário
-  respondeu que vai discutir com o parceiro antes de decidir. **O código fica pronto e
-  "adormecido"**: com o repo privado, `fetchLatestRelease()` sempre devolve `null`
-  (silenciosamente, sem crash nem mensagem de erro pro usuário final) e o popup nunca
-  aparece - comportamento seguro por padrão, não precisa de flag nem reverter nada. Quando
-  o usuário decidir, só falta tornar o repo público pra a feature come  çar a funcionar
-  sozinha, sem mexer em mais nada.
-- **Não mudar sem avisar antes:** se decidirem manter o repo privado pra sempre, essa
-  feature nunca vai funcionar do jeito atual (sem servidor/backend próprio) - nesse caso,
-  a alternativa seria voltar a distribuir por link/WhatsApp manual (fluxo de antes) ou
-  montar um backend/proxy autenticado só pra expor a info de release (fora de escopo por
-  ora, não implementado).
+- **Decisão tomada 17/09/2026:** usuário confirmou com o parceiro e pediu pra tornar o
+  repositório público. Antes de mexer, conferido que nunca vazou nada sensível pro
+  histórico do git (`git log --all` por nome de arquivo e por conteúdo - sem
+  `keystore.properties`, `*.jks`, token ou senha em commit nenhum; os três sempre
+  estiveram no `.gitignore`). Repo trocado pra público via `gh repo edit --visibility
+  public --accept-visibility-change-consequences`. Checagem anônima confirmada
+  funcionando de ponta a ponta: `curl` sem token em
+  `GET /repos/wellpailer64-dev/PailerFM/releases?per_page=1` devolve o release mais
+  recente com o asset do APK.
+- **Achado no caminho: CI estava quebrado há dias, sem nenhum Release novo saindo.**
+  Investigando por que a checagem não tinha nada mais recente que oferecer (última
+  release era de 12/09/2026, cinco dias parada, mesmo com pushes normais acontecendo),
+  descoberto que `Build APK` falhava rápido (10-27s) em TODO push desde pelo menos
+  16/09/2026 - `android-actions/setup-android@v3` tenta instalar o pacote legado
+  `tools` via sdkmanager, que a Google removeu do repositório do SDK
+  (`Warning: Failed to find package 'tools'`). Corrigido em 3 rodadas (achar o
+  `sdkmanager` real do runner deu 2 tentativas erradas antes de um diagnóstico
+  completo confirmar o caminho - ver histórico de commits em `.github/workflows/
+  build-apk.yml` do mesmo dia). Build de teste rodou verde em 19m46s e publicou
+  `v2026.09.17-39` - primeira release nova em 5 dias.
+- **Otimização no mesmo commit: removido `ndk;26.1.10909125`/`cmake;3.22.1` do
+  `sdkmanager --install`.** O app não compila mais nada nativo via CMake/NDK desde a
+  remoção da síntese de voz local (ADR-035, 16/09/2026) - sem `externalNativeBuild`
+  em `app/build.gradle.kts`, sem `.so`/`jniLibs`/`CMakeLists.txt` no projeto. Baixar
+  ~1GB de NDK+CMake em toda rodada de CI sem nenhum uso real era o principal motivo do
+  build ficar lento - e ficaria lento em TODO run, não só no primeiro (GitHub Actions
+  roda numa VM nova sempre; só `actions/cache` explícito sobrevive entre runs, e esse
+  cache é só das dependências Gradle/Kotlin, não do SDK).
+- **Não mudar sem avisar antes:** repositório público expõe todo o histórico git, não
+  só o código atual - qualquer um pode clonar/dar fork a partir de agora. Se decidirem
+  voltar a privado no futuro, cópias já feitas por terceiros nesse meio-tempo não são
+  revogadas (GitHub não força-apaga forks quando a origem vira privada de novo).
 
 ## ADR-034 — Feed remoto de boletins aprovados (Cloudflare) vira fonte prioritária do buffer
 

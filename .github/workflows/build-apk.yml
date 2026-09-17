@@ -48,14 +48,22 @@ jobs:
           dirname "$SDKMANAGER_PATH" >> "$GITHUB_PATH"
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Instala NDK e CMake pinados
+      # ndk;26.1.10909125 e cmake;3.22.1 removidos daqui (17/09/2026): o app nao compila mais
+      # nenhum codigo nativo via CMake/NDK desde que a sintese de voz local (sherpa-onnx/
+      # llama.cpp) foi removida em 16/09/2026 (ADR-035) - confirmado sem
+      # externalNativeBuild/CMakeLists em app/build.gradle.kts e sem nenhum .so/jniLibs no
+      # projeto. O `ndk { abiFilters += "arm64-v8a" }` que ainda existe em build.gradle.kts e
+      # so um filtro de empacotamento pra .so vindo de dependencias (ExoPlayer etc.), nao pede
+      # o SDK component do NDK. Baixar ~1GB de NDK + CMake em toda rodada de CI, sem nenhum uso,
+      # era o motivo real do build ficar lento - nao "so no primeiro", TODO run (GitHub Actions
+      # roda numa VM nova sempre, nada fica em cache exceto o que actions/cache guarda
+      # explicitamente).
+      - name: Instala plataforma e build-tools
         run: |
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install \
             "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;26.1.10909125" \
-            "cmake;3.22.1"
+            "build-tools;34.0.0"
 
       - name: Cache Gradle
         uses: actions/cache@v4
