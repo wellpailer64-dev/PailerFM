@@ -1102,6 +1102,37 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Tenta silenciosamente trocar a letra atual por uma versao SINCRONIZADA quando a que ja
+    // esta carregada (ou vazia) nao tem sincronia - pedido do usuario (17/09/2026): letra
+    // incorporada na tag do arquivo quase nunca tem timestamp, entao a legenda nunca
+    // acompanhava a musica ate o usuario clicar manualmente em "Buscar letra online". Chamada
+    // pelos mesmos LaunchedEffect que ja disparavam fetchLyricsOnline() so quando a letra
+    // estava vazia (HomeScreen/FullPlayer) - agora tambem quando ha letra mas ela NAO tem
+    // sincronia. Diferente de fetchLyricsOnline() (usado pelo botao explicito "Buscar letra
+    // online", que sempre aplica o que achar): so troca a letra atual se o resultado vier
+    // sincronizado, ou se nao havia nada carregado antes - nunca substitui uma letra sem
+    // sincronia ja carregada por outra tambem sem sincronia (evita trocar um texto bom por um
+    // pior/diferente so porque "achou alguma coisa"). Nunca define lyrics.message: e um upgrade
+    // silencioso em segundo plano, nao um pedido explicito do usuario - mostrar "letra nao
+    // encontrada" pra quem esta vendo uma letra perfeitamente normal (so sem sincronia) seria
+    // enganoso.
+    fun autoUpgradeLyricsSyncIfNeeded(songId: Long) {
+        val current = lyricsState.value
+        if (current.songId != songId || current.isLoading || current.isFetching || current.lyrics.synced) return
+        val wasEmpty = current.lyrics.isEmpty
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return
+        lyricsState.value = lyricsState.value.copy(isFetching = true)
+        viewModelScope.launch {
+            val fetched = lyricsRepository.fetchOnline(song)
+            if (lyricsState.value.songId != songId) return@launch
+            lyricsState.value = if (fetched != null && (fetched.synced || wasEmpty)) {
+                lyricsState.value.copy(lyrics = fetched, isFetching = false)
+            } else {
+                lyricsState.value.copy(isFetching = false)
+            }
+        }
+    }
+
     fun openLyricsEditor() {
         lyricsState.value = lyricsState.value.copy(
             editorOpen = true,

@@ -1037,7 +1037,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             lyrics = lyrics,
                             onContinue = { viewModel.continuePlayback(songs) },
                             onTogglePlayPause = viewModel::togglePlayPause,
-                            onFetchLyrics = { player.songId?.let(viewModel::fetchLyricsOnline) },
+                            onAutoUpgradeLyrics = { player.songId?.let(viewModel::autoUpgradeLyricsSyncIfNeeded) },
                             onOpenAlbum = { selectedAlbum = it },
                             onOpenRadio = {
                                 radioSession = emptyList()
@@ -1282,6 +1282,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 isFavorite = viewModel.isCurrentSongFavorite(),
                 lyrics = lyrics,
                 onFetchLyrics = { player.songId?.let(viewModel::fetchLyricsOnline) },
+                onAutoUpgradeLyrics = { player.songId?.let(viewModel::autoUpgradeLyricsSyncIfNeeded) },
                 onEditLyrics = viewModel::openLyricsEditor,
                 onRemoveLyrics = { player.songId?.let(viewModel::removeLyrics) },
                 onClose = { showFullPlayer = false },
@@ -3431,7 +3432,7 @@ private fun HomeScreen(
     lyrics: LyricsUiState = LyricsUiState(),
     onContinue: () -> Unit,
     onTogglePlayPause: () -> Unit,
-    onFetchLyrics: () -> Unit,
+    onAutoUpgradeLyrics: () -> Unit = {},
     onOpenAlbum: (LocalAlbum) -> Unit,
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenCurrentPlayer: () -> Unit,
@@ -3443,23 +3444,30 @@ private fun HomeScreen(
 ) {
     // Legenda (letra sincronizada sobre o disco) na Home - toggle manual do usuario, independente
     // do auto-fetch ao arrastar pro lado no FullPlayer (ADR-023). Enquanto ligado, dispara a busca
-    // sozinho sempre que a musica atual nao tiver letra ainda - inclusive ao trocar de faixa com o
-    // toggle ja ativado (nao so no clique que liga), senao a legenda fica "presa" na letra da
-    // musica anterior. lyrics.message == null evita repetir uma busca que ja falhou pra essa
-    // musica (mesma trava do auto-fetch do player).
+    // sozinho sempre que a musica atual nao tiver letra SINCRONIZADA ainda (vazia OU so com
+    // texto sem timestamp, ex. letra incorporada na tag do arquivo - pedido do usuario
+    // 17/09/2026: a legenda nunca acompanhava a musica em varias faixas porque a letra
+    // incorporada quase nunca tem sincronia, e antes so tentava buscar online quando nao
+    // havia NENHUMA letra) - inclusive ao trocar de faixa com o toggle ja ativado (nao so no
+    // clique que liga), senao a legenda fica "presa" na letra da musica anterior.
+    // onAutoUpgradeLyrics() so troca a letra atual se achar uma versao sincronizada (ou se nao
+    // havia nada antes) - nunca troca um texto sem sincronia por outro tambem sem sincronia,
+    // ver comentario em autoUpgradeLyricsSyncIfNeeded() no ViewModel. lyrics.message == null
+    // evita repetir uma busca que ja falhou pra essa musica (mesma trava do auto-fetch do
+    // player).
     // Ligada por padrao (pedido do usuario 15/09/2026, mesma regra da reproducao automatica).
     var homeCaptionsEnabled by rememberSaveable { mutableStateOf(true) }
     val onToggleCaptions: () -> Unit = { homeCaptionsEnabled = !homeCaptionsEnabled }
-    LaunchedEffect(homeCaptionsEnabled, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.isEmpty, lyrics.message) {
+    LaunchedEffect(homeCaptionsEnabled, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.synced, lyrics.message) {
         if (homeCaptionsEnabled &&
             player.songId != null &&
             lyrics.songId == player.songId &&
             !lyrics.isLoading &&
             !lyrics.isFetching &&
-            lyrics.lyrics.isEmpty &&
+            !lyrics.lyrics.synced &&
             lyrics.message == null
         ) {
-            onFetchLyrics()
+            onAutoUpgradeLyrics()
         }
     }
     val homeRecentAlbums = remember(recentlyAddedAlbums) { recentlyAddedAlbums.take(8) }
@@ -3543,7 +3551,10 @@ private fun HomeScreen(
 
     LazyColumn(
         flingBehavior = rememberSoftFlingBehavior(),
-        contentPadding = PaddingValues(bottom = 18.dp),
+        // top = 12.dp (pedido do usuario 17/09/2026): sem padding nenhum no topo, o card do
+        // disco (primeiro item, radio ao vivo ou tocando agora/continuar ouvindo) ficava colado
+        // direto na status bar - so uma margem pequena, nao um header novo.
+        contentPadding = PaddingValues(top = 12.dp, bottom = 18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         // Sessao do disco (radio ao vivo OU tocando agora/continuar ouvindo) preenche a tela
@@ -7772,6 +7783,7 @@ private fun FullPlayer(
     onSeek: (Long) -> Unit,
     lyrics: LyricsUiState = LyricsUiState(),
     onFetchLyrics: () -> Unit = {},
+    onAutoUpgradeLyrics: () -> Unit = {},
     onEditLyrics: () -> Unit = {},
     onRemoveLyrics: () -> Unit = {},
     albumSongs: List<LocalSong> = emptyList(),
@@ -7877,20 +7889,25 @@ private fun FullPlayer(
                 // titulo/seek/controles/"Mais de <album>" ficam na posicao exata de sempre.
                 val pagerState = rememberPagerState(pageCount = { 2 })
                 // Arrastar ate a pagina da letra ja e um pedido implicito de ve-la - dispara a
-                // busca online sozinho quando chega la sem letra carregada ainda, sem precisar de
-                // botao "Buscar online" (pedido do usuario 15/09/2026). So tenta 1 vez por musica:
-                // se falhar, lyrics.message fica preenchido e trava o auto-retry ate trocar de
-                // faixa (ai o ViewModel reresenta o estado e message volta a null).
-                LaunchedEffect(pagerState.currentPage, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.isEmpty, lyrics.message) {
+                // busca online sozinho quando chega la sem letra SINCRONIZADA ainda (vazia OU so
+                // com texto sem timestamp - pedido do usuario 17/09/2026, mesmo motivo do
+                // LaunchedEffect equivalente em HomeScreen), sem precisar de botao "Buscar
+                // online" (pedido do usuario 15/09/2026). onAutoUpgradeLyrics() so troca a letra
+                // atual se achar uma versao sincronizada (ou se nao havia nada antes), ver
+                // autoUpgradeLyricsSyncIfNeeded() no ViewModel. So tenta 1 vez por musica: se
+                // falhar (ou nao achar nada com sincronia), lyrics.message so fica preenchido se
+                // a letra estava vazia - com letra sem sincronia ja carregada, so para de tentar
+                // sem mensagem de erro nenhuma (nao e uma falha, so nao tinha nada melhor).
+                LaunchedEffect(pagerState.currentPage, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.synced, lyrics.message) {
                     if (pagerState.currentPage == 1 &&
                         player.songId != null &&
                         lyrics.songId == player.songId &&
                         !lyrics.isLoading &&
                         !lyrics.isFetching &&
-                        lyrics.lyrics.isEmpty &&
+                        !lyrics.lyrics.synced &&
                         lyrics.message == null
                     ) {
-                        onFetchLyrics()
+                        onAutoUpgradeLyrics()
                     }
                 }
                 HorizontalPager(
@@ -8117,7 +8134,7 @@ private fun LyricsOverflowMenu(
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(
-                text = { Text(if (hasLyrics) "Editar letra" else "Colar letra") },
+                text = { Text(if (hasLyrics) "Editar letra" else "Adicionar letra") },
                 onClick = { expanded = false; onEdit() },
             )
             DropdownMenuItem(
@@ -8135,7 +8152,7 @@ private fun LyricsOverflowMenu(
 }
 
 // Pagina de letra do player (arrasta pro lado a partir da capa). Estados: carregando / vazio (a
-// busca online ja disparou sozinha ao chegar aqui - so mostra "Colar letra" se ela falhar, ver o
+// busca online ja disparou sozinha ao chegar aqui - so mostra "Adicionar letra" se ela falhar, ver o
 // LaunchedEffect em FullPlayer) / buscando / com letra sincronizada (destaca e rola a linha atual
 // usando player.positionMs, que ja pulsa pelo polling existente - sem timer novo) / letra sem
 // sincronia (texto rolavel).
@@ -8170,7 +8187,7 @@ private fun LyricsPage(
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = onEdit) { Text("Colar letra") }
+                Button(onClick = onEdit) { Text("Adicionar letra") }
             }
 
             else -> {
@@ -8288,7 +8305,7 @@ private fun LyricsEditorDialog(
                 onValueChange = onDraftChange,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 360.dp),
                 minLines = 8,
-                placeholder = { Text("Cole a letra aqui (aceita formato .lrc com tempos).") },
+                placeholder = { Text("Cole ou escreva a letra aqui (aceita formato .lrc com tempos).") },
             )
         },
         confirmButton = {

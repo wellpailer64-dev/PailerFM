@@ -2057,3 +2057,45 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
 - **Não mudar sem:** manter a garantia de que um manifest sem nenhum item `especial` se
   comporta **exatamente** como antes desta ADR (zero mudança de comportamento pra quem
   nunca usar a feature) - `isSpecial` sempre `false` por default em toda leitura/escrita.
+
+## ADR-038 — Home: margem do card do disco + legenda sempre tenta sincronia + rótulo de letra manual
+
+- **Contexto (17/09/2026):** três pedidos do usuário testando o app depois da ADR-037,
+  primeira leva de mudanças usando a auto-atualização in-app recém-ativada (ADR-033) em
+  vez de instalar via ADB.
+- **1. Card do disco colado no topo:** `HomeScreen`, o `LazyColumn` principal (card do
+  disco/radio ao vivo é o primeiro item) não tinha `contentPadding` nenhum no topo (só
+  `bottom = 18.dp`) - o card ficava colado direto na status bar. Corrigido com
+  `top = 12.dp`, sem mexer em mais nada da estrutura (sem header novo).
+- **2. Legenda (letra sincronizada sobre o disco) nunca acompanhava a música em várias
+  faixas:** `HomeScreen`/`FullPlayer` só disparavam busca online de letra automaticamente
+  quando NÃO havia letra nenhuma (`lyrics.lyrics.isEmpty`). Letra incorporada na tag do
+  arquivo (ID3 `USLT` e equivalentes) quase nunca tem timestamp - carregava sem sincronia
+  e nunca tentava melhorar, mesmo com internet disponível e o usuário nunca percebendo
+  que dava pra ter algo melhor. Corrigido: condição virou `!lyrics.lyrics.synced` (dispara
+  também quando há letra mas sem sincronia, não só quando está vazia) chamando uma função
+  nova, `LocalTuneViewModel.autoUpgradeLyricsSyncIfNeeded()`, em vez de
+  `fetchLyricsOnline()` direto - essa função só SUBSTITUI a letra atual se achar uma
+  versão sincronizada online (ou se não havia nada carregado antes); se a busca só achar
+  outro texto sem sincronia, mantém o que já estava mostrando (evita trocar uma letra
+  incorporada boa por outra pior/diferente só porque "achou alguma coisa" em outra fonte)
+  e nunca mostra mensagem de erro (é um upgrade silencioso em segundo plano, não um pedido
+  explícito do usuário). `fetchLyricsOnline()` original continua intacto, ainda usado pelo
+  botão explícito "Buscar letra online" no menu de opções - lá faz sentido aplicar
+  qualquer coisa que achar, porque foi pedido na hora.
+- **3. "Escrever letra" quando não existe nenhuma:** já existia de verdade - o botão
+  "Colar letra" (vazio) / "Editar letra" (com letra) sempre abriu o mesmo
+  `LyricsEditorDialog` com um `OutlinedTextField` comum, que aceita digitar OU colar
+  igualmente (é só um campo de texto multi-linha). O problema era só o RÓTULO: "Colar
+  letra" e o placeholder "Cole a letra aqui" sugeriam que só dava pra colar, escondendo
+  que dava pra digitar a letra do zero. Renomeado pra "Adicionar letra" (botão e item do
+  menu) e placeholder pra "Cole ou escreva a letra aqui (...)" - mesma funcionalidade de
+  sempre, só deixando claro que as duas formas funcionam. Nenhuma mudança de código no
+  fluxo de salvar (`LyricsRepository.save()`/`LyricsSource.MANUAL` já cobriam isso).
+- **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, sem warning novo (inclusive
+  removido `onFetchLyrics` de `HomeScreen`, que ficou sem uso depois da mudança #2 - só
+  `FullPlayer` ainda precisa dele, pro botão explícito).
+- **Teste combinado com a ADR-033:** usuário vai confirmar essas três mudanças
+  instalando via o popup de auto-atualização (push → CI → Release novo → app pede pra
+  atualizar sozinho), não via `adb install` manual - primeiro teste de ponta a ponta da
+  auto-atualização desde que foi ativada.
