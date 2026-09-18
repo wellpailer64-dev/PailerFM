@@ -38,6 +38,11 @@ class BroadcastFeedRepository(private val context: Context) {
     suspend fun downloadNextApprovedBulletin(
         targetDir: File,
         reservedKeys: Set<String>,
+        // Chaves "so deste buffer" usadas se a rodada normal (reservedKeys, historico completo)
+        // nao devolver nada - ver comentario sobre pool esgotado do feed abaixo. Default vazio
+        // preserva o comportamento antigo (sem fallback) pra quem nao passar nada, ex.
+        // checkForSpecialOnAppOpen().
+        fallbackReservedKeys: Set<String> = emptySet(),
         // true quando o chamador so tem vagas RESERVADAS pra especial sobrando (ver
         // BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS em LocalTuneViewModel.kt/ADR-037) - ignora
         // itens normais mesmo que existam, pra nao gastar essas vagas com conteudo comum.
@@ -49,7 +54,7 @@ class BroadcastFeedRepository(private val context: Context) {
             }
         }
         try {
-            downloadNextApprovedBulletinBlocking(targetDir, reservedKeys, specialOnly)
+            downloadNextApprovedBulletinBlocking(targetDir, reservedKeys, fallbackReservedKeys, specialOnly)
         } finally {
             cancelWatchdog.dispose()
         }
@@ -58,6 +63,7 @@ class BroadcastFeedRepository(private val context: Context) {
     private fun downloadNextApprovedBulletinBlocking(
         targetDir: File,
         reservedKeys: Set<String>,
+        fallbackReservedKeys: Set<String>,
         specialOnly: Boolean,
     ): RemoteApprovedBulletin? {
         return runCatching {
@@ -83,6 +89,24 @@ class BroadcastFeedRepository(private val context: Context) {
             for (item in ordered) {
                 val bulletin = tryDownloadApprovedItem(item, targetDir, reservedKeys, logSkipReason = specialOnly)
                 if (bulletin != null) return@runCatching bulletin
+            }
+            // Pool de boletins aprovados no feed pode ser menor que o historico anti-repeticao
+            // (RECENT_BULLETIN_STORY_KEY_LIMIT em LocalTuneViewModel.kt) - sem esta saida, assim
+            // que cada item do manifest ja tiver tocado uma vez, reservedKeys bloqueia o feed
+            // INTEIRO pra sempre (nada novo nunca aparece pra "abrir vaga" no historico) e o
+            // buffer fica vazio permanentemente, sem erro nenhum - descoberto ao vivo 18/09/2026
+            // (radio parou de tocar boletim depois de uns dias). Preferimos repetir o boletim
+            // menos recente a nunca mais tocar nenhum - so nao repete um item que ja esta
+            // sentado no buffer AGORA (fallbackReservedKeys), mesmo criterio de fail-open ja
+            // usado pra "expires_at" ausente acima.
+            if (!specialOnly && ordered.isNotEmpty()) {
+                for (item in ordered) {
+                    val bulletin = tryDownloadApprovedItem(item, targetDir, fallbackReservedKeys, logSkipReason = false)
+                    if (bulletin != null) {
+                        Log.w(TAG, "boletim: pool do feed esgotado contra o historico anti-repeticao - repetindo boletim ja tocado")
+                        return@runCatching bulletin
+                    }
+                }
             }
             null
         }.onFailure {

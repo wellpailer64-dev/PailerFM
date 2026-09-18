@@ -2792,6 +2792,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         return reserved
     }
 
+    // Só as chaves que JÁ estão nesta rodada do buffer (não o histórico de reproduções
+    // antigas) - usado como fallback quando o pool do feed é menor que
+    // RECENT_BULLETIN_STORY_KEY_LIMIT (ver downloadNextApprovedBulletin/fallbackReservedKeys em
+    // BroadcastFeedRepository): melhor repetir um boletim já tocado há dias do que duplicar um
+    // item que está sentado no buffer agora mesmo.
+    private fun currentBulletinBufferKeys(): Set<String> =
+        bulletinBuffer.mapNotNull { item -> item.script.newsReservationKey().takeIf { it.isNotBlank() } }.toSet()
+
     private fun RadioScript.newsReservationKey(): String =
         "${story.source.normalizedBulletinKeyPart()}|${story.title.normalizedBulletinKeyPart()}"
 
@@ -2910,6 +2918,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             broadcastFeedRepository.downloadNextApprovedBulletin(
                                 targetDir = coreBufferDir,
                                 reservedKeys = currentReservedBulletinStoryKeys(),
+                                fallbackReservedKeys = currentBulletinBufferKeys(),
                                 specialOnly = specialOnly,
                             )
                         }
