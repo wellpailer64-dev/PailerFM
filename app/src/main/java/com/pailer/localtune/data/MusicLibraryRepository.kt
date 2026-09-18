@@ -125,20 +125,34 @@ class MusicLibraryRepository(private val context: Context) {
                         val albumArtistOverride = getAlbumArtistOverride(albumId, rawAlbum)
                         val artistOverride = metadataPrefs.getString(artistOverrideKey(rawArtist), null)
                         val uri = ContentUris.withAppendedId(collection, id)
+                        // Override por FAIXA UNICA (ver saveTrackTitleOverride e afins) - prevalece
+                        // sobre qualquer override de album, porque o usuario editou essa faixa
+                        // especificamente (ex.: "AUD1028389.mp3" recebida por WhatsApp).
+                        val trackTitleOverride = getTrackTitleOverride(id)
+                        val trackArtistOverride = getTrackArtistOverride(id)
+                        val trackAlbumOverride = getTrackAlbumOverride(id)
+                        val trackGenreOverride = getTrackGenreOverride(id)
+                        val trackYearOverride = getTrackYearOverride(id)
                         add(
                             LocalSong(
                                 id = id,
-                                title = cursor.getString(titleColumn).cleanUnknown("Sem titulo"),
-                                artist = albumArtistOverride?.takeIf { it.isNotBlank() }
+                                title = trackTitleOverride?.takeIf { it.isNotBlank() }
+                                    ?: cursor.getString(titleColumn).cleanUnknown("Sem titulo"),
+                                artist = trackArtistOverride?.takeIf { it.isNotBlank() }
+                                    ?: albumArtistOverride?.takeIf { it.isNotBlank() }
                                     ?: artistOverride?.takeIf { it.isNotBlank() }
                                     ?: rawArtist,
-                                album = album,
+                                album = trackAlbumOverride?.takeIf { it.isNotBlank() } ?: album,
                                 albumId = albumId,
                                 durationMs = cursor.getLong(durationColumn),
                                 trackNumber = cursor.getInt(trackColumn),
                                 dateAdded = cursor.getLong(dateAddedColumn),
-                                genre = genreOverride?.takeIf { it.isNotBlank() } ?: rawGenre,
-                                year = yearOverride?.takeIf { it > 0 } ?: cursor.getInt(yearColumn),
+                                genre = trackGenreOverride?.takeIf { it.isNotBlank() }
+                                    ?: genreOverride?.takeIf { it.isNotBlank() }
+                                    ?: rawGenre,
+                                year = trackYearOverride?.takeIf { it > 0 }
+                                    ?: yearOverride?.takeIf { it > 0 }
+                                    ?: cursor.getInt(yearColumn),
                                 contentUri = uri,
                             )
                         )
@@ -798,7 +812,134 @@ class MusicLibraryRepository(private val context: Context) {
             .apply()
     }
 
+    // --- Edicao de metadados de UMA faixa (pedido do usuario 17/09/2026) - mesmo padrao dos
+    // overrides de album acima, so que a chave e o songId em vez de albumId+titulo. Cobre o caso
+    // de faixa recebida por app de mensagem com nome tipo "AUD1028389.mp3": da pra corrigir
+    // titulo/album/artista/genero/ano so daquela faixa, sem afetar o resto do album que ela
+    // esteja agrupada hoje (ex.: outras faixas com o mesmo albumId de pasta compartilhada).
+    fun saveTrackTitleOverride(song: LocalSong, title: String) {
+        metadataPrefs.edit()
+            .putString(trackTitleOverrideKey(song.id), title)
+            .remove(trackTagWriteAppliedKey(song.id))
+            .apply()
+    }
+
+    fun saveTrackArtistOverride(song: LocalSong, artist: String) {
+        metadataPrefs.edit()
+            .putString(trackArtistOverrideKey(song.id), artist)
+            .remove(trackTagWriteAppliedKey(song.id))
+            .apply()
+    }
+
+    fun saveTrackAlbumOverride(song: LocalSong, album: String) {
+        metadataPrefs.edit()
+            .putString(trackAlbumOverrideKey(song.id), album)
+            .remove(trackTagWriteAppliedKey(song.id))
+            .apply()
+    }
+
+    fun saveTrackGenreOverride(song: LocalSong, genre: String) {
+        metadataPrefs.edit()
+            .putString(trackGenreOverrideKey(song.id), genre)
+            .remove(trackTagWriteAppliedKey(song.id))
+            .apply()
+    }
+
+    fun saveTrackYearOverride(song: LocalSong, year: Int) {
+        metadataPrefs.edit()
+            .putInt(trackYearOverrideKey(song.id), year)
+            .remove(trackTagWriteAppliedKey(song.id))
+            .apply()
+    }
+
+    private fun getTrackTitleOverride(songId: Long): String? =
+        metadataPrefs.getString(trackTitleOverrideKey(songId), null)
+
+    private fun getTrackArtistOverride(songId: Long): String? =
+        metadataPrefs.getString(trackArtistOverrideKey(songId), null)
+
+    private fun getTrackAlbumOverride(songId: Long): String? =
+        metadataPrefs.getString(trackAlbumOverrideKey(songId), null)
+
+    private fun getTrackGenreOverride(songId: Long): String? =
+        metadataPrefs.getString(trackGenreOverrideKey(songId), null)
+
+    private fun getTrackYearOverride(songId: Long): Int? {
+        val key = trackYearOverrideKey(songId)
+        return if (metadataPrefs.contains(key)) metadataPrefs.getInt(key, 0) else null
+    }
+
+    private fun trackTitleOverrideKey(songId: Long): String = "track_title:$songId"
+    private fun trackArtistOverrideKey(songId: Long): String = "track_artist:$songId"
+    private fun trackAlbumOverrideKey(songId: Long): String = "track_album:$songId"
+    private fun trackGenreOverrideKey(songId: Long): String = "track_genre:$songId"
+    private fun trackYearOverrideKey(songId: Long): String = "track_year:$songId"
+    private fun trackTagWriteAppliedKey(songId: Long): String = "tag_write_applied_track:$songId"
+
+    private fun trackTagWriteFingerprint(
+        songId: Long,
+        title: String?,
+        album: String?,
+        artist: String?,
+        genre: String?,
+        year: Int?,
+    ): String =
+        buildString {
+            append(songId)
+            append("|title=")
+            append(title.orEmpty().trim())
+            append("|album=")
+            append(album.orEmpty().trim())
+            append("|artist=")
+            append(artist.orEmpty().trim())
+            append("|genre=")
+            append(genre.orEmpty().trim())
+            append("|year=")
+            append(year?.toString().orEmpty())
+        }
+
+    private fun trackPendingTagChanges(songs: List<LocalSong>): List<PendingTagChange> =
+        songs.mapNotNull { song ->
+            val titleOverride = getTrackTitleOverride(song.id)?.takeIf { it.isNotBlank() }
+            val albumOverride = getTrackAlbumOverride(song.id)?.takeIf { it.isNotBlank() }
+            val artistOverride = getTrackArtistOverride(song.id)?.takeIf { it.isNotBlank() }
+            val genreOverride = getTrackGenreOverride(song.id)?.takeIf { it.isNotBlank() }
+            val yearOverride = getTrackYearOverride(song.id)?.takeIf { it > 0 }
+            val fields = buildList {
+                if (!titleOverride.isNullOrBlank()) add("Titulo: $titleOverride")
+                if (!albumOverride.isNullOrBlank()) add("Album: $albumOverride")
+                if (!artistOverride.isNullOrBlank()) add("Artista: $artistOverride")
+                if (!genreOverride.isNullOrBlank()) add("Genero: $genreOverride")
+                if (yearOverride != null) add("Ano: $yearOverride")
+            }
+            if (fields.isEmpty()) return@mapNotNull null
+            val fingerprint = trackTagWriteFingerprint(song.id, titleOverride, albumOverride, artistOverride, genreOverride, yearOverride)
+            if (metadataPrefs.getString(trackTagWriteAppliedKey(song.id), null) == fingerprint) {
+                return@mapNotNull null
+            }
+            PendingTagChange(
+                id = "track:${song.id}",
+                albumTitle = titleOverride ?: song.title,
+                artistName = artistOverride ?: song.artist,
+                artworkUri = song.artworkUri,
+                songCount = 1,
+                fields = fields,
+                songIds = listOf(song.id),
+                albumValue = albumOverride,
+                artistValue = artistOverride,
+                genreValue = genreOverride,
+                yearValue = yearOverride,
+                titleValue = titleOverride,
+                trackId = song.id,
+                writeFingerprint = fingerprint,
+            )
+        }
+
     fun pendingTagChanges(songs: List<LocalSong>): List<PendingTagChange> =
+        (albumPendingTagChanges(songs) + trackPendingTagChanges(songs))
+            .sortedBy { it.albumTitle.lowercase() }
+
+    private fun albumPendingTagChanges(songs: List<LocalSong>): List<PendingTagChange> =
         albumsFrom(songs).mapNotNull { album ->
             val titleOverride = getAlbumTitleOverride(album.id, album.title)
                 ?.takeIf { it.isNotBlank() }
@@ -890,9 +1031,13 @@ class MusicLibraryRepository(private val context: Context) {
         if (appliedChanges.isNotEmpty()) {
             val editor = metadataPrefs.edit()
             appliedChanges.forEach { change ->
-                val firstSong = change.songIds.firstNotNullOfOrNull { songsById[it] }
-                if (firstSong != null) {
-                    editor.putString(tagWriteAppliedKey(firstSong.albumId, firstSong.album), change.writeFingerprint)
+                if (change.trackId != null) {
+                    editor.putString(trackTagWriteAppliedKey(change.trackId), change.writeFingerprint)
+                } else {
+                    val firstSong = change.songIds.firstNotNullOfOrNull { songsById[it] }
+                    if (firstSong != null) {
+                        editor.putString(tagWriteAppliedKey(firstSong.albumId, firstSong.album), change.writeFingerprint)
+                    }
                 }
             }
             editor.apply()
@@ -923,6 +1068,7 @@ class MusicLibraryRepository(private val context: Context) {
 
         val audioFile = AudioFileIO.read(tempFile)
         val tag = audioFile.tagOrCreateAndSetDefault
+        change.titleValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.TITLE, it) }
         change.albumValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ALBUM, it) }
         change.artistValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ARTIST, it) }
         change.genreValue?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.GENRE, it) }

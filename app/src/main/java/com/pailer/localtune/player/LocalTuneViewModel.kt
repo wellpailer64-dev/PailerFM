@@ -1848,6 +1848,71 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             )
     }
 
+    // Edicao de UMA faixa (pedido do usuario 17/09/2026) - mesmo padrao de saveAlbumMetadataEdit,
+    // so que troca so a faixa clicada (por id), nao o album inteiro. Cobre faixas recebidas por
+    // app de mensagem com nome tipo "AUD1028389.mp3": da pra corrigir titulo/album/artista/genero/
+    // ano so dela. Como albumsFrom/artistsFrom agrupam por albumId+titulo e por artista, mudar o
+    // album/artista aqui naturalmente "destaca" a faixa do grupo antigo sem mexer nas outras.
+    fun saveTrackMetadataEdit(
+        song: LocalSong,
+        title: String,
+        artistName: String,
+        album: String,
+        genre: String,
+        year: Int = song.year,
+    ): LocalSong {
+        val cleanTitle = title.trim().ifBlank { song.title }
+        val cleanArtist = artistName.trim().ifBlank { song.artist }
+        val cleanAlbum = album.trim().ifBlank { song.album }
+        val cleanGenre = genre.trim()
+        val cleanYear = year.takeIf { it > 0 } ?: 0
+        val titleChanged = cleanTitle != song.title
+        val artistChanged = cleanArtist != song.artist
+        val albumChanged = cleanAlbum != song.album
+        val genreChanged = cleanGenre != song.genre
+        val yearChanged = cleanYear > 0 && cleanYear != song.year
+
+        if (titleChanged) repository.saveTrackTitleOverride(song, cleanTitle)
+        if (artistChanged) repository.saveTrackArtistOverride(song, cleanArtist)
+        if (albumChanged) repository.saveTrackAlbumOverride(song, cleanAlbum)
+        if (genreChanged) repository.saveTrackGenreOverride(song, cleanGenre)
+        if (yearChanged) repository.saveTrackYearOverride(song, cleanYear)
+
+        val updatedSongs = libraryState.value.songs.map { existing ->
+            if (existing.id != song.id) {
+                existing
+            } else {
+                existing.copy(
+                    title = if (titleChanged) cleanTitle else existing.title,
+                    artist = if (artistChanged) cleanArtist else existing.artist,
+                    album = if (albumChanged) cleanAlbum else existing.album,
+                    genre = if (genreChanged) cleanGenre else existing.genre,
+                    year = if (yearChanged) cleanYear else existing.year,
+                )
+            }
+        }
+
+        libraryState.value = libraryState.value.copy(songs = updatedSongs)
+        rebuildLibraryContent()
+        viewModelScope.launch { repository.saveCachedSongs(updatedSongs) }
+        val pending = repository.pendingTagChanges(updatedSongs)
+        requestedTagWriteChanges = if (titleChanged || artistChanged || albumChanged || genreChanged || yearChanged) {
+            pending.filter { change -> change.trackId == song.id }
+        } else {
+            emptyList()
+        }
+        metadataState.value = metadataState.value.copy(
+            pendingTagChanges = pending,
+            message = if (requestedTagWriteChanges.isEmpty()) {
+                "Nada mudou nessa faixa."
+            } else {
+                "Metadados salvos. O Android vai pedir permissao para gravar a faixa."
+            },
+        )
+
+        return updatedSongs.firstOrNull { it.id == song.id } ?: song
+    }
+
     fun scanPendingTagWrites() {
         val songs = libraryState.value.songs
         metadataState.value = metadataState.value.copy(isScanning = true, message = null)

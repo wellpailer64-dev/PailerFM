@@ -429,6 +429,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(MainTab.Home) }
     var librarySection by rememberSaveable { mutableStateOf(LibrarySection.Artists) }
     var showFullPlayer by rememberSaveable { mutableStateOf(false) }
+    var showTrackEditor by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var settingsPage by rememberSaveable { mutableStateOf(SettingsPage.Main) }
     var selectedAlbum by remember { mutableStateOf<LocalAlbum?>(null) }
@@ -714,6 +715,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
 
     BackHandler(enabled = canHandleBack) {
         when {
+            showTrackEditor -> showTrackEditor = false
             showFullPlayer -> showFullPlayer = false
             showSettings -> {
                 when (settingsPage) {
@@ -777,8 +779,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             selectedArtist = null
             // radioSession NAO e limpa aqui de proposito - trocar de aba so fecha a tela de
             // detalhe, a radio pode continuar tocando em segundo plano e o usuario pode voltar
-            // pra ela clicando no card "ao vivo" (ver openActiveRadio).
-            selectedRadio = null
+            // pra ela clicando no card "ao vivo" (ver openActiveRadio) OU clicando de novo no
+            // botao da radio abaixo.
+            //
+            // Pedido do usuario 17/09/2026: com uma radio ativa tocando, sair pra Inicio e depois
+            // clicar no botao do meio (radio) tem que voltar PRA DENTRO da radio que esta tocando,
+            // nao pra lista de outras radios - a lista so aparece se o usuario sair da radio atual
+            // de verdade (stopRadio). Mesmo trecho de busca que openActiveRadio usa mais abaixo.
+            selectedRadio = if (tab == MainTab.Radio) {
+                radios.firstOrNull { it.name == player.activeRadioName }
+            } else {
+                null
+            }
             selectedGenre = null
             isGeneratingRadio = false
             selectedTab = tab
@@ -1269,6 +1281,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         }
 
         if (showFullPlayer) {
+            val playingSong = remember(player.songId, songs) {
+                songs.firstOrNull { it.id == player.songId }
+            }
             val playingAlbum = remember(player.songId, songs, albums) {
                 songs.firstOrNull { it.id == player.songId }
                     ?.let { song -> albums.firstOrNull { it.id == song.albumId } }
@@ -1284,6 +1299,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 onAutoUpgradeLyrics = { player.songId?.let(viewModel::autoUpgradeLyricsSyncIfNeeded) },
                 onEditLyrics = viewModel::openLyricsEditor,
                 onRemoveLyrics = { player.songId?.let(viewModel::removeLyrics) },
+                onEditTrack = { showTrackEditor = true },
                 onClose = { showFullPlayer = false },
                 onToggleFavorite = viewModel::toggleCurrentSongFavorite,
                 onToggle = viewModel::togglePlayPause,
@@ -1315,6 +1331,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     onSave = { player.songId?.let(viewModel::saveLyrics) },
                     onRemove = { player.songId?.let(viewModel::removeLyrics) },
                     onDismiss = viewModel::dismissLyricsEditor,
+                )
+            }
+            if (showTrackEditor && playingSong != null) {
+                TrackMetadataEditorOverlay(
+                    song = playingSong,
+                    availableGenres = availableGenres,
+                    onCancel = { showTrackEditor = false },
+                    onSave = { title, artistName, album, genre, year ->
+                        viewModel.saveTrackMetadataEdit(playingSong, title, artistName, album, genre, year)
+                        requestRecentMetadataEditWrite()
+                        showTrackEditor = false
+                    },
                 )
             }
         }
@@ -3192,7 +3220,7 @@ private fun PendingTagChangeRow(change: PendingTagChange) {
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${change.artistName} • ${change.songCount} faixas",
+                "${change.artistName} • ${change.songCount} ${if (change.songCount == 1) "faixa" else "faixas"}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 1,
@@ -5380,6 +5408,86 @@ private fun AlbumMetadataEditorOverlay(
                     }
                     Button(
                         onClick = { onSave(title, artist, genre, year.toIntOrNull() ?: 0) },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Salvar")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Edicao de metadados de UMA faixa (pedido do usuario 17/09/2026) - aberta pelos 3 pontinhos ao
+// lado do X do player cheio ("Editar faixa"). Cobre o caso de faixa recebida por app de mensagem
+// com nome tipo "AUD1028389.mp3": da pra corrigir titulo/album/artista/genero/ano so dela, sem
+// precisar editar o album inteiro (ver saveTrackMetadataEdit no ViewModel).
+@Composable
+private fun TrackMetadataEditorOverlay(
+    song: LocalSong,
+    availableGenres: List<String>,
+    onCancel: () -> Unit,
+    onSave: (String, String, String, String, Int) -> Unit,
+) {
+    var title by remember(song.id) { mutableStateOf(song.title) }
+    var artist by remember(song.id) { mutableStateOf(song.artist) }
+    var album by remember(song.id) { mutableStateOf(song.album) }
+    var genre by remember(song.id) { mutableStateOf(song.genre) }
+    var year by remember(song.id) { mutableStateOf(song.year.takeIf { it > 0 }?.toString().orEmpty()) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.58f)),
+    ) {
+        Surface(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(18.dp)
+                .fillMaxWidth(),
+            color = PailerSurfaceHigh,
+            shape = RoundedCornerShape(8.dp),
+            tonalElevation = 10.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Editar faixa",
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onBackground,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    IconButton(onClick = onCancel) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancelar", tint = MaterialTheme.colorScheme.onBackground)
+                    }
+                }
+                MetadataTextField(value = title, onValueChange = { title = it }, label = "Nome da faixa")
+                MetadataTextField(value = artist, onValueChange = { artist = it }, label = "Nome do artista")
+                MetadataTextField(value = album, onValueChange = { album = it }, label = "Nome do album")
+                GenreTagField(
+                    value = genre,
+                    onValueChange = { genre = it },
+                    suggestions = availableGenres,
+                )
+                MetadataTextField(
+                    value = year,
+                    onValueChange = { input -> year = input.filter { it.isDigit() }.take(4) },
+                    label = "Ano de lançamento",
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    TextButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                        Text("Cancelar")
+                    }
+                    Button(
+                        onClick = { onSave(title, artist, album, genre, year.toIntOrNull() ?: 0) },
                         modifier = Modifier.weight(1f),
                     ) {
                         Text("Salvar")
@@ -7756,6 +7864,7 @@ private fun FullPlayer(
     onAutoUpgradeLyrics: () -> Unit = {},
     onEditLyrics: () -> Unit = {},
     onRemoveLyrics: () -> Unit = {},
+    onEditTrack: () -> Unit = {},
     albumSongs: List<LocalSong> = emptyList(),
     onOpenAlbum: (() -> Unit)? = null,
     onOpenArtist: (() -> Unit)? = null,
@@ -7818,6 +7927,7 @@ private fun FullPlayer(
                         onEdit = onEditLyrics,
                         onFetch = onFetchLyrics,
                         onRemove = onRemoveLyrics,
+                        onEditTrack = onEditTrack,
                     )
                 }
                 IconButton(onClick = onClose) {
@@ -8092,13 +8202,14 @@ private fun LyricsOverflowMenu(
     onEdit: () -> Unit,
     onFetch: () -> Unit,
     onRemove: () -> Unit,
+    onEditTrack: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { expanded = true }, enabled = enabled) {
             Icon(
                 Icons.Filled.MoreVert,
-                contentDescription = "Opções de letra",
+                contentDescription = "Mais opções",
                 tint = MaterialTheme.colorScheme.onBackground,
             )
         }
@@ -8117,6 +8228,10 @@ private fun LyricsOverflowMenu(
                     onClick = { expanded = false; onRemove() },
                 )
             }
+            DropdownMenuItem(
+                text = { Text("Editar faixa") },
+                onClick = { expanded = false; onEditTrack() },
+            )
         }
     }
 }

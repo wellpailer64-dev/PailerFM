@@ -105,6 +105,13 @@ data class PendingTagChange(
     val artistValue: String?,
     val genreValue: String?,
     val yearValue: Int?,
+    // So preenchido pra edicao de UMA faixa (ver saveTrackTitleOverride) - edicao de album nunca
+    // mexe no titulo da faixa, so em album/artista/genero/ano compartilhados por todo o album.
+    val titleValue: String? = null,
+    // Nao-nulo so pra mudanca ESCOPADA A UMA FAIXA (trackPendingTagChanges) - usado pra marcar o
+    // "ja gravado" por faixa (trackTagWriteAppliedKey) em vez de por album, senao colidiria com a
+    // chave de "ja gravado" de edicao de album (tagWriteAppliedKey usa albumId+titulo do album).
+    val trackId: Long? = null,
     val writeFingerprint: String,
 )
 
