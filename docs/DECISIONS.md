@@ -2312,3 +2312,77 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   quando um boletim real toca - depende do buffer interno decidir tocar um boletim, não
   dá pra forçar de fora; lógica implementada e revisada mas sem confirmação em teste real
   ainda.
+
+## ADR-043 — Rotação aleatória de cenas, transição de trocar o disco, filtro VHS e 3 correções reais de bug (supera partes do ADR-042)
+
+- **Contexto (18/09/2026, mesmo dia do ADR-042):** três rodadas seguidas de feedback ao
+  vivo do usuário testando no aparelho (dele mesmo mexendo, e por `adb screencap`) sobre o
+  que o ADR-042 tinha acabado de introduzir. Resultado: 3 bugs reais corrigidos e a
+  sequência de cenas deixou de ser uma ordem fixa.
+- **Bug 1 - "modo cinema" em duas etapas quando devia ser uma só:** o usuário pediu barra
+  de progresso E header/navbar sumindo juntos aos 5s; a implementação original escurecia
+  o header/navbar 5s DEPOIS da barra sumir (10s no total). Unificado num só
+  `RadioCinematicHideDelayMs = 5_000L` pros dois. Also corrigido: o header/navbar só
+  ficavam com fundo preto, ícone e texto continuavam visíveis por cima - agora
+  `LibraryHeader`/`BottomMainNavigationBar` também animam a opacidade do CONTEÚDO
+  (`contentAlpha`) separado da cor de fundo, então ícone/texto somem de verdade.
+- **Bug 2 - fade "piscando" nas trocas de cena que o usuário reportou como
+  "bizarro"/"piscada":** investigado e a causa não era o mecanismo em si (já antecipado
+  por polling, ver ADR-042) e sim: (a) o scrim de fade estava desenhado ANTES do filtro
+  vintage e do granulado no `Box`, ou seja, não cobria essas duas camadas - movido pra
+  ser o ÚLTIMO filho do `Box`, acima de tudo; (b) a duração era curta demais (360ms) pra
+  disfarçar qualquer variação de timing - aumentada pra 750ms.
+- **Bug 3 - relógio do "modo cinema" contava desde a abertura do app:** já corrigido
+  antes do commit anterior mas registrado aqui por completude - `lastInteractionAt` zera
+  toda vez que o modo cinema é habilitado (entrar na tela da rádio), não só na primeira
+  composição.
+- **Sequência de cenas deixa de ser fixa (supera a descrição de playlist fixo do
+  ADR-042):** em vez de um `ExoPlayer` playlist estático `[capa, capa, take_de_cima,
+  fran]` em `REPEAT_MODE_ALL` (sempre a mesma ordem, sempre os 2 mesmos takes de
+  ambiente), agora e uma fila dinâmica: `buildRadioCycleChunk()` monta `capa, capa` + 1
+  ou 2 cenas de ambiente sorteadas (sem repetir a mesma duas vezes seguidas) de um pool
+  que já tem 5 takes (`take_de_cima`, `fran`, `dog`, `cafe_nico`, `disco_girando`); um
+  watcher (`LaunchedEffect` de polling a cada 300ms) estende a fila do ExoPlayer aos
+  poucos (mantém ~3 itens de folga) e poda o que já tocou, pra não crescer pra sempre numa
+  música longa. `REPEAT_MODE_OFF` em vez de `ALL` - quem mantém o ciclo rodando é essa
+  extensão dinâmica, não o loop do player. Um `dynamicCycleEnabled` flag desliga esse
+  watcher durante qualquer estado forçado (boletim, disco final, trocando disco) pra ele
+  não mexer na fila de item único desses estados.
+- **Novos takes:**
+  - `radio_scene_dog.mp4` - cachorro dormindo, entrou no pool de ambiente. Tinha
+    proporção (496×864) levemente diferente dos outros (720×1278) e aparecia com tarja
+    preta em cima/embaixo - corrigido trocando o `TextureView` cru por um
+    `AspectRatioFrameLayout` (`androidx.media3.ui`) com `RESIZE_MODE_ZOOM`
+    (`RadioMockupVideoBackground`), que agora corta as bordas em vez de dar letterbox -
+    reagindo a `Player.Listener.onVideoSizeChanged` pra recalcular a proporção certa a
+    cada troca de vídeo.
+  - `radio_scene_cafe_nico.mp4` - café do Nico fumegando. Fonte original vinha sem
+    compressão nenhuma (3.2MB pra 5s, ~5.1Mbps) - recomprimida (`crf 26`, `preset slow`,
+    H.264) pra ~500KB e 2x mais lenta (pedido do usuário: "tá muito rápida").
+  - `radio_scene_disco_girando.mp4` - novo take criado a partir dos ÚLTIMOS segundos do
+    vídeo de trocar o disco (a partir de ~3s, quando as mãos já saíram e o disco só está
+    girando sozinho - confirmado quadro a quadro), 1.6x mais lento, também no pool de
+    ambiente (sem overlay de capa - é só o giro do vinil, não mostra a arte do álbum).
+  - `radio_scene_trocando_disco.mp4` - nova transição: Fran trocando o vinil na vitrola,
+    6.5s de fonte (folga de segurança acima dos ~5.9s que o fade+hold realmente usam).
+- **Transição "trocando o disco":** dispara quando a música muda de verdade - flash pro
+  preto, mostra `trocando_disco` por `RadioDiscSwapHoldMs` (5s) em `REPEAT_MODE_ONE`, flash
+  de novo e volta pro ciclo normal (já com a capa/arte da música nova). Ajuste fino ao
+  vivo (usuário: "pode começar a transição só um pouco antes"): em vez de reagir só depois
+  que `songId` já mudou, um `discSwapImminent` (últimos `RadioDiscSwapLeadMs` = 900ms da
+  música ANTIGA) antecipa o disparo - implementado com `rememberUpdatedState` +
+  `while(isActive)` polling (não um `LaunchedEffect(key = songId)` comum) porque precisa
+  ler o valor mais recente de `songId`/`discSwapImminent` sem reiniciar o timer de hold no
+  meio da transição; `songId` mudando ainda funciona como fallback caso
+  `discSwapImminent` nunca dispare (skip manual, por exemplo).
+- **Filtro trocado - "old" (`radio_filter_old.mp4`, removido) vira VHS
+  (`radio_filter_vhs.mp4`):** grão/scanline em vez de vazamento de luz, opacidade subiu
+  de 32% pra 35%, velocidade voltou a 1x (o VHS não precisava do slow-down que o "old"
+  tinha - `RadioOldFilmFilterOverlay` renomeado pra `RadioVhsFilterOverlay`).
+- **Verificado ao vivo:** todas as 3 correções de bug, o filtro VHS, a cena do dog
+  preenchendo sem tarja e a rotação aleatória incluindo o dog foram confirmados por
+  `adb screencap` real durante o teste (não só lido no código). **Não verificado ao
+  vivo:** o timing fino da antecipação de 900ms da transição de trocar disco (o usuário
+  só viu UMA troca de música acontecer durante o teste, antes desse ajuste) e a cena do
+  café do Nico / disco girando (adicionadas na correção seguinte, sem uma troca de
+  música real ter acontecido ainda durante o teste pra confirmar visualmente).

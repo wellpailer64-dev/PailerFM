@@ -23,6 +23,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.LruCache
 import android.view.TextureView
+import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -200,6 +201,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -246,9 +248,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.VideoSize
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
@@ -6324,6 +6327,10 @@ private val RadioAlbumMockupCorners = listOf(
 // video (12s). Ver rememberRadioMockupSequencer().
 private const val RadioEndingCutoverMs = 12_000L
 
+// Quanto antes do fim real da musica a transicao de trocar o disco comeca (pedido do usuario
+// 18/09/2026, ajuste fino depois de ver ao vivo: "pode começar a transição só um pouco antes").
+private const val RadioDiscSwapLeadMs = 900L
+
 @Composable
 private fun RadioAlbumMockupScene(
     player: PlayerUiState,
@@ -6337,10 +6344,16 @@ private fun RadioAlbumMockupScene(
 ) {
     val nearEnd = player.durationMs > 0 &&
         (player.durationMs - player.positionMs) in 0..RadioEndingCutoverMs
+    // Antecipa um pouco a transicao de trocar o disco (pedido do usuario 18/09/2026: "pode
+    // começar a transição só um pouco antes") - dispara ainda com a musica antiga tocando, nao so
+    // reagindo depois que songId ja mudou.
+    val discSwapImminent = player.durationMs > 0 &&
+        (player.durationMs - player.positionMs) in 0..RadioDiscSwapLeadMs
     val scrim = rememberRadioTransitionScrimState()
     val sequencer = rememberRadioMockupSequencer(
         songId = player.songId,
         nearEnd = nearEnd,
+        discSwapImminent = discSwapImminent,
         // Boletim ao vivo tocando: trava no take de cima em loop, sem capa (pedido do usuario
         // 18/09/2026); quando termina, volta pra capa/disco.
         isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
@@ -6474,9 +6487,9 @@ private fun RadioAlbumMockupScene(
             )
         }
         RadioMockupNoiseOverlay(Modifier.matchParentSize())
-        // Filtro vintage: sempre por cima de tudo, em loop proprio, independente da cena de
-        // fundo trocando por baixo dele.
-        RadioOldFilmFilterOverlay(Modifier.matchParentSize())
+        // Filtro VHS: sempre por cima de tudo, em loop proprio, independente da cena de fundo
+        // trocando por baixo dele.
+        RadioVhsFilterOverlay(Modifier.matchParentSize())
         // Fade de transicao por ULTIMO (acima de tudo, inclusive do filtro vintage e do
         // granulado) - pedido do usuario 18/09/2026: o atraso da capa (des)aparecendo exatamente
         // no corte pra/da cena do disco só ficou escondido de verdade com o fade cobrindo
@@ -6574,16 +6587,42 @@ private fun radioMockupMediaItem(context: Context, rawRes: Int, mediaId: String)
         .setMediaId(mediaId)
         .build()
 
-// Sequencia de takes da radio (pedido do usuario 18/09/2026): capa do disco em loop 2x, depois
-// take de cima do ambiente, depois Fran escrevendo, volta pra capa - em ciclo continuo. So os
-// takes "capa" e "disco final" mostram a arte do album desenhada em perspectiva por cima
-// (PerspectiveAlbumArtwork); os takes de ambiente sao so a filmagem, sem overlay de capa.
-// Perto do fim da musica (RadioEndingCutoverMs) o ciclo e interrompido e trocamos pro take de
-// encerramento (radio_scene_disco_final), que fica ate a proxima musica comecar.
+// Um "pedaco" do ciclo normal: capa em loop 2x + 1 ou 2 cenas de ambiente aleatorias (pedido do
+// usuario 18/09/2026: "não precisa aparecer todos os takes em sequência de uma vez... em ordem
+// aleatória, e no máximo 2 cenas no intervalo da cena oficial do disco"). Evita repetir a MESMA
+// cena de ambiente duas vezes seguidas dentro do mesmo intervalo, so por variedade.
+private fun buildRadioCycleChunk(environmentPool: List<MediaItem>, coverItem: MediaItem): List<MediaItem> {
+    val sceneCount = (1..2).random()
+    var previous: MediaItem? = null
+    val scenes = List(sceneCount) {
+        var pick = environmentPool.random()
+        if (environmentPool.size > 1) {
+            while (pick.mediaId == previous?.mediaId) pick = environmentPool.random()
+        }
+        previous = pick
+        pick
+    }
+    return listOf(coverItem, coverItem) + scenes
+}
+
+// Quanto tempo o take de trocar o disco fica visivel de fato (depois do fade de entrada) antes
+// de voltar pro ciclo normal - ver LaunchedEffect de songId abaixo.
+private const val RadioDiscSwapHoldMs = 5_000L
+
+// Sequencia de takes da radio (pedido do usuario 18/09/2026, refinado no mesmo dia): capa do
+// disco em loop 2x, depois 1-2 cenas de ambiente aleatorias, volta pra capa - ciclo continuo com
+// fila do ExoPlayer estendida dinamicamente aos poucos (ver watcher de extensao mais abaixo), nao
+// um playlist fixo repetindo sempre a mesma ordem. So os takes "capa"/"disco" mostram a arte do
+// album desenhada em perspectiva por cima (PerspectiveAlbumArtwork); os takes de ambiente sao so
+// a filmagem, sem overlay de capa. Perto do fim da musica o ciclo e interrompido e trocamos pro
+// take de encerramento (radio_scene_disco_final); quando a musica muda de verdade, entra a
+// transicao de trocar o disco (radio_scene_trocando_disco) bem no limite entre uma musica e
+// outra, e so depois volta pro ciclo normal - ja com a capa/arte da musica nova.
 @Composable
 private fun rememberRadioMockupSequencer(
     songId: Long?,
     nearEnd: Boolean,
+    discSwapImminent: Boolean,
     isBulletinPlaying: Boolean,
     scrim: RadioTransitionScrimState,
 ): RadioMockupSequencerState {
@@ -6598,11 +6637,23 @@ private fun rememberRadioMockupSequencer(
     val franItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_fran_escrevendo, "fran")
     }
+    val dogItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_dog, "dog")
+    }
+    val cafeNicoItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_cafe_nico, "cafe_nico")
+    }
+    val discoGirandoItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_disco_girando, "disco_girando")
+    }
     val discoItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_disco_final, "disco")
     }
-    val basePlaylist = remember(coverItem, takeDeCimaItem, franItem) {
-        listOf(coverItem, coverItem, takeDeCimaItem, franItem)
+    val trocandoDiscoItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_trocando_disco, "trocando_disco")
+    }
+    val environmentPool = remember(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem) {
+        listOf(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem)
     }
 
     val exoPlayer = remember(context) {
@@ -6613,6 +6664,21 @@ private fun rememberRadioMockupSequencer(
     var discoActiveForSong by remember(exoPlayer) { mutableStateOf<Long?>(null) }
     var isFirstSetup by remember(exoPlayer) { mutableStateOf(true) }
     var hasHandledBulletinOnce by remember(exoPlayer) { mutableStateOf(false) }
+    // Enquanto false, o watcher de extensao (mais abaixo) fica de fora - evita ele "completar"
+    // uma fila que na verdade e um estado forcado de item unico (boletim/disco final/trocando
+    // disco, todos REPEAT_MODE_ONE).
+    var dynamicCycleEnabled by remember(exoPlayer) { mutableStateOf(true) }
+
+    fun freshCyclePlaylist() = buildRadioCycleChunk(environmentPool, coverItem) +
+        buildRadioCycleChunk(environmentPool, coverItem)
+
+    val startFreshCycle: suspend () -> Unit = {
+        dynamicCycleEnabled = true
+        exoPlayer.setMediaItems(freshCyclePlaylist())
+        exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = true
+    }
 
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
@@ -6631,32 +6697,78 @@ private fun rememberRadioMockupSequencer(
     // RadioNaturalTransitionWatcher.
     RadioNaturalTransitionWatcher(exoPlayer, scrim)
 
-    // Musica nova (ou primeira composicao): reinicia o ciclo normal a partir da capa. So a
-    // primeira vez (isFirstSetup) pula o flash - nao ha nada pra "esconder" ainda, a tela esta
-    // abrindo agora.
-    LaunchedEffect(exoPlayer, songId, basePlaylist) {
-        discoActiveForSong = null
-        val applyPlaylist: suspend () -> Unit = {
-            exoPlayer.setMediaItems(basePlaylist)
-            exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
-            exoPlayer.prepare()
-            exoPlayer.playWhenReady = true
+    // Fila dinamica: enquanto no ciclo normal, mantem sempre um pedaco de folga na frente
+    // (nunca deixa o ExoPlayer ficar sem "proximo item" real, que faria REPEAT_MODE_OFF parar
+    // sozinho) e poda o que ja tocou pra fila nao crescer pra sempre numa musica longa.
+    LaunchedEffect(exoPlayer) {
+        while (isActive) {
+            if (dynamicCycleEnabled) {
+                val index = exoPlayer.currentMediaItemIndex
+                val count = exoPlayer.mediaItemCount
+                if (count - index <= 3) {
+                    exoPlayer.addMediaItems(buildRadioCycleChunk(environmentPool, coverItem))
+                }
+                if (index > 1) {
+                    exoPlayer.removeMediaItems(0, index)
+                }
+            }
+            delay(300)
         }
+    }
+
+    // Primeira composicao: so aplica o ciclo normal a partir da capa, sem flash nem transicao -
+    // nao ha musica anterior nenhuma, a tela esta abrindo agora.
+    LaunchedEffect(exoPlayer, environmentPool, coverItem) {
         if (isFirstSetup) {
             isFirstSetup = false
-            applyPlaylist()
-        } else {
-            scrim.flashThroughBlack(onBlack = applyPlaylist)
+            startFreshCycle()
+        }
+    }
+
+    // Transicao de trocar o disco (pedido do usuario 18/09/2026): dispara ANTES de songId mudar
+    // de verdade, assim que discSwapImminent fica true (musica antiga terminando) - "pode começar
+    // a transição só um pouco antes". guardActive evita disparar de novo por causa do proprio
+    // songId mudando logo em seguida; se por algum motivo discSwapImminent nunca chegou a ficar
+    // true pra essa transicao (skip manual, por exemplo), o proprio songId mudando dispara na
+    // hora como fallback. Usa rememberUpdatedState pra ler os valores mais recentes de dentro de
+    // um loop que NAO reinicia a cada recomposicao (evita reiniciar o timer de hold no meio).
+    val currentSongId = rememberUpdatedState(songId)
+    val currentDiscSwapImminent = rememberUpdatedState(discSwapImminent)
+    LaunchedEffect(exoPlayer, environmentPool, coverItem, trocandoDiscoItem) {
+        var lastSongId = currentSongId.value
+        while (isActive) {
+            if (!isFirstSetup) {
+                val songChanged = currentSongId.value != lastSongId
+                if (currentDiscSwapImminent.value || songChanged) {
+                    lastSongId = currentSongId.value
+                    discoActiveForSong = null
+                    // dynamicCycleEnabled = false enquanto isso pra o watcher de extensao nao
+                    // mexer na fila de item unico do trocando-disco.
+                    dynamicCycleEnabled = false
+                    scrim.flashThroughBlack(onBlack = {
+                        exoPlayer.setMediaItem(trocandoDiscoItem)
+                        exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                        exoPlayer.prepare()
+                        exoPlayer.playWhenReady = true
+                    })
+                    delay(RadioDiscSwapHoldMs)
+                    scrim.flashThroughBlack(onBlack = startFreshCycle)
+                    lastSongId = currentSongId.value
+                }
+            }
+            delay(80)
         }
     }
 
     // Perto do fim da musica atual: corta pro take de encerramento (por trás do flash, pra
     // esconder o corte forcado) e trava nele ate a proxima musica comecar (o LaunchedEffect acima
-    // reresolve quando songId mudar). Ignorado com boletim tocando - o boletim manda nesse
-    // momento (ver efeito abaixo), a musica esta pausada mesmo.
+    // reresolve quando songId mudar, incluindo a transicao de trocar o disco). Ignorado com
+    // boletim tocando - o boletim manda nesse momento (ver efeito abaixo), a musica esta pausada
+    // mesmo.
     LaunchedEffect(exoPlayer, songId, nearEnd, discoItem, isBulletinPlaying) {
         if (nearEnd && !isBulletinPlaying && discoActiveForSong != songId) {
             discoActiveForSong = songId
+            dynamicCycleEnabled = false
             scrim.flashThroughBlack(onBlack = {
                 exoPlayer.setMediaItem(discoItem)
                 exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
@@ -6667,15 +6779,17 @@ private fun rememberRadioMockupSequencer(
     }
 
     // Boletim ao vivo (pedido do usuario 18/09/2026): enquanto toca, trava so no take de cima em
-    // loop, sem capa. Quando termina, volta pro ciclo normal a partir da capa/disco - o efeito de
-    // songId acima ja cobre o caso comum (o boletim quase sempre entrega numa musica nova), esse
-    // aqui cobre o caso raro de a MESMA musica continuar depois do boletim.
-    LaunchedEffect(exoPlayer, isBulletinPlaying, takeDeCimaItem, basePlaylist) {
+    // loop, sem capa. Quando termina, volta pro ciclo normal a partir da capa/disco - SEM a
+    // transicao de trocar o disco (a musica nao mudou de verdade nesse caso raro, so pausou pro
+    // boletim) - o efeito de songId acima ja cobre o caso comum (o boletim quase sempre entrega
+    // numa musica nova).
+    LaunchedEffect(exoPlayer, isBulletinPlaying, takeDeCimaItem, environmentPool, coverItem) {
         if (!hasHandledBulletinOnce) {
             hasHandledBulletinOnce = true
             if (!isBulletinPlaying) return@LaunchedEffect
         }
         if (isBulletinPlaying) {
+            dynamicCycleEnabled = false
             scrim.flashThroughBlack(onBlack = {
                 exoPlayer.setMediaItem(takeDeCimaItem)
                 exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
@@ -6684,12 +6798,7 @@ private fun rememberRadioMockupSequencer(
             })
         } else {
             discoActiveForSong = null
-            scrim.flashThroughBlack(onBlack = {
-                exoPlayer.setMediaItems(basePlaylist)
-                exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
-                exoPlayer.prepare()
-                exoPlayer.playWhenReady = true
-            })
+            scrim.flashThroughBlack(onBlack = startFreshCycle)
         }
     }
 
@@ -6744,9 +6853,16 @@ private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTran
                 // "não precisa [de fade], só de uma cena diferente pra outra diferente".
                 val itemCount = exoPlayer.mediaItemCount
                 val currentIndex = exoPlayer.currentMediaItemIndex
-                val sameContentLoop = itemCount > 0 &&
-                    exoPlayer.getMediaItemAt(currentIndex).mediaId ==
-                        exoPlayer.getMediaItemAt((currentIndex + 1) % itemCount).mediaId
+                // Fila e linear (nao da REPEAT_MODE_ALL) exceto nos estados de item unico
+                // (REPEAT_MODE_ONE, onde currentIndex+1 nao existe mas o proprio item repete
+                // sozinho - conta como "mesmo conteudo" tambem).
+                val sameContentLoop = when {
+                    itemCount == 1 -> true
+                    currentIndex + 1 < itemCount ->
+                        exoPlayer.getMediaItemAt(currentIndex).mediaId ==
+                            exoPlayer.getMediaItemAt(currentIndex + 1).mediaId
+                    else -> false
+                }
                 when {
                     armed && !sameContentLoop && remaining in 0..RadioSceneTransitionLeadMs -> {
                         armed = false
@@ -6764,34 +6880,57 @@ private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTran
 
 @Composable
 private fun RadioMockupVideoBackground(exoPlayer: ExoPlayer, modifier: Modifier = Modifier) {
+    // Preenche o quadro inteiro cortando as bordas (RESIZE_MODE_ZOOM) em vez de deixar tarja
+    // preta - achado ao vivo 18/09/2026 com o take do dog, que tem proporcao um pouco diferente
+    // dos outros takes e aparecia com letterbox sem isso.
+    val aspectRatioFrame = remember { mutableStateOf<AspectRatioFrameLayout?>(null) }
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.height > 0 && videoSize.width > 0) {
+                    val aspect = videoSize.width.toFloat() * videoSize.pixelWidthHeightRatio / videoSize.height
+                    aspectRatioFrame.value?.setAspectRatio(aspect)
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
+    }
     AndroidView(
         modifier = modifier,
         factory = { viewContext ->
-            TextureView(viewContext).also { textureView ->
+            AspectRatioFrameLayout(viewContext).apply {
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                val textureView = TextureView(viewContext)
+                addView(
+                    textureView,
+                    ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
+                )
                 exoPlayer.setVideoTextureView(textureView)
+                aspectRatioFrame.value = this
             }
         },
-        update = { textureView ->
+        update = { frame ->
+            aspectRatioFrame.value = frame
+            val textureView = frame.getChildAt(0) as TextureView
             exoPlayer.setVideoTextureView(textureView)
             if (!exoPlayer.isPlaying) exoPlayer.play()
         },
     )
 }
 
-// Pedido do usuario 18/09/2026: opacidade um pouco mais alta que o teste inicial (20%) e
-// velocidade reduzida (o video original e rapido demais pro efeito "filme antigo" pretendido).
-private const val RadioOldFilmFilterAlpha = 0.32f
-private const val RadioOldFilmFilterSpeed = 0.6f
+// Pedido do usuario 18/09/2026: filtro "old" trocado pelo VHS (radio_filter_vhs) - opacidade 35%,
+// velocidade normal (sem necessidade de reduzir como o filtro anterior).
+private const val RadioVhsFilterAlpha = 0.35f
 
 @Composable
-private fun RadioOldFilmFilterOverlay(modifier: Modifier = Modifier) {
+private fun RadioVhsFilterOverlay(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val exoPlayer = remember(context) {
         ExoPlayer.Builder(context).build().apply {
             volume = 0f
             repeatMode = Player.REPEAT_MODE_ONE
-            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/${R.raw.radio_filter_old}")))
-            playbackParameters = PlaybackParameters(RadioOldFilmFilterSpeed)
+            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/${R.raw.radio_filter_vhs}")))
             prepare()
             playWhenReady = true
         }
@@ -6800,7 +6939,7 @@ private fun RadioOldFilmFilterOverlay(modifier: Modifier = Modifier) {
         onDispose { exoPlayer.release() }
     }
     AndroidView(
-        modifier = modifier.alpha(RadioOldFilmFilterAlpha),
+        modifier = modifier.alpha(RadioVhsFilterAlpha),
         factory = { viewContext ->
             TextureView(viewContext).also { textureView ->
                 textureView.isOpaque = false
