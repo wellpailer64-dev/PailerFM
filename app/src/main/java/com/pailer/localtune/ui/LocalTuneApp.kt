@@ -7,10 +7,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.graphics.BlurMaskFilter
+import android.graphics.LinearGradient
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.RectF
+import android.graphics.Shader
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.LruCache
+import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -178,6 +188,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -197,8 +208,11 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
@@ -221,10 +235,13 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
@@ -633,6 +650,18 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         miniPlayerVisible = false
     }
     val lyrics = viewModel.lyricsState.value
+    LaunchedEffect(player.activeRadioName, player.songId, lyrics.songId, lyrics.isLoading, lyrics.lyrics.synced, lyrics.message) {
+        if (player.activeRadioName.isNotBlank() &&
+            player.songId != null &&
+            lyrics.songId == player.songId &&
+            !lyrics.isLoading &&
+            !lyrics.isFetching &&
+            !lyrics.lyrics.synced &&
+            lyrics.message == null
+        ) {
+            viewModel.autoUpgradeLyricsSyncIfNeeded(player.songId)
+        }
+    }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
     val landscapeRailWidth = 64.dp
@@ -792,6 +821,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         if (showHomeBackdrop) {
             AlbumArtBackdrop(uri = homeBackdropUri, embeddedSourceUri = homeBackdropSourceUri)
         }
+        val isRadioActive = player.activeRadioName.isNotBlank() && player.hasMedia
+        val isInsideActiveRadio = isRadioActive && (selectedTab == MainTab.Radio || selectedRadio != null)
         val selectMainTab: (MainTab) -> Unit = { tab ->
             selectedAlbum = null
             selectedArtist = null
@@ -819,7 +850,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 Column(
                     modifier = Modifier.padding(end = if (isLandscape) landscapeRailWidth else 0.dp),
                 ) {
-                    if (player.hasMedia) {
+                    if (player.hasMedia && !isInsideActiveRadio) {
                         AnimatedVisibility(
                             visible = miniPlayerVisible,
                             enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
@@ -890,10 +921,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     onStopScanRemote = viewModel::stopScanningRemoteDevices,
                     onConnectRemote = viewModel::connectToRemoteDevice,
                     onDisconnectRemote = viewModel::disconnectRemote,
-                    // Pedido do usuario (10/09/2026): busca só faz sentido em Biblioteca/Rádio -
-                    // a aba Início não tem lista pra filtrar, então a barra sumia sem função. Logo
-                    // centraliza sozinha quando a busca some (ver LibraryHeader).
-                    showSearch = selectedTab != MainTab.Home,
+                    // Busca so fica na Biblioteca. A radio e uma tela de experiencia/controle,
+                    // sem lista textual pra filtrar ali.
+                    showSearch = selectedTab == MainTab.Library,
                 )
 
                 val openedAlbum = selectedAlbum
@@ -998,16 +1028,6 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         sessionSongs = radioSession,
                         songsBetweenBulletins = radioBulletins.settings.songsBetweenBulletins,
                         isGenerating = isGeneratingRadio,
-                        onBack = {
-                            // So chamado pelo botao "Sair da radio" agora (a tela nao tem mais
-                            // seta de voltar - o back do sistema fecha via BackHandler, que so
-                            // fecha a tela e deixa a radio tocando). Esse botao e uma saida de
-                            // verdade: para a reproducao e esvazia a fila.
-                            viewModel.stopRadio()
-                            radioSession = emptyList()
-                            selectedRadio = null
-                            isGeneratingRadio = false
-                        },
                         onEnterRadio = {
                             if (!isGeneratingRadio) {
                                 isGeneratingRadio = true
@@ -1022,6 +1042,22 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             }
                         },
                         onOpenPlayer = { showFullPlayer = true },
+                        isFavorite = viewModel.isCurrentSongFavorite(),
+                        onToggleFavorite = viewModel::toggleCurrentSongFavorite,
+                        onToggleMute = viewModel::toggleRadioMute,
+                        onExitRadio = {
+                            viewModel.stopRadio()
+                            radioSession = emptyList()
+                            isGeneratingRadio = false
+                        },
+                        onDislike = {
+                            viewModel.dislikeCurrentRadioSong()?.let { result ->
+                                if (result.index in radioSession.indices) {
+                                    radioSession = radioSession.toMutableList()
+                                        .apply { this[result.index] = result.replacement }
+                                }
+                            }
+                        },
                         onDeleteRadio = {
                             viewModel.deleteRadio(openedRadio)
                             radioSession = emptyList()
@@ -5691,9 +5727,13 @@ private fun RadioDetailScreen(
     // se algum chamador nao passar o valor real das configuracoes de boletim.
     songsBetweenBulletins: Int = 3,
     isGenerating: Boolean,
-    onBack: () -> Unit,
     onEnterRadio: () -> Unit,
     onOpenPlayer: () -> Unit,
+    isFavorite: Boolean = false,
+    onToggleFavorite: () -> Unit = {},
+    onToggleMute: () -> Unit = {},
+    onExitRadio: () -> Unit = {},
+    onDislike: () -> Unit = {},
     onDeleteRadio: () -> Unit = {},
     artists: List<LocalArtist> = emptyList(),
     albums: List<LocalAlbum> = emptyList(),
@@ -5716,37 +5756,35 @@ private fun RadioDetailScreen(
     // ver MusicLibraryRepository.renameCustomRadio.
     val canRename = radio.isCustom && radio.customId?.startsWith("genre:") != true
     val canManageSources = radio.isCustom && (extraArtists.isNotEmpty() || extraAlbums.isNotEmpty())
+    val isInSession = player.activeRadioName == radio.name && player.hasMedia
     LazyColumn(
         state = listState,
         flingBehavior = rememberSoftFlingBehavior(),
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+        contentPadding = PaddingValues(
+            horizontal = if (isInSession) 0.dp else 18.dp,
+            vertical = if (isInSession) 0.dp else 8.dp,
+        ),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         // Sem seta de voltar aqui de proposito - o gesto/botao de voltar do proprio Android
         // já cobre isso; a lixeira desceu pra ficar do lado do botao principal (Sair/Entrar).
-        val isInSession = player.activeRadioName == radio.name && player.hasMedia
         if (isInSession) {
             item {
-                LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer)
+                LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer, edgeToEdge = true)
             }
             // Ja mostrando a rádio ao vivo no card acima (nome, faixa atual, capa) - repetir
-            // mosaico/nome/descricao aqui embaixo seria redundante. So o botao pra sair.
-            // Botoes de gerenciar fontes/renomear/apagar removidos daqui (pedido do usuario
-            // 17/09/2026): esse tipo de alteracao na radio so faz sentido feita de FORA dela
-            // (ramo "else" abaixo, antes de entrar) - dentro da sessao ao vivo, so "Sair da
-            // radio" faz sentido, em destaque ocupando a largura toda.
+            // mosaico/nome/descricao aqui embaixo seria redundante. Os controles essenciais ficam
+            // aqui dentro da propria radio, deixando o mini player global escondido nessa tela.
             item {
-                Button(
-                    onClick = onBack,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp),
-                ) {
-                    Icon(Icons.Filled.Close, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Sair da rádio")
-                }
+                RadioSessionControls(
+                    player = player,
+                    isFavorite = isFavorite,
+                    onDislike = onDislike,
+                    onToggleFavorite = onToggleFavorite,
+                    onToggleMute = onToggleMute,
+                    onExitRadio = onExitRadio,
+                    modifier = Modifier.padding(horizontal = 18.dp),
+                )
             }
         } else {
             item {
@@ -5982,6 +6020,79 @@ private fun RadioDetailScreen(
 }
 
 @Composable
+private fun RadioSessionControls(
+    player: PlayerUiState,
+    isFavorite: Boolean,
+    onDislike: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    onToggleMute: () -> Unit,
+    onExitRadio: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(64.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(PailerSurface.copy(alpha = 0.78f))
+            .padding(horizontal = 14.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioControlButton(
+            icon = Icons.Filled.ThumbDown,
+            contentDescription = "Nao curti essa faixa na radio",
+            enabled = player.songId != null,
+            onClick = onDislike,
+        )
+        RadioControlButton(
+            icon = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+            contentDescription = "Curtir faixa",
+            tint = if (isFavorite) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.9f),
+            enabled = player.songId != null,
+            onClick = onToggleFavorite,
+        )
+        RadioControlButton(
+            icon = if (player.isRadioMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+            contentDescription = if (player.isRadioMuted) "Ativar som" else "Mutar",
+            onClick = onToggleMute,
+        )
+        RadioControlButton(
+            icon = Icons.Filled.PowerSettingsNew,
+            contentDescription = "Desligar radio",
+            tint = Color(0xFFFFD6B0),
+            onClick = onExitRadio,
+        )
+    }
+}
+
+@Composable
+private fun RadioControlButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    tint: Color = Color.White.copy(alpha = 0.9f),
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = if (enabled) 0.24f else 0.12f)),
+    ) {
+        Icon(
+            icon,
+            contentDescription = contentDescription,
+            tint = if (enabled) tint else Color.White.copy(alpha = 0.32f),
+            modifier = Modifier.size(26.dp),
+        )
+    }
+}
+
+@Composable
 private fun LiveRadioBadge(isActive: Boolean) {
     val transition = rememberInfiniteTransition(label = "radioLivePulse")
     val pulse by transition.animateFloat(
@@ -6123,109 +6234,303 @@ private fun LiveNowRadioCard(
     lyrics: LyricsUiState = LyricsUiState(),
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    edgeToEdge: Boolean = false,
 ) {
     Card(
         modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(if (edgeToEdge) 0.dp else 8.dp),
         colors = CardDefaults.cardColors(containerColor = PailerSurface),
     ) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+        RadioAlbumMockupScene(
+            player = player,
+            lyrics = lyrics,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(RadioAlbumMockupAspectRatio),
+        )
+    }
+}
+
+private const val RadioAlbumMockupAspectRatio = 941f / 1672f
+
+private val RadioAlbumMockupCorners = listOf(
+    Offset(0.0210f, 0.3100f),
+    Offset(0.5950f, 0.3360f),
+    Offset(0.6900f, 0.7070f),
+    Offset(0.1010f, 0.7630f),
+)
+
+@Composable
+private fun RadioAlbumMockupScene(
+    player: PlayerUiState,
+    lyrics: LyricsUiState,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier.clipToBounds()) {
+        RadioMockupVideoBackground(Modifier.fillMaxSize())
+        PerspectiveAlbumArtwork(
+            uri = player.artworkUri,
+            embeddedSourceUri = player.artworkSourceUri,
+            modifier = Modifier.fillMaxSize(),
+        )
+        Canvas(Modifier.matchParentSize()) {
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xFFFFC06A).copy(alpha = 0.13f),
+                        Color(0xFFFF8A2F).copy(alpha = 0.04f),
+                        Color.Transparent,
+                    ),
+                    center = Offset(size.width * 0.73f, size.height * 0.38f),
+                    radius = size.width * 0.48f,
+                ),
+                radius = size.width * 0.48f,
+                center = Offset(size.width * 0.73f, size.height * 0.38f),
+            )
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(PailerCharcoal.copy(alpha = 0.86f), Color.Transparent),
+                    )
+                )
+                .padding(start = 18.dp, top = 30.dp, end = 18.dp, bottom = 58.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 LiveRadioBadge(isActive = true)
                 Spacer(Modifier.weight(1f))
                 Text(
                     "${formatDuration(player.positionMs)} / ${formatDuration(player.durationMs)}",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = Color.White.copy(alpha = 0.72f),
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
-            Box(
+            Spacer(Modifier.height(12.dp))
+            Text(
+                player.title.ifBlank { "Tocando agora" },
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Black,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                listOf(player.artist, player.album).filter { it.isNotBlank() }.joinToString(" • "),
+                color = Color.White.copy(alpha = 0.76f),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                player.playbackSource.ifBlank { "Rádio" },
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, PailerCharcoal.copy(alpha = 0.95f)),
+                    )
+                )
+                .padding(start = 18.dp, top = 62.dp, end = 18.dp, bottom = 42.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            HomeLyricsSubtitle(
+                lyrics = lyrics,
+                songId = player.songId,
+                positionMs = player.positionMs,
+                isPlaying = player.isPlaying,
+                enabled = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = {
+                    if (player.durationMs > 0) {
+                        (player.positionMs.toFloat() / player.durationMs.toFloat()).coerceIn(0f, 1f)
+                    } else {
+                        0f
+                    }
+                },
                 modifier = Modifier
                     .fillMaxWidth()
-                    // Proporcao real dos gifs (720x406~414) - fundo inteiro, sem cortar topo/base.
-                    .aspectRatio(16f / 9f),
-            ) {
-                DayPeriodGifBackground(
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.FillBounds,
-                )
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(Color.Transparent, PailerCharcoal.copy(alpha = 0.92f)),
-                            )
-                        )
-                        .padding(top = 18.dp, start = 10.dp, end = 10.dp, bottom = 6.dp),
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        ArtworkBox(
-                            uri = player.artworkUri,
-                            embeddedSourceUri = player.artworkSourceUri,
-                            modifier = Modifier.size(34.dp),
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                player.playbackSource.ifBlank { "Rádio" },
-                                color = MaterialTheme.colorScheme.primary,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                player.title.ifBlank { "Tocando agora" },
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                listOf(player.artist, player.album).filter { it.isNotBlank() }.joinToString(" • "),
-                                color = Color.White.copy(alpha = 0.75f),
-                                style = MaterialTheme.typography.labelSmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
-                    HomeLyricsSubtitle(
-                        lyrics = lyrics,
-                        songId = player.songId,
-                        positionMs = player.positionMs,
-                        isPlaying = player.isPlaying,
-                        enabled = true,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                    Spacer(Modifier.height(5.dp))
-                    LinearProgressIndicator(
-                        progress = {
-                            if (player.durationMs > 0) {
-                                (player.positionMs.toFloat() / player.durationMs.toFloat()).coerceIn(0f, 1f)
-                            } else {
-                                0f
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(3.dp)
-                            .clip(CircleShape),
-                        color = MaterialTheme.colorScheme.primary,
-                        trackColor = Color.White.copy(alpha = 0.25f),
+                    .height(3.dp)
+                    .clip(CircleShape),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = Color.White.copy(alpha = 0.25f),
+            )
+        }
+        RadioMockupNoiseOverlay(Modifier.matchParentSize())
+    }
+}
+
+@Composable
+private fun RadioMockupVideoBackground(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val videoUri = remember(context) {
+        Uri.parse("android.resource://${context.packageName}/${R.raw.radio_album_mockup_scene}")
+    }
+    val exoPlayer = remember(context, videoUri) {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 0f
+            repeatMode = Player.REPEAT_MODE_ONE
+            setMediaItem(MediaItem.fromUri(videoUri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+    DisposableEffect(exoPlayer) {
+        onDispose { exoPlayer.release() }
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { viewContext ->
+            TextureView(viewContext).also { textureView ->
+                exoPlayer.setVideoTextureView(textureView)
+            }
+        },
+        update = { textureView ->
+            exoPlayer.setVideoTextureView(textureView)
+            if (!exoPlayer.isPlaying) exoPlayer.play()
+        },
+    )
+}
+
+@Composable
+private fun RadioMockupNoiseOverlay(modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val step = 24f
+        val dot = 1.25f
+        val columns = (size.width / step).toInt()
+        val rows = (size.height / step).toInt()
+        for (row in 0..rows) {
+            for (column in 0..columns) {
+                val hash = (column * 73_856_093) xor (row * 19_349_663)
+                val grain = ((hash ushr 8) and 0xFF) / 255f
+                if (grain > 0.38f) {
+                    val alpha = if (grain > 0.72f) 0.045f else 0.022f
+                    drawRect(
+                        color = if (grain > 0.72f) Color.White.copy(alpha = alpha) else Color.Black.copy(alpha = alpha),
+                        topLeft = Offset(column * step, row * step),
+                        size = Size(dot, dot),
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PerspectiveAlbumArtwork(
+    uri: Uri?,
+    embeddedSourceUri: Uri?,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var artwork by remember(uri, embeddedSourceUri) {
+        mutableStateOf(peekCachedArtwork(uri, embeddedSourceUri))
+    }
+
+    LaunchedEffect(uri, embeddedSourceUri) {
+        artwork = peekCachedArtwork(uri, embeddedSourceUri)
+            ?: withContext(Dispatchers.IO) {
+                embeddedSourceUri?.let { loadEmbeddedArtwork(context, it) }
+                    ?: uri?.let { loadScaledArtwork(context, it) }
+            }
+    }
+
+    val currentArtwork = artwork ?: return
+    Canvas(modifier = modifier) {
+        val bitmap = currentArtwork.asAndroidBitmap()
+        val p1 = Offset(size.width * RadioAlbumMockupCorners[0].x, size.height * RadioAlbumMockupCorners[0].y)
+        val p2 = Offset(size.width * RadioAlbumMockupCorners[1].x, size.height * RadioAlbumMockupCorners[1].y)
+        val p3 = Offset(size.width * RadioAlbumMockupCorners[2].x, size.height * RadioAlbumMockupCorners[2].y)
+        val p4 = Offset(size.width * RadioAlbumMockupCorners[3].x, size.height * RadioAlbumMockupCorners[3].y)
+        val destination = floatArrayOf(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y)
+        val cropSide = minOf(bitmap.width, bitmap.height).toFloat()
+        val cropLeft = (bitmap.width - cropSide) / 2f
+        val cropTop = (bitmap.height - cropSide) / 2f
+        val source = floatArrayOf(
+            cropLeft, cropTop,
+            cropLeft + cropSide, cropTop,
+            cropLeft + cropSide, cropTop + cropSide,
+            cropLeft, cropTop + cropSide,
+        )
+        val matrix = Matrix().apply { setPolyToPoly(source, 0, destination, 0, 4) }
+        val albumPath = Path().apply {
+            val cornerRadius = cropSide * 0.02f
+            addRoundRect(
+                RectF(cropLeft, cropTop, cropLeft + cropSide, cropTop + cropSide),
+                cornerRadius,
+                cornerRadius,
+                Path.Direction.CW,
+            )
+            transform(matrix)
+        }
+        drawIntoCanvas { canvas ->
+            val nativeCanvas = canvas.nativeCanvas
+            val saveCount = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
+            nativeCanvas.clipPath(albumPath)
+            nativeCanvas.drawBitmap(
+                bitmap,
+                matrix,
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).apply {
+                    alpha = 226
+                },
+            )
+            nativeCanvas.drawRect(
+                0f,
+                0f,
+                size.width,
+                size.height,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.argb(34, 0, 0, 0)
+                },
+            )
+            nativeCanvas.drawRect(
+                0f,
+                0f,
+                size.width,
+                size.height,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    shader = LinearGradient(
+                        p1.x,
+                        p1.y,
+                        p3.x,
+                        p3.y,
+                        intArrayOf(
+                            android.graphics.Color.argb(58, 20, 14, 10),
+                            android.graphics.Color.TRANSPARENT,
+                            android.graphics.Color.argb(34, 255, 178, 94),
+                        ),
+                        floatArrayOf(0f, 0.52f, 1f),
+                        Shader.TileMode.CLAMP,
+                    )
+                },
+            )
+            nativeCanvas.drawPath(
+                albumPath,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = size.minDimension * 0.008f
+                    color = android.graphics.Color.argb(34, 0, 0, 0)
+                    maskFilter = BlurMaskFilter(size.minDimension * 0.0025f, BlurMaskFilter.Blur.NORMAL)
+                    xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+                },
+            )
+            nativeCanvas.restoreToCount(saveCount)
         }
     }
 }
@@ -7971,29 +8276,14 @@ private fun FullPlayer(
             }
             Spacer(Modifier.height(36.dp))
             if (isRadio) {
-                Box(
+                RadioAlbumMockupScene(
+                    player = player,
+                    lyrics = lyrics,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .aspectRatio(1f)
+                        .aspectRatio(RadioAlbumMockupAspectRatio)
                         .clip(RoundedCornerShape(8.dp)),
-                ) {
-                    ArtworkBox(
-                        uri = player.artworkUri,
-                        embeddedSourceUri = player.artworkSourceUri,
-                        modifier = Modifier.fillMaxSize(),
-                        iconModifier = Modifier.size(84.dp),
-                    )
-                    HomeLyricsSubtitle(
-                        lyrics = lyrics,
-                        songId = player.songId,
-                        positionMs = player.positionMs,
-                        isPlaying = player.isPlaying,
-                        enabled = true,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(horizontal = 18.dp, vertical = 18.dp),
-                    )
-                }
+                )
             } else {
                 // Arrasta pro lado: pagina 0 = capa (chamada identica de ArtworkBox), pagina 1 = letra.
                 // Travado na MESMA caixa fillMaxWidth().aspectRatio(1f) que a capa ocupava, entao
