@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
@@ -18,6 +19,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.LruCache
 import android.view.TextureView
@@ -26,11 +28,14 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDecay
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -38,6 +43,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -240,6 +246,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.pailer.localtune.R
@@ -823,6 +830,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         }
         val isRadioActive = player.activeRadioName.isNotBlank() && player.hasMedia
         val isInsideActiveRadio = isRadioActive && (selectedTab == MainTab.Radio || selectedRadio != null)
+        // "Modo cinema" da tela da radio (pedido do usuario 18/09/2026): barra de progresso some
+        // e o header/navbar do proprio app ficam pretos depois de um tempo parado, tocar na tela
+        // volta tudo ao normal. So ativo dentro da tela da radio com sessao rolando (ver
+        // RadioDetailScreen.isInSession + LiveNowRadioCard(edgeToEdge = true) mais abaixo) -
+        // hoisted aqui porque header e navbar sao irmaos da tela da radio, nao filhos dela.
+        val radioCinematicIdle = rememberRadioCinematicIdleState(enabled = isInsideActiveRadio)
         val selectMainTab: (MainTab) -> Unit = { tab ->
             selectedAlbum = null
             selectedArtist = null
@@ -888,6 +901,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         BottomMainNavigationBar(
                             selectedTab = selectedTab,
                             onSelectTab = selectMainTab,
+                            dimmed = radioCinematicIdle.dimSystemBars,
                         )
                     }
                 }
@@ -924,6 +938,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     // Busca so fica na Biblioteca. A radio e uma tela de experiencia/controle,
                     // sem lista textual pra filtrar ali.
                     showSearch = selectedTab == MainTab.Library,
+                    dimmed = radioCinematicIdle.dimSystemBars,
                 )
 
                 val openedAlbum = selectedAlbum
@@ -1088,6 +1103,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             viewModel.renameRadio(openedRadio, newName)?.let { selectedRadio = it }
                         },
                         listState = radioDetailListState,
+                        cinematicIdle = radioCinematicIdle,
                     )
                     }
                     openedGenre != null -> GenreDetailScreen(
@@ -1437,14 +1453,30 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
 private fun BottomMainNavigationBar(
     selectedTab: MainTab,
     onSelectTab: (MainTab) -> Unit,
+    // "Modo cinema" da radio ativa (pedido do usuario 18/09/2026): fica preto depois de um tempo
+    // parado, ver rememberRadioCinematicIdleState/LibraryShell.
+    dimmed: Boolean = false,
 ) {
+    val containerColor by animateColorAsState(
+        targetValue = if (dimmed) Color.Black else PailerSurface.copy(alpha = 0.94f),
+        animationSpec = tween(400),
+        label = "bottomNavBackground",
+    )
+    // Icones/texto somem junto com o fundo escurecendo (pedido do usuario 18/09/2026) - o fundo
+    // fica preto solido, so o CONTEUDO de cada item desaparece.
+    val contentAlpha by animateFloatAsState(
+        targetValue = if (dimmed) 0f else 1f,
+        animationSpec = tween(400),
+        label = "bottomNavContentAlpha",
+    )
     NavigationBar(
         modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
-        containerColor = PailerSurface.copy(alpha = 0.94f),
+        containerColor = containerColor,
     ) {
         MainTab.entries.forEach { tab ->
             val isRadio = tab == MainTab.Radio
             NavigationBarItem(
+                modifier = Modifier.alpha(contentAlpha),
                 selected = selectedTab == tab,
                 onClick = { onSelectTab(tab) },
                 icon = {
@@ -1557,18 +1589,34 @@ private fun LibraryHeader(
     onConnectRemote: (RemoteDeviceEntry) -> Unit,
     onDisconnectRemote: () -> Unit,
     showSearch: Boolean = true,
+    // "Modo cinema" da radio ativa (pedido do usuario 18/09/2026): fica preto depois de um tempo
+    // parado, ver rememberRadioCinematicIdleState/LibraryShell.
+    dimmed: Boolean = false,
 ) {
+    val backgroundColor by animateColorAsState(
+        targetValue = if (dimmed) Color.Black else PailerSurface,
+        animationSpec = tween(400),
+        label = "libraryHeaderBackground",
+    )
+    // Icones/texto somem junto com o fundo escurecendo (pedido do usuario 18/09/2026) - o fundo
+    // fica preto solido (nao transparente), so o CONTEUDO desaparece.
+    val contentAlpha by animateFloatAsState(
+        targetValue = if (dimmed) 0f else 1f,
+        animationSpec = tween(400),
+        label = "libraryHeaderContentAlpha",
+    )
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(PailerSurface)
+            .background(backgroundColor)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(40.dp)
-                .padding(horizontal = 10.dp),
+                .padding(horizontal = 10.dp)
+                .alpha(contentAlpha),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             HeaderSettingsButton(onSettings = onSettings, isLoading = isLoading)
@@ -5745,6 +5793,7 @@ private fun RadioDetailScreen(
     onRemoveAlbum: (LocalAlbum) -> Unit = {},
     onRenameRadio: (String) -> Unit = {},
     listState: LazyListState = rememberLazyListState(),
+    cinematicIdle: RadioCinematicIdleState? = null,
 ) {
     var showDeleteConfirm by rememberSaveable(radio.customId) { mutableStateOf(false) }
     // So radio personalizada (isCustom) tem definicao persistida pra estender com mais
@@ -5770,7 +5819,13 @@ private fun RadioDetailScreen(
         // já cobre isso; a lixeira desceu pra ficar do lado do botao principal (Sair/Entrar).
         if (isInSession) {
             item {
-                LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer, edgeToEdge = true)
+                LiveNowRadioCard(
+                    player = player,
+                    lyrics = lyrics,
+                    onClick = onOpenPlayer,
+                    edgeToEdge = true,
+                    cinematicIdle = cinematicIdle,
+                )
             }
             // Ja mostrando a rádio ao vivo no card acima (nome, faixa atual, capa) - repetir
             // mosaico/nome/descricao aqui embaixo seria redundante. Os controles essenciais ficam
@@ -6235,6 +6290,7 @@ private fun LiveNowRadioCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     edgeToEdge: Boolean = false,
+    cinematicIdle: RadioCinematicIdleState? = null,
 ) {
     Card(
         modifier = modifier
@@ -6249,6 +6305,7 @@ private fun LiveNowRadioCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(RadioAlbumMockupAspectRatio),
+            cinematicIdle = cinematicIdle,
         )
     }
 }
@@ -6262,19 +6319,55 @@ private val RadioAlbumMockupCorners = listOf(
     Offset(0.1010f, 0.7630f),
 )
 
+// Quanto antes do fim da musica a cena corta pra radio_scene_disco_final (mesmo enquadramento
+// da capa, take de encerramento) - musica e video terminam juntos. Alinhado a duracao desse
+// video (12s). Ver rememberRadioMockupSequencer().
+private const val RadioEndingCutoverMs = 12_000L
+
 @Composable
 private fun RadioAlbumMockupScene(
     player: PlayerUiState,
     lyrics: LyricsUiState,
     modifier: Modifier = Modifier,
+    // null no card pequeno da Home (barra de progresso sempre visivel, sem "modo cinema") - nas
+    // telas de radio em tela cheia (RadioDetailScreen/FullPlayer) quem chama ja tem o estado
+    // hoisted (LibraryShell/FullPlayer), porque o header e a navbar do app sao IRMAOS dessa
+    // cena, nao filhos dela (pedido do usuario 18/09/2026).
+    cinematicIdle: RadioCinematicIdleState? = null,
 ) {
-    Box(modifier = modifier.clipToBounds()) {
-        RadioMockupVideoBackground(Modifier.fillMaxSize())
-        PerspectiveAlbumArtwork(
-            uri = player.artworkUri,
-            embeddedSourceUri = player.artworkSourceUri,
-            modifier = Modifier.fillMaxSize(),
-        )
+    val nearEnd = player.durationMs > 0 &&
+        (player.durationMs - player.positionMs) in 0..RadioEndingCutoverMs
+    val scrim = rememberRadioTransitionScrimState()
+    val sequencer = rememberRadioMockupSequencer(
+        songId = player.songId,
+        nearEnd = nearEnd,
+        // Boletim ao vivo tocando: trava no take de cima em loop, sem capa (pedido do usuario
+        // 18/09/2026); quando termina, volta pra capa/disco.
+        isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
+        scrim = scrim,
+    )
+
+    Box(
+        modifier = modifier
+            .clipToBounds()
+            .then(
+                if (cinematicIdle != null) {
+                    Modifier.pointerInput(Unit) {
+                        detectTapGestures(onTap = { cinematicIdle.onInteraction() })
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        RadioMockupVideoBackground(sequencer.exoPlayer, Modifier.fillMaxSize())
+        if (sequencer.showAlbumArt) {
+            PerspectiveAlbumArtwork(
+                uri = player.artworkUri,
+                embeddedSourceUri = player.artworkSourceUri,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
         Canvas(Modifier.matchParentSize()) {
             drawCircle(
                 brush = Brush.radialGradient(
@@ -6344,7 +6437,7 @@ private fun RadioAlbumMockupScene(
                         colors = listOf(Color.Transparent, PailerCharcoal.copy(alpha = 0.95f)),
                     )
                 )
-                .padding(start = 18.dp, top = 62.dp, end = 18.dp, bottom = 42.dp),
+                .padding(start = 18.dp, top = 62.dp, end = 18.dp, bottom = 100.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             HomeLyricsSubtitle(
@@ -6356,6 +6449,13 @@ private fun RadioAlbumMockupScene(
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(Modifier.height(8.dp))
+            // No player expandido, some depois de alguns segundos parado e volta ao tocar na tela
+            // (pedido do usuario 18/09/2026) - no card pequeno da Home fica sempre visivel.
+            val progressBarAlpha by animateFloatAsState(
+                targetValue = if (cinematicIdle?.controlsVisible != false) 1f else 0f,
+                animationSpec = tween(400),
+                label = "radioProgressBarAlpha",
+            )
             LinearProgressIndicator(
                 progress = {
                     if (player.durationMs > 0) {
@@ -6367,26 +6467,331 @@ private fun RadioAlbumMockupScene(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(3.dp)
-                    .clip(CircleShape),
+                    .clip(CircleShape)
+                    .alpha(progressBarAlpha),
                 color = MaterialTheme.colorScheme.primary,
                 trackColor = Color.White.copy(alpha = 0.25f),
             )
         }
         RadioMockupNoiseOverlay(Modifier.matchParentSize())
+        // Filtro vintage: sempre por cima de tudo, em loop proprio, independente da cena de
+        // fundo trocando por baixo dele.
+        RadioOldFilmFilterOverlay(Modifier.matchParentSize())
+        // Fade de transicao por ULTIMO (acima de tudo, inclusive do filtro vintage e do
+        // granulado) - pedido do usuario 18/09/2026: o atraso da capa (des)aparecendo exatamente
+        // no corte pra/da cena do disco só ficou escondido de verdade com o fade cobrindo
+        // literalmente todas as camadas, nao so o video e a capa por baixo do texto.
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color.Black.copy(alpha = scrim.alphaValue)),
+        )
+    }
+}
+
+private class RadioMockupSequencerState(
+    val exoPlayer: ExoPlayer,
+    val showAlbumArt: Boolean,
+    val currentMediaId: String,
+)
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+// "Modo cinema" da radio ativa (pedido do usuario 18/09/2026): sem interacao, esconde a barra de
+// progresso E escurece (fundo preto + icones/texto some) o header/navbar do app, tudo junto, no
+// mesmo instante. Tocar na tela (onInteraction) reseta tudo pro estado normal e reinicia a
+// contagem.
+private const val RadioCinematicHideDelayMs = 5_000L
+
+private class RadioCinematicIdleState(
+    val controlsVisible: Boolean,
+    val dimSystemBars: Boolean,
+    val onInteraction: () -> Unit,
+)
+
+@Composable
+private fun rememberRadioCinematicIdleState(enabled: Boolean): RadioCinematicIdleState {
+    var lastInteractionAt by remember { mutableStateOf(SystemClock.uptimeMillis()) }
+    var controlsVisible by remember { mutableStateOf(true) }
+    var dimSystemBars by remember { mutableStateOf(false) }
+
+    // Loop de polling em vez de LaunchedEffect(key = tick) que reinicia a cada toque: um efeito
+    // so, que roda o tempo todo e reage a lastInteractionAt - mais a prova de bug do que
+    // depender do efeito ser cancelado/recriado no timing certo a cada interacao.
+    LaunchedEffect(enabled) {
+        if (!enabled) {
+            controlsVisible = true
+            dimSystemBars = false
+            return@LaunchedEffect
+        }
+        // Zera a contagem sempre que o modo cinema fica habilitado (ex.: entrar na tela da
+        // radio) - sem isso o relogio vinha rodando desde a primeira composicao da tela
+        // (as vezes desde a abertura do app), fazendo a barra sumir/escurecer na hora se o
+        // usuario demorasse pra chegar na radio (achado ao vivo 18/09/2026).
+        lastInteractionAt = SystemClock.uptimeMillis()
+        while (isActive) {
+            val idleMs = SystemClock.uptimeMillis() - lastInteractionAt
+            val hide = idleMs >= RadioCinematicHideDelayMs
+            controlsVisible = !hide
+            dimSystemBars = hide
+            delay(200)
+        }
+    }
+
+    return RadioCinematicIdleState(
+        controlsVisible = controlsVisible,
+        dimSystemBars = dimSystemBars,
+        onInteraction = { lastInteractionAt = SystemClock.uptimeMillis() },
+    )
+}
+
+@Composable
+private fun RadioCinematicSystemBars(dim: Boolean) {
+    val activity = LocalContext.current.findActivity() ?: return
+    val window = activity.window
+    DisposableEffect(window) {
+        val originalStatusBarColor = window.statusBarColor
+        val originalNavigationBarColor = window.navigationBarColor
+        onDispose {
+            window.statusBarColor = originalStatusBarColor
+            window.navigationBarColor = originalNavigationBarColor
+        }
+    }
+    LaunchedEffect(window, dim) {
+        val color = if (dim) android.graphics.Color.BLACK else android.graphics.Color.TRANSPARENT
+        window.statusBarColor = color
+        window.navigationBarColor = color
+    }
+}
+
+private fun radioMockupMediaItem(context: Context, rawRes: Int, mediaId: String): MediaItem =
+    MediaItem.Builder()
+        .setUri(Uri.parse("android.resource://${context.packageName}/$rawRes"))
+        .setMediaId(mediaId)
+        .build()
+
+// Sequencia de takes da radio (pedido do usuario 18/09/2026): capa do disco em loop 2x, depois
+// take de cima do ambiente, depois Fran escrevendo, volta pra capa - em ciclo continuo. So os
+// takes "capa" e "disco final" mostram a arte do album desenhada em perspectiva por cima
+// (PerspectiveAlbumArtwork); os takes de ambiente sao so a filmagem, sem overlay de capa.
+// Perto do fim da musica (RadioEndingCutoverMs) o ciclo e interrompido e trocamos pro take de
+// encerramento (radio_scene_disco_final), que fica ate a proxima musica comecar.
+@Composable
+private fun rememberRadioMockupSequencer(
+    songId: Long?,
+    nearEnd: Boolean,
+    isBulletinPlaying: Boolean,
+    scrim: RadioTransitionScrimState,
+): RadioMockupSequencerState {
+    val context = LocalContext.current
+
+    val coverItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_album_mockup_scene, "cover")
+    }
+    val takeDeCimaItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_take_de_cima, "take_de_cima")
+    }
+    val franItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_fran_escrevendo, "fran")
+    }
+    val discoItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_disco_final, "disco")
+    }
+    val basePlaylist = remember(coverItem, takeDeCimaItem, franItem) {
+        listOf(coverItem, coverItem, takeDeCimaItem, franItem)
+    }
+
+    val exoPlayer = remember(context) {
+        ExoPlayer.Builder(context).build().apply { volume = 0f }
+    }
+
+    var currentMediaId by remember(exoPlayer) { mutableStateOf(coverItem.mediaId) }
+    var discoActiveForSong by remember(exoPlayer) { mutableStateOf<Long?>(null) }
+    var isFirstSetup by remember(exoPlayer) { mutableStateOf(true) }
+    var hasHandledBulletinOnce by remember(exoPlayer) { mutableStateOf(false) }
+
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                currentMediaId = mediaItem?.mediaId ?: currentMediaId
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            exoPlayer.release()
+        }
+    }
+
+    // Cortes NATURAIS do playlist (teto->fran, fran->capa, etc.) - antecipados por polling, ver
+    // RadioNaturalTransitionWatcher.
+    RadioNaturalTransitionWatcher(exoPlayer, scrim)
+
+    // Musica nova (ou primeira composicao): reinicia o ciclo normal a partir da capa. So a
+    // primeira vez (isFirstSetup) pula o flash - nao ha nada pra "esconder" ainda, a tela esta
+    // abrindo agora.
+    LaunchedEffect(exoPlayer, songId, basePlaylist) {
+        discoActiveForSong = null
+        val applyPlaylist: suspend () -> Unit = {
+            exoPlayer.setMediaItems(basePlaylist)
+            exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+        }
+        if (isFirstSetup) {
+            isFirstSetup = false
+            applyPlaylist()
+        } else {
+            scrim.flashThroughBlack(onBlack = applyPlaylist)
+        }
+    }
+
+    // Perto do fim da musica atual: corta pro take de encerramento (por trás do flash, pra
+    // esconder o corte forcado) e trava nele ate a proxima musica comecar (o LaunchedEffect acima
+    // reresolve quando songId mudar). Ignorado com boletim tocando - o boletim manda nesse
+    // momento (ver efeito abaixo), a musica esta pausada mesmo.
+    LaunchedEffect(exoPlayer, songId, nearEnd, discoItem, isBulletinPlaying) {
+        if (nearEnd && !isBulletinPlaying && discoActiveForSong != songId) {
+            discoActiveForSong = songId
+            scrim.flashThroughBlack(onBlack = {
+                exoPlayer.setMediaItem(discoItem)
+                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+            })
+        }
+    }
+
+    // Boletim ao vivo (pedido do usuario 18/09/2026): enquanto toca, trava so no take de cima em
+    // loop, sem capa. Quando termina, volta pro ciclo normal a partir da capa/disco - o efeito de
+    // songId acima ja cobre o caso comum (o boletim quase sempre entrega numa musica nova), esse
+    // aqui cobre o caso raro de a MESMA musica continuar depois do boletim.
+    LaunchedEffect(exoPlayer, isBulletinPlaying, takeDeCimaItem, basePlaylist) {
+        if (!hasHandledBulletinOnce) {
+            hasHandledBulletinOnce = true
+            if (!isBulletinPlaying) return@LaunchedEffect
+        }
+        if (isBulletinPlaying) {
+            scrim.flashThroughBlack(onBlack = {
+                exoPlayer.setMediaItem(takeDeCimaItem)
+                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+            })
+        } else {
+            discoActiveForSong = null
+            scrim.flashThroughBlack(onBlack = {
+                exoPlayer.setMediaItems(basePlaylist)
+                exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+            })
+        }
+    }
+
+    val showAlbumArt = currentMediaId == coverItem.mediaId || currentMediaId == discoItem.mediaId
+    return RadioMockupSequencerState(exoPlayer, showAlbumArt, currentMediaId)
+}
+
+// Cobre o corte entre takes com um flash preto ANTECIPADO (pedido do usuario 18/09/2026: o fade
+// reagindo depois que o corte ja aconteceu (onMediaItemTransition) ficava sempre um passo atras
+// do glitch, o que parecia uma piscada em vez de um fade - "o fade precisa entrar antes, ficar
+// escuro no centro e voltar suave"). Fecha pro preto ANTES do corte previsto, segura escuro
+// (cobrindo o instante exato da troca) e so entao abre de novo devagar.
+private const val RadioSceneTransitionLeadMs = 450L
+private const val RadioSceneTransitionHoldMs = 200L
+private const val RadioSceneTransitionFadeInMs = 450
+private const val RadioSceneTransitionFadeOutMs = 700
+private const val RadioSceneTransitionRearmMarginMs = 500L
+
+private class RadioTransitionScrimState(private val alpha: Animatable<Float, *>) {
+    val alphaValue: Float get() = alpha.value
+
+    suspend fun flashThroughBlack(onBlack: (suspend () -> Unit)? = null) {
+        alpha.animateTo(1f, tween(RadioSceneTransitionFadeInMs))
+        onBlack?.invoke()
+        delay(RadioSceneTransitionHoldMs)
+        alpha.animateTo(0f, tween(RadioSceneTransitionFadeOutMs))
     }
 }
 
 @Composable
-private fun RadioMockupVideoBackground(modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val videoUri = remember(context) {
-        Uri.parse("android.resource://${context.packageName}/${R.raw.radio_album_mockup_scene}")
+private fun rememberRadioTransitionScrimState(): RadioTransitionScrimState {
+    val alpha = remember { Animatable(0f) }
+    return remember(alpha) { RadioTransitionScrimState(alpha) }
+}
+
+// Antecipa cortes NATURAIS do playlist (troca automatica de item no ExoPlayer, sem intervencao
+// nossa - ex.: teto->fran, fran->volta pra capa) monitorando quanto falta pro fim do item atual,
+// ja que todos os takes tem duracao fixa e conhecida. Cortes que NOS disparamos (disco no fim da
+// musica, reset pra musica nova) sao cobertos a parte, orquestrados ao redor do proprio
+// setMediaItem (ver rememberRadioMockupSequencer) - ai sabemos exatamente quando o corte
+// acontece, nao precisa adivinhar por polling.
+@Composable
+private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTransitionScrimState) {
+    LaunchedEffect(exoPlayer, scrim) {
+        var armed = true
+        while (isActive) {
+            val duration = exoPlayer.duration
+            val remaining = duration - exoPlayer.currentPosition
+            if (duration > 0) {
+                // Pula o flash quando o proximo item e o MESMO take (ex.: capa->capa no loop de
+                // 2x, ou o disco repetindo em REPEAT_MODE_ONE) - pedido do usuario 18/09/2026:
+                // "não precisa [de fade], só de uma cena diferente pra outra diferente".
+                val itemCount = exoPlayer.mediaItemCount
+                val currentIndex = exoPlayer.currentMediaItemIndex
+                val sameContentLoop = itemCount > 0 &&
+                    exoPlayer.getMediaItemAt(currentIndex).mediaId ==
+                        exoPlayer.getMediaItemAt((currentIndex + 1) % itemCount).mediaId
+                when {
+                    armed && !sameContentLoop && remaining in 0..RadioSceneTransitionLeadMs -> {
+                        armed = false
+                        scrim.flashThroughBlack()
+                    }
+                    remaining > RadioSceneTransitionLeadMs + RadioSceneTransitionRearmMarginMs -> {
+                        armed = true
+                    }
+                }
+            }
+            delay(50)
+        }
     }
-    val exoPlayer = remember(context, videoUri) {
+}
+
+@Composable
+private fun RadioMockupVideoBackground(exoPlayer: ExoPlayer, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { viewContext ->
+            TextureView(viewContext).also { textureView ->
+                exoPlayer.setVideoTextureView(textureView)
+            }
+        },
+        update = { textureView ->
+            exoPlayer.setVideoTextureView(textureView)
+            if (!exoPlayer.isPlaying) exoPlayer.play()
+        },
+    )
+}
+
+// Pedido do usuario 18/09/2026: opacidade um pouco mais alta que o teste inicial (20%) e
+// velocidade reduzida (o video original e rapido demais pro efeito "filme antigo" pretendido).
+private const val RadioOldFilmFilterAlpha = 0.32f
+private const val RadioOldFilmFilterSpeed = 0.6f
+
+@Composable
+private fun RadioOldFilmFilterOverlay(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val exoPlayer = remember(context) {
         ExoPlayer.Builder(context).build().apply {
             volume = 0f
             repeatMode = Player.REPEAT_MODE_ONE
-            setMediaItem(MediaItem.fromUri(videoUri))
+            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/${R.raw.radio_filter_old}")))
+            playbackParameters = PlaybackParameters(RadioOldFilmFilterSpeed)
             prepare()
             playWhenReady = true
         }
@@ -6395,9 +6800,10 @@ private fun RadioMockupVideoBackground(modifier: Modifier = Modifier) {
         onDispose { exoPlayer.release() }
     }
     AndroidView(
-        modifier = modifier,
+        modifier = modifier.alpha(RadioOldFilmFilterAlpha),
         factory = { viewContext ->
             TextureView(viewContext).also { textureView ->
+                textureView.isOpaque = false
                 exoPlayer.setVideoTextureView(textureView)
             }
         },
@@ -8210,6 +8616,10 @@ private fun FullPlayer(
 ) {
     val context = LocalContext.current
     val isRadio = player.activeRadioName.isNotBlank()
+    val cinematicIdle = rememberRadioCinematicIdleState(enabled = isRadio)
+    if (isRadio) {
+        RadioCinematicSystemBars(dim = cinematicIdle.dimSystemBars)
+    }
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center,
@@ -8283,6 +8693,7 @@ private fun FullPlayer(
                         .fillMaxWidth()
                         .aspectRatio(RadioAlbumMockupAspectRatio)
                         .clip(RoundedCornerShape(8.dp)),
+                    cinematicIdle = cinematicIdle,
                 )
             } else {
                 // Arrasta pro lado: pagina 0 = capa (chamada identica de ArtworkBox), pagina 1 = letra.

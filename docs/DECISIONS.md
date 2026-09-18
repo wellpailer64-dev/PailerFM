@@ -2247,3 +2247,68 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   rejeitou todos os candidatos (`reservationKey ja em uso`) exatamente como esperado, o
   fallback então encheu o buffer até 8/10 com IDs de boletim distintos
   (`blt_2bda28a1`, `blt_746d8f6f`, `blt_4cf800d8`, ...) - buffer voltou a funcionar.
+
+## ADR-042 — Rádio ao vivo ganha múltiplas cenas de vídeo em sequência, "modo cinema" e integração com boletim (`LocalTuneApp.kt`, `RadioAlbumMockupScene`)
+
+- **Contexto (18/09/2026):** o mockup da rádio (ADR anterior "Refine radio mockup
+  experience") tinha um único vídeo de fundo (`radio_album_mockup_scene.mp4`) em loop
+  fixo, com a capa do álbum desenhada em perspectiva por cima. Pedido do usuário: variar
+  a cena (não ficar só na capa), dar um ar mais "cinematográfico" na tela cheia da rádio,
+  e a cena precisa reagir a boletim tocando.
+- **Novos takes filmados** (fonte: `C:\Users\Pailer\Desktop\comprimidos`, convertidos de
+  HEVC pra H.264 - mesmo codec do vídeo já embutido - pra não estourar o pool de
+  decoders de hardware do aparelho quando duas camadas de vídeo tocam ao mesmo tempo,
+  ver filtro vintage abaixo):
+  - `radio_scene_take_de_cima.mp4` - plano geral de cima do estúdio, câmera lenta (1.4x).
+  - `radio_scene_fran_escrevendo.mp4` - close da Fran escrevendo, cortado pra começar
+    0.5s mais tarde (frame inicial ruim) e terminar ANTES dela largar a caneta (achado
+    quadro a quadro com `ffmpeg`/`ffprobe`), em câmera lenta 2x - resultando em ~10.3s.
+  - `radio_scene_disco_final.mp4` - mesmo enquadramento da capa (confirmado quadro a
+    quadro que é o mesmo setup de câmera), take de encerramento dedicado.
+  - `radio_filter_old.mp4` - filtro vintage em teste (grão/risco/vazamento de luz),
+    opacidade 32% e velocidade 0.6x, em loop próprio e independente, sempre por cima de
+    TODAS as outras camadas (inclusive do fade de transição, que fica ainda mais acima).
+- **Sequenciador (`rememberRadioMockupSequencer`):** um único `ExoPlayer` com playlist
+  `[capa, capa, take_de_cima, fran]` em `REPEAT_MODE_ALL` - a arte do álbum em
+  perspectiva (`PerspectiveAlbumArtwork`) só é desenhada quando o item atual é "capa" ou
+  "disco". Perto do fim da música (últimos 12s) o ciclo é interrompido e trocamos pro
+  take de encerramento (`disco_final`), travado até a próxima música começar.
+- **Fade de transição (`RadioTransitionScrimState`/`RadioNaturalTransitionWatcher`):**
+  reescrito depois de duas rodadas de feedback ao vivo ("pisca", "atraso da capa
+  entrando/saindo"). Em vez de reagir DEPOIS do corte (`onMediaItemTransition`, que
+  chegava um passo atrás do glitch do texture view), o corte é ANTECIPADO por polling da
+  posição/duração do item atual (todos os takes têm duração fixa e conhecida): fecha pro
+  preto ~450ms antes do fim previsto, segura ~200ms (cobrindo o instante real do corte,
+  inclusive trocas forçadas via `setMediaItem` como o corte pro disco/boletim, que são
+  orquestradas em volta do próprio flash), e só então abre de novo em ~700ms. Pula o
+  flash quando o próximo item é o MESMO conteúdo (loop de 2x da capa, ou o disco/take de
+  boletim repetindo sozinho em `REPEAT_MODE_ONE`) - fade só entre cenas diferentes.
+- **Boletim ao vivo:** enquanto `player.currentNewsHeadline` não está vazio, a cena trava
+  no take de cima em loop (sem capa) por trás do mesmo fade; quando o boletim termina e a
+  música volta, corta de volta pra capa/disco e reinicia o ciclo normal. Tem prioridade
+  sobre o corte "música acabando" (que também usa o take do disco) - boletins entram
+  tipicamente nos últimos segundos da música (ver `checkForEarlyNewsBreak` em
+  RADIO_PIPELINE.md), então os dois gatilhos podiam disparar juntos sem essa prioridade.
+- **"Modo cinema" (`rememberRadioCinematicIdleState`, hoisted em `LibraryShell`):** sem
+  toque na tela por 5s, a barra de progresso some E o header/navbar do PRÓPRIO app
+  (`LibraryHeader`/`BottomMainNavigationBar` - não a status/navigation bar do Android)
+  ficam pretos com ícones/texto desaparecendo junto. Tocar em qualquer lugar da cena
+  restaura tudo na hora e reinicia a contagem. Corrigido ao vivo um bug real do relógio de
+  inatividade: ele contava desde a primeira composição da tela (às vezes desde a abertura
+  do app), escurecendo tudo na hora se o usuário demorasse pra chegar na rádio - agora
+  zera sempre que o modo cinema é habilitado.
+- **Achado importante:** a implementação inicial desse "modo cinema" foi ligada em
+  `FullPlayer` (tela de player expandido) - só depois, comparando com um screenshot real
+  do usuário, ficou claro que a tela de verdade usada pra rádio é `RadioDetailScreen`
+  (aba Rádio, card em tela cheia via `LiveNowRadioCard(edgeToEdge = true)`), que nunca
+  passa por `FullPlayer`. A lógica foi migrada/hoisted pra `LibraryShell` (pai comum do
+  header, da navbar e da tela da rádio), mantendo `FullPlayer` com sua própria instância
+  independente (caminho ainda alcançável via "abrir player", pouco usado no fluxo real).
+- **Verificado ao vivo:** `assembleRelease` + `adb install -r` no Motorola físico,
+  `adb shell input tap` + `adb exec-out screencap` pra confirmar visualmente (sem
+  depender só do usuário testar às cegas) - barra de progresso sumindo/voltando,
+  header/navbar pretos com ícones somem juntos aos 5s, toque restaurando tudo, sequência
+  de cenas trocando com o fade. **Não verificado ao vivo:** o corte pra "take de cima"
+  quando um boletim real toca - depende do buffer interno decidir tocar um boletim, não
+  dá pra forçar de fora; lógica implementada e revisada mas sem confirmação em teste real
+  ainda.
