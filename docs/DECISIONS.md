@@ -2204,3 +2204,46 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   `blockStart`/`blockEnd` conferida manualmente pra `interval = 3` em várias posições
   (1, 3, 4, 6, 7 - todas caem no bloco certo). Não testado ao vivo ainda nesta sessão -
   vai junto do próximo push/release.
+
+## ADR-041 — Bug real: buffer de boletim travava vazio pra sempre quando o pool do feed é menor que o histórico anti-repetição
+
+- **Contexto (18/09/2026):** usuário reportou "urgente, o app de rádio não está mais
+  tocando os boletins depois de 3 músicas". Investigado ao vivo no aparelho (`adb logcat`
+  filtrado por `PailerRadioVoice`/`PailerBroadcastFeed`) + inspeção direta do
+  `manifest.json` publicado no Cloudflare.
+- **Causa raiz:** `recentBulletinStoryKeys` (anti-repetição, ver ADR-034/035) guarda as
+  últimas `RECENT_BULLETIN_STORY_KEY_LIMIT` = 80 chaves de boletim tocadas, persistidas em
+  disco (`radioPrefs`) e nunca zeradas sozinhas. O manifest do feed remoto, checado nesse
+  dia, tinha só 22 itens aprovados/não-vencidos no total. Rodando a rádio por alguns dias
+  o app cobriu o pool inteiro do feed pelo menos uma vez - a partir daí, TODA chave que
+  aparece no manifest já está em `recentBulletinStoryKeys`, `currentReservedBulletinStoryKeys()`
+  bloqueia o feed inteiro, `downloadNextApprovedBulletinBlocking()` retorna `null` pra toda
+  vaga, o `bulletinBuffer` fica permanentemente vazio, e `speakNextNewsBreak()` cancela a
+  entrada do boletim a cada intervalo (a cada 3 músicas, padrão) - **sem log de erro
+  nenhum**, porque esse é o mesmo caminho "silencioso por design" usado pra feed
+  genuinamente vazio ou rede fora do ar (ver RADIO_PIPELINE.md). Confirmado ao vivo: logcat
+  mostrava só `boletim: buscando posicao=0 specialOnly=false` e nada depois - o pedido
+  retornava `null` sem exceção nenhuma.
+- **Correção (`BroadcastFeedRepository.kt`/`LocalTuneViewModel.kt`):**
+  `downloadNextApprovedBulletin()`/`downloadNextApprovedBulletinBlocking()` ganharam um
+  parâmetro `fallbackReservedKeys` (default vazio, preserva comportamento antigo pra quem
+  não passar nada - `checkForSpecialOnAppOpen()` não usa). Se a rodada normal (`reservedKeys`
+  = histórico completo + buffer atual) não acha nada mas o manifest TINHA candidatos
+  válidos (status/expiração/áudio ok), tenta de novo só com `fallbackReservedKeys` -
+  `LocalTuneViewModel.currentBulletinBufferKeys()`, as chaves que já estão no
+  `bulletinBuffer` NESTA rodada - preferindo repetir um boletim antigo a nunca mais tocar
+  nenhum. Loga `W/PailerBroadcastFeed: "pool do feed esgotado contra o historico
+  anti-repeticao - repetindo boletim ja tocado"` quando isso acontece, pra não ficar
+  silencioso de novo da próxima vez. Não se aplica a `specialOnly` (o "especial" é aviso
+  avulso por pedido direto - ver ADR-037 - não faz sentido repetir sozinho fora de fila).
+- **Não corrigido de propósito - rotação não é justa:** o fallback pega o primeiro item do
+  manifest (ordem do próprio feed) que não está no buffer AGORA, não o "menos tocado
+  recentemente" dentro do histórico de 80. Dá pra repetir sempre o mesmo item favorecido
+  pela ordem do manifest em vez de girar o pool inteiro. Aceito por ora - o bug crítico era
+  "nunca mais toca boletim nenhum"; rotação justa entre repetições é um polish, não urgência
+  (ver TODO.md se quiser revisitar).
+- **Verificado ao vivo:** `assembleRelease` + `adb install -r` no Motorola físico, reaberto
+  o app com o buffer zerado (0/0 no disco) e `adb logcat` acompanhando: rodada normal
+  rejeitou todos os candidatos (`reservationKey ja em uso`) exatamente como esperado, o
+  fallback então encheu o buffer até 8/10 com IDs de boletim distintos
+  (`blt_2bda28a1`, `blt_746d8f6f`, `blt_4cf800d8`, ...) - buffer voltou a funcionar.

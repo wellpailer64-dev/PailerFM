@@ -126,12 +126,25 @@ o app só baixa `.wav` + roteiro, confere tamanho/hash e entra direto no `bullet
 buffer — a lógica de normalização em `BroadcastFeedRepository` precisa continuar
 reproduzindo essa fórmula exatamente (ver ADR-035, bug de dedup corrigido 16/09/2026).
 
-**Sem alternativa quando o feed está vazio:** se `downloadNextApprovedBulletin()` não
-devolve nada (feed sem item novo) ou o WAV baixado não é tocável, a vaga do buffer fica
-vazia e, na hora do intervalo, `speakNextNewsBreak()` simplesmente cancela a entrada e a
-música segue — sem RSS, sem redator local/Gemini, sem síntese de voz local/Gemini, sem
-TTS do Android (tudo isso foi removido em 16/09/2026; ver ADR de remoção em
-DECISIONS.md). Rede fora do ar também nunca trava o app: qualquer falha em
+**Dedup tem um fallback pra quando o pool do feed é menor que o histórico (ADR-041,
+18/09/2026):** `recentBulletinStoryKeys` guarda as últimas `RECENT_BULLETIN_STORY_KEY_LIMIT`
+= 80 chaves tocadas; o feed publicado costuma ter uma dúzia ou duas de itens aprovados por
+vez. Assim que o app cobre o pool inteiro do feed, toda chave do manifest cai dentro desse
+histórico e a rodada normal (`reservedKeys`) nunca mais acha nada — sem esse fallback, o
+buffer ficava vazio pra sempre e a rádio parava de anunciar boletim, em silêncio (bug real,
+visto ao vivo). Se a rodada normal não devolve nada mas o manifest TINHA candidatos
+válidos, `downloadNextApprovedBulletinBlocking()` tenta de novo ignorando o histórico —
+só evita repetir um item que já está sentado no `bulletinBuffer` agora mesmo
+(`fallbackReservedKeys`/`currentBulletinBufferKeys()`) — preferindo repetir um boletim
+antigo a nunca mais tocar nenhum. Não roda em `specialOnly` (o "especial" é aviso avulso,
+não faz sentido repetir sozinho).
+
+**Sem alternativa quando o feed está genuinamente vazio ou fora do ar:** se o manifest não
+tem NENHUM candidato aprovado/não-vencido (nem pro fallback acima), ou o WAV baixado não é
+tocável, ou a rede está fora do ar, a vaga do buffer fica vazia e, na hora do intervalo,
+`speakNextNewsBreak()` simplesmente cancela a entrada e a música segue — sem RSS, sem
+redator local/Gemini, sem síntese de voz local/Gemini, sem TTS do Android (tudo isso foi
+removido em 16/09/2026; ver ADR de remoção em DECISIONS.md). Qualquer falha em
 `BroadcastFeedRepository` é capturada e tratada como "sem boletim novo".
 
 `RadioScript`/`RadioScriptLine`/`RadioSpeaker`/`RadioScriptSource` (em `RadioBulletin.kt`)
