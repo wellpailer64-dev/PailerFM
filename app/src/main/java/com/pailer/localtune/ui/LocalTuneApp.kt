@@ -184,6 +184,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -434,7 +435,24 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var settingsPage by rememberSaveable { mutableStateOf(SettingsPage.Main) }
     var selectedAlbum by remember { mutableStateOf<LocalAlbum?>(null) }
     var selectedArtist by remember { mutableStateOf<LocalArtist?>(null) }
-    var selectedRadio by remember { mutableStateOf<LocalRadio?>(null) }
+    // rememberSaveable (nao remember simples) de proposito - pedido do usuario 17/09/2026: girar
+    // a tela recria a Activity (sem android:configChanges no manifest), e um remember comum
+    // reseta pra null nessa recriacao mesmo com uma radio ainda tocando (o ViewModel sobrevive,
+    // so o estado local desta composable que se perde) - a tela caia de volta na lista de
+    // "outras radios" na vertical. Salva so o NOME (String, serializavel de verdade no Bundle) e
+    // resolve pro LocalRadio de verdade contra viewModel.libraryContentState (nao contra o `radios`
+    // local mais abaixo - o Saver roda na primeira composicao, antes daquele val existir; o
+    // ViewModel em si sobrevive rotacao, entao esse state ja vem populado mesmo recem-recriado).
+    val selectedRadioSaver = remember {
+        Saver<LocalRadio?, String>(
+            save = { it?.name ?: "" },
+            restore = { name ->
+                name.takeIf { it.isNotEmpty() }
+                    ?.let { savedName -> viewModel.libraryContentState.value.radios.firstOrNull { it.name == savedName } }
+            },
+        )
+    }
+    var selectedRadio by rememberSaveable(stateSaver = selectedRadioSaver) { mutableStateOf<LocalRadio?>(null) }
     var selectedGenre by remember { mutableStateOf<LocalRadio?>(null) }
     // Mini player some sozinho depois de 5s sem nenhum toque na tela e volta a aparecer no
     // proximo toque (pedido do usuario 15/09/2026, imitando players tipo Youtube Music) - so a
@@ -954,6 +972,19 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         listState = artistDetailListState,
                     )
                     openedRadio != null -> {
+                    // Pedido do usuario 17/09/2026: saiu do app (ou girou a tela), quando volta a
+                    // radio ativa aparece so com o card "ao vivo" e o bloco embaixo vazio - o
+                    // estado local radioSession (Compose remember, nao sobrevive a Activity
+                    // recriada) fica vazio mas a radio continua tocando de verdade no controller.
+                    // Em vez de deixar vazio ou gerar sessao nova (reiniciaria a musica atual),
+                    // reconstroi a lista a partir da fila real (ver currentRadioQueueSongs).
+                    LaunchedEffect(openedRadio.name, player.activeRadioName, player.hasMedia) {
+                        val isActiveSession = player.activeRadioName == openedRadio.name && player.hasMedia
+                        if (isActiveSession && radioSession.isEmpty()) {
+                            val recovered = viewModel.currentRadioQueueSongs()
+                            if (recovered.isNotEmpty()) radioSession = recovered
+                        }
+                    }
                     // Fontes extras (adicionadas via "+") da radio aberta, resolvidas contra as
                     // listas artists/albums ja carregadas - recalculado a cada recomposicao (nao
                     // memoizado), entao some/aparece sozinho ao adicionar/remover fonte.

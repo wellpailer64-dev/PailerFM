@@ -989,6 +989,24 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun createRadioSession(radio: LocalRadio): List<LocalSong> = repository.radioSessionFrom(radio)
 
+    // Reconstroi a "Sequencia ao vivo do bloco" (RadioDetailScreen.sessionSongs) direto da fila
+    // REAL do controller - pedido do usuario 17/09/2026: ao voltar pro app depois de um tempo
+    // fora (ou depois de girar a tela), a lista local de sessao (estado de Compose, nao
+    // sobrevive a recriacao da Activity) as vezes fica vazia mesmo com a radio ainda tocando,
+    // e a tela mostrava so o card "ao vivo" com o bloco embaixo vazio. Em vez de gerar uma
+    // sessao NOVA (que reiniciaria a musica atual do zero, ver playRadioSession), so re-le o
+    // que ja esta tocando: setMediaItems (playSongs) poe a sessao INTEIRA de uma vez e boletim
+    // nunca entra como item de fila de verdade (toca por cima via announcementPlayer), entao o
+    // indice da fila do controller bate 1:1 com a sessionSongs original.
+    fun currentRadioQueueSongs(): List<LocalSong> {
+        val player = controller ?: return emptyList()
+        if (player.mediaItemCount == 0) return emptyList()
+        val songsById = libraryState.value.songs.associateBy { it.id }
+        return (0 until player.mediaItemCount).mapNotNull { index ->
+            player.getMediaItemAt(index).mediaId.toLongOrNull()?.let(songsById::get)
+        }
+    }
+
     fun listenAgainSongs(songs: List<LocalSong>): List<LocalSong> {
         val byId = songs.associateBy { it.id }
         val history = libraryState.value.historyIds.mapNotNull { byId[it] }
