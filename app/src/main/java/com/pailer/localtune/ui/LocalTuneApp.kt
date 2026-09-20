@@ -6383,7 +6383,11 @@ private fun RadioAlbumMockupScene(
     val chorusWindows = remember(lyrics.lyrics) {
         if (lyrics.lyrics.synced) LrcParser.chorusWindows(lyrics.lyrics.lines) else emptyList()
     }
-    val chorusWindowStartMs = chorusWindows.firstOrNull { player.positionMs in it }?.first
+    // A ocorrencia inteira (nao so o inicio) - pedido do usuario 20/09/2026: "faz as cenas
+    // durarem o refrão todo" - antes so um take de ceu tocava (~8-10s) e voltava pro disco no
+    // meio do refrao, cortando de volta pra capa e voltando de novo no verso seguinte do refrao.
+    // Com o range inteiro da pra saber a duracao de VERDADE da ocorrencia (ver sequencer abaixo).
+    val chorusWindowRange = chorusWindows.firstOrNull { player.positionMs in it }
     val scrim = rememberRadioTransitionScrimState()
     val sequencer = rememberRadioMockupSequencer(
         songId = player.songId,
@@ -6393,7 +6397,7 @@ private fun RadioAlbumMockupScene(
         // 18/09/2026); quando termina, volta pra capa/disco.
         isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
         hasProfilePhoto = player.profilePhotoUri != null,
-        chorusWindowStartMs = chorusWindowStartMs,
+        chorusWindowRange = chorusWindowRange,
         scrim = scrim,
     )
 
@@ -6711,25 +6715,30 @@ private fun buildRadioCycleChunk(environmentPool: List<MediaItem>, coverItem: Me
     return listOf(coverItem, coverItem) + scenes
 }
 
-// Quanto tempo o take de ceu do refrao fica visivel (pedido do usuario 20/09/2026, "nao precisa
-// durar o refrao todo"). Os 4 clipes (radio_scene_ceu_madrugada/manha/tarde/noite) sao um loop
-// "ida e volta" de 8s cada (4s pra frente + os mesmos 4s de tras pra frente, pedido do usuario
-// depois: "deixa eles com a mesma duração também... algo que funcione em loop") - ultimo frame do
-// clipe = primeiro frame, entao REPEAT_MODE_ONE (ver abaixo) nao da nenhum salto visivel no corte
-// do loop, sobra ou falta o hold nao importa mais.
-private const val RadioChorusSkyHoldMs = 10_000L
+// Pedido do usuario 20/09/2026: "faz as cenas durarem o refrão todo" - antes o hold era um
+// numero fixo (10s) sem relacao com o refrao de verdade, entao um refrao mais longo cortava de
+// volta pro disco no meio (voltava pra capa, tocava outro verso do refrao, tinha que trocar de
+// novo) - ida-e-volta feia. Agora o hold e a duracao REAL da ocorrencia do refrao (fim - inicio
+// do range de LrcParser.chorusWindows) - os clipes de ceu sao loops "ida e volta" tocados em
+// sequencia dentro do POOL do horario (ver skyPoolForNow), entao qualquer duracao de hold funciona
+// sem cortar feio no meio. RadioChorusSkyMinHoldMs (~1 clipe inteiro) evita entrar por uma
+// ocorrencia curta demais pra valer a pena a transicao; o teto de 45s e so seguranca contra o
+// heuristico "detectar" por acaso um refrao gigante.
+private const val RadioChorusSkyMinHoldMs = 4_000L
+private fun holdMsForChorusWindow(range: LongRange): Long =
+    (range.last - range.first).coerceIn(RadioChorusSkyMinHoldMs, 45_000L)
 
-// Escolhe o take de ceu pelo RELOGIO REAL do aparelho (pedido do usuario 20/09/2026: "os takes
-// sempre vão aparecer de acordo com o horário") - nao e sorteado nem depende da musica, e sempre o
-// horario batendo com a hora local de quem esta ouvindo:
-//   madrugada 00h-07h (usuario pediu 00h-05h; o buraco 05h-07h ficou aqui por padrao, mais perto
-//   tematicamente de madrugada do que de manha), manha 07h-12h, tarde 12h-19h, noite 19h-00h.
-private fun skyMediaItemForNow(
-    madrugada: MediaItem,
-    manha: MediaItem,
-    tarde: MediaItem,
-    noite: MediaItem,
-): MediaItem {
+// Escolhe o POOL de takes de ceu (varias opcoes por horario, pedido do usuario 20/09/2026: "pega
+// 2 opções a mais de cada cena... faz eles tocar um após o outro") pelo RELOGIO REAL do aparelho -
+// nao e sorteado nem depende da musica, e sempre o horario batendo com a hora local de quem esta
+// ouvindo: madrugada 00h-07h (usuario pediu 00h-05h; o buraco 05h-07h ficou aqui por padrao, mais
+// perto tematicamente de madrugada do que de manha), manha 07h-12h, tarde 12h-19h, noite 19h-00h.
+private fun skyPoolForNow(
+    madrugada: List<MediaItem>,
+    manha: List<MediaItem>,
+    tarde: List<MediaItem>,
+    noite: List<MediaItem>,
+): List<MediaItem> {
     val hour = java.time.LocalTime.now().hour
     return when {
         hour < 7 -> madrugada
@@ -6766,11 +6775,13 @@ private fun rememberRadioMockupSequencer(
     // "esse take só aparece se tiver foto lá"). Muda o pool pra frente (proxima extensao da fila),
     // sem interromper o que ja esta tocando.
     hasProfilePhoto: Boolean,
-    // Instante (ms na musica atual) de INICIO da ocorrencia do refrao que esta rolando AGORA, ou
-    // null fora de refrao / sem letra sincronizada (pedido do usuario 20/09/2026, ver
-    // LrcParser.chorusWindows) - muda de valor a cada nova ocorrencia do refrao, usado como
-    // "chave" pra saber se essa ocorrencia especifica ja mostrou o take de ceu ou nao.
-    chorusWindowStartMs: Long?,
+    // Range (ms na musica atual) da ocorrencia do refrao que esta rolando AGORA, ou null fora de
+    // refrao / sem letra sincronizada (pedido do usuario 20/09/2026, ver LrcParser.chorusWindows).
+    // O INICIO do range muda a cada nova ocorrencia do refrao, usado como "chave" pra saber se
+    // essa ocorrencia especifica ja mostrou o take de ceu ou nao; a duracao do range (fim-inicio)
+    // vira o hold de verdade da cena de ceu (ver holdMsForChorusWindow) - pedido do usuario depois
+    // de ver ao vivo: "faz as cenas durarem o refrão todo", sem hold fixo desalinhado da letra.
+    chorusWindowRange: LongRange?,
     scrim: RadioTransitionScrimState,
 ): RadioMockupSequencerState {
     val context = LocalContext.current
@@ -6813,19 +6824,40 @@ private fun rememberRadioMockupSequencer(
         radioMockupMediaItem(context, R.raw.radio_scene_trocando_disco, "trocando_disco")
     }
     // Takes de ceu (pedido do usuario 20/09/2026) - so tocam durante um refrao (ver watcher de
-    // refrao mais abaixo), NAO fazem parte do environmentPool sorteado do ciclo normal. Um por
-    // horario do dia, ver skyMediaItemForNow().
-    val skyMadrugadaItem = remember(context) {
-        radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada, "ceu_madrugada")
+    // refrao mais abaixo), NAO fazem parte do environmentPool sorteado do ciclo normal. Um POOL
+    // de 3 clipes por horario do dia (pedido do usuario depois: "pega 2 opções a mais de cada
+    // cena... faz eles tocar um após o outro" - ver skyPoolForNow), nao so 1 fixo.
+    val skyMadrugadaPool = remember(context) {
+        listOf(
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada, "ceu_madrugada_1"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada_2, "ceu_madrugada_2"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada_3, "ceu_madrugada_3"),
+        )
     }
-    val skyManhaItem = remember(context) {
-        radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha, "ceu_manha")
+    val skyManhaPool = remember(context) {
+        listOf(
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha, "ceu_manha_1"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha_2, "ceu_manha_2"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha_3, "ceu_manha_3"),
+        )
     }
-    val skyTardeItem = remember(context) {
-        radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde, "ceu_tarde")
+    // Take antigo de radio_scene_ceu_tarde.mp4 foi SUBSTITUIDO (pedido do usuario 20/09/2026:
+    // "esse [céu de tarde] está meio cara de savana, precisa ser algo urbano") - os 3 agora sao
+    // todos novos, silhueta de skyline generica (nunca uma casa/ponto turistico reconhecivel, pra
+    // servir de céu de QUALQUER cidade).
+    val skyTardePool = remember(context) {
+        listOf(
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde, "ceu_tarde_1"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde_2, "ceu_tarde_2"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde_3, "ceu_tarde_3"),
+        )
     }
-    val skyNoiteItem = remember(context) {
-        radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite, "ceu_noite")
+    val skyNoitePool = remember(context) {
+        listOf(
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite, "ceu_noite_1"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite_2, "ceu_noite_2"),
+            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite_3, "ceu_noite_3"),
+        )
     }
     val environmentPool = remember(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem, quadroFotosItem, tvItem, hasProfilePhoto) {
         val base = listOf(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem, tvItem)
@@ -6987,39 +7019,42 @@ private fun rememberRadioMockupSequencer(
         }
     }
 
-    // Take de ceu no refrao (pedido do usuario 20/09/2026): entra so quando chorusWindowStartMs
+    // Take de ceu no refrao (pedido do usuario 20/09/2026): entra so quando chorusWindowRange
     // aponta uma ocorrencia de refrao que essa musica ainda nao mostrou - guarda por
     // songId+startMs (chorusShownForSongId/chorusShownWindowStart) pra nao repetir a cada
     // recomposicao enquanto a musica continua dentro da MESMA ocorrencia (a janela dura varias
     // linhas, esse efeito roda em loop de polling). !nearEnd evita colidir com a transicao de
     // encerramento/troca de disco perto do fim da musica (dynamicCycleEnabled ja e a trava
-    // compartilhada contra rodar 2 transicoes especiais ao mesmo tempo). Um so take por ocorrencia
-    // e o suficiente - "nao precisa durar o refrao todo" (pedido do usuario).
-    val currentChorusWindowStart = rememberUpdatedState(chorusWindowStartMs)
+    // compartilhada contra rodar 2 transicoes especiais ao mesmo tempo). O POOL inteiro do
+    // horario entra na fila (embaralhado) em REPEAT_MODE_ALL - toca um clipe apos o outro
+    // (pedido do usuario) pelo tempo INTEIRO da ocorrencia do refrao (holdMsForChorusWindow),
+    // sem cortar de volta pro disco no meio.
+    val currentChorusWindowRange = rememberUpdatedState(chorusWindowRange)
     var chorusShownForSongId by remember(exoPlayer) { mutableStateOf<Long?>(null) }
     var chorusShownWindowStart by remember(exoPlayer) { mutableStateOf<Long?>(null) }
-    LaunchedEffect(exoPlayer, skyMadrugadaItem, skyManhaItem, skyTardeItem, skyNoiteItem) {
+    LaunchedEffect(exoPlayer, skyMadrugadaPool, skyManhaPool, skyTardePool, skyNoitePool) {
         while (isActive) {
-            val windowStart = currentChorusWindowStart.value
+            val window = currentChorusWindowRange.value
             val songNow = currentSongId.value
             if (songNow != chorusShownForSongId) {
                 chorusShownForSongId = songNow
                 chorusShownWindowStart = null
             }
-            val alreadyShownThisOccurrence = windowStart != null && windowStart == chorusShownWindowStart
-            if (!isFirstSetup && dynamicCycleEnabled && !nearEnd && windowStart != null && !alreadyShownThisOccurrence) {
-                chorusShownWindowStart = windowStart
-                val skyItem = skyMediaItemForNow(skyMadrugadaItem, skyManhaItem, skyTardeItem, skyNoiteItem)
+            val alreadyShownThisOccurrence = window != null && window.first == chorusShownWindowStart
+            if (!isFirstSetup && dynamicCycleEnabled && !nearEnd && window != null && !alreadyShownThisOccurrence) {
+                chorusShownWindowStart = window.first
+                val skyPool = skyPoolForNow(skyMadrugadaPool, skyManhaPool, skyTardePool, skyNoitePool)
                 dynamicCycleEnabled = false
                 scrim.flashThroughBlack(onBlack = {
-                    exoPlayer.setMediaItem(skyItem)
-                    // REPEAT_MODE_ONE (loop "ida e volta" de 8s, ver RadioChorusSkyHoldMs) - o
-                    // hold pode durar mais ou menos que o clipe sem cortar feio no meio.
-                    exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                    exoPlayer.setMediaItems(skyPool.shuffled())
+                    // REPEAT_MODE_ALL (era ONE com 1 clipe so) - agora e um POOL de varios
+                    // clipes, toca um apos o outro e recomeca do inicio se o refrao continuar
+                    // mais que uma volta completa do pool.
+                    exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
                     exoPlayer.prepare()
                     exoPlayer.playWhenReady = true
                 })
-                delay(RadioChorusSkyHoldMs)
+                delay(holdMsForChorusWindow(window))
                 scrim.flashThroughBlack(onBlack = startFreshCycle)
             }
             delay(150)
@@ -7029,10 +7064,9 @@ private fun rememberRadioMockupSequencer(
     val showAlbumArt = currentMediaId == coverItem.mediaId || currentMediaId == discoItem.mediaId
     val showProfilePhotoBoard = currentMediaId == quadroFotosItem.mediaId
     val showTvScreen = currentMediaId == tvItem.mediaId
-    val chorusCaptionActive = currentMediaId == skyMadrugadaItem.mediaId ||
-        currentMediaId == skyManhaItem.mediaId ||
-        currentMediaId == skyTardeItem.mediaId ||
-        currentMediaId == skyNoiteItem.mediaId
+    // Todo mediaId de take de ceu comeca com "ceu_" (ver os 4 pools acima) - mais simples que
+    // comparar contra as 12 opcoes uma a uma.
+    val chorusCaptionActive = currentMediaId.startsWith("ceu_")
     return RadioMockupSequencerState(
         exoPlayer,
         showAlbumArt,
@@ -8937,13 +8971,14 @@ private fun RadioChorusCaption(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Black,
             // Maior e alinhada a esquerda (pedido do usuario 20/09/2026, ajuste depois de ver ao
-            // vivo) - era 26sp/centralizada.
+            // vivo) - era 26sp/centralizada. Sem limite de linhas nem ellipsis (pedido do usuario
+            // depois: "nunca cortar a letra... pode usar o espaço vertical, já que o horizontal
+            // ficou limitado") - com a fonte maior e alinhada a esquerda uma frase grande pode
+            // precisar de 3+ linhas, e isso e melhor do que cortar.
             fontSize = 38.sp,
             lineHeight = 42.sp,
             letterSpacing = 0.4.sp,
             textAlign = TextAlign.Start,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
         )
     }
 }
