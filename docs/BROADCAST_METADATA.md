@@ -286,7 +286,8 @@ _broadcast-boletins-local/distribuicao-app/public/
   metadata/{content_type}/{category}/...
 ```
 
-Contrato inicial do `manifest.json`:
+Contrato do `manifest.json` (atualizado 17/09/2026 - `expires_at` e a proveniencia dentro
+de `source_record.provenance` sao reais agora, nao mais proposta):
 
 ```json
 {
@@ -307,7 +308,24 @@ Contrato inicial do `manifest.json`:
       "category": "games",
       "priority": 50,
       "created_at": "2026-09-16T21:00:00Z",
+      "expires_at": "2026-09-18T21:00:00Z",
       "approved_at": "2026-09-16T21:20:00Z",
+      "source_record": {
+        "provenance": {
+          "source_discovery": "Canaltech Games",
+          "source_url": "https://canaltech.com.br/...",
+          "published_at": "Wed, 17 Sep 2026 09:00:00 -0300",
+          "license": "Direitos reservados (Lei 9.610/98) - uso apenas como radar de pauta",
+          "attribution_required": true,
+          "commercial_reuse": false,
+          "ai_ingestion_allowed": false,
+          "content_mode": "discovery_only",
+          "primary_sources": [
+            { "url": "https://onlinelibrary.wiley.com/doi/...", "domain": "onlinelibrary.wiley.com" }
+          ],
+          "authors": ["Nome do jornalista, se identificado"]
+        }
+      },
       "audio": {
         "path": "audio/temporal/games/blt_abc123_titulo-interno.wav",
         "format": "wav",
@@ -330,6 +348,17 @@ Contrato inicial do `manifest.json`:
 
 O app deve tratar `manifest.json` como fonte da verdade. Arquivos antigos que sobrem na
 pasta publica nao devem ser consumidos se nao estiverem listados no manifesto.
+
+`expires_at` (ISO8601 UTC): quando o boletim vence. Calculado em
+`compute_expires_at()`/`broadcast_core.py` a partir da publicacao original da noticia
+(RSS `published_at`) mais uma janela por perfil de conteudo - 24h pra categorias
+"aconteceu agora" (geopolitics/technology/health/general), 72h pras demais categorias
+temporais, 60 dias de prateleira pra `evergreen` (nao e infinito, decisao explicita do
+usuario). Boletim vencido e **apagado de verdade** (nao arquivado) do painel, do
+Cloudflare e nunca chega a ser baixado pelo app (`BroadcastFeedRepository.isExpired()`,
+ver ADR-036 em [DECISIONS.md](DECISIONS.md)) - decisao do usuario: noticia vencida nao
+tem valor de guardar. Pendencia conhecida: boletim ja baixado pro buffer do app antes de
+vencer nao e reavaliado depois (ver [TODO.md](TODO.md)).
 
 ## Plano cauteloso de implementacao
 
@@ -360,3 +389,15 @@ pasta publica nao devem ser consumidos se nao estiverem listados no manifesto.
   pre-pipeline. O plano foi ajustado para aproveitar essa pasta em vez de criar uma
   estrutura paralela. Tambem foi incorporada a necessidade de uma etapa explicita de
   pesquisa/enriquecimento antes da redacao.
+- 2026-09-17: sessao grande de depuracao + evolucao da central local (ver ADR-036 em
+  [DECISIONS.md](DECISIONS.md) para o detalhe completo). Resumo: corrigidos bugs reais de
+  card preso na sintese, disputa de GPU entre redator/voz, fonte RSS quebrada (gzip) e 3
+  bugs de categorizacao; classificacao `temporal`/`evergreen` (que ate entao nunca
+  funcionava de verdade - tudo caia em `temporal`) foi corrigida com sinais reais;
+  adicionadas 13 fontes RSS novas (5 -> 18 portais); implementada politica de uso por
+  fonte (raspagem de texto integral desligada por padrao, so links de fonte primaria e
+  autoria sao extraidos) com cadeia de proveniencia por boletim; implementado prazo de
+  validade real (`expires_at`) com delecao definitiva de boletim vencido no painel, no
+  Cloudflare e no app (lado app documentado em ADR-036, pendencia de buffer local em
+  [TODO.md](TODO.md) do app); site do Cloudflare reorganizado em secoes
+  Temporal/Atemporal por categoria.
