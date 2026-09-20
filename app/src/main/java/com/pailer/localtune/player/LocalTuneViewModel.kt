@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.media.MediaPlayer
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.PowerManager
 import android.util.Log
@@ -453,6 +454,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // chamada durante a passagem tocaria a passagem duas vezes.
     private var newsBreakEnding = false
     private var announcementPlayer: MediaPlayer? = null
+    // Ganho de verdade em cima do boletim (pedido do usuario 20/09/2026: "aumenta o som dos
+    // boletins") - MediaPlayer.setVolume() satura em 1f (unity gain), nao da pra passar disso;
+    // o audio baixado do feed remoto as vezes vem gravado baixo. LoudnessEnhancer aplica ganho de
+    // verdade (com compressor de faixa dinamica embutido, evita estourar/clipar) por cima da
+    // sessao de audio do announcementPlayer. Ver playAnnouncementFile.
+    private var announcementLoudnessEnhancer: LoudnessEnhancer? = null
     // Player dedicado pro "Reproduzir" do card de buffer (playReadyBufferedBulletin) - separado
     // de announcementPlayer de proposito: o arquivo de um boletim do buffer ainda pertence ao
     // bulletinBuffer (vai tocar de verdade dali a pouco) - reusar o mesmo player/apagamento
@@ -2722,6 +2729,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         cancelSleepTimer()
         announcementPlayer?.release()
         announcementPlayer = null
+        announcementLoudnessEnhancer?.release()
+        announcementLoudnessEnhancer = null
         // Radio pode ser desligada no meio do fade de checkForEarlyNewsBreak (ver la) - restaura
         // o volume senao a musica fica muda dependendo de onde o fade parou. Sempre 1f (nao
         // radioVolume()) e reseta o mute - cada sessao de radio nova comeca sem mute.
@@ -2759,6 +2768,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun playVinhetaResource(resId: Int, volume: Float = 1.0f, onFinished: () -> Unit) {
         announcementPlayer?.release()
         announcementPlayer = null
+        // Vinheta nao usa o ganho extra do boletim (ver playAnnouncementFile) - so limpa um
+        // enhancer que possa ter sobrado de um boletim anterior, pra nao ficar preso a uma
+        // sessao de audio que ja vai ser encerrada.
+        announcementLoudnessEnhancer?.release()
+        announcementLoudnessEnhancer = null
         val player = runCatching {
             MediaPlayer.create(getApplication(), resId)
         }.getOrNull()
@@ -3404,6 +3418,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             Log.w(TAG_RADIO_VOICE, "announcement watchdog fired - forcing playback resume")
             runCatching { announcementPlayer?.release() }
             announcementPlayer = null
+            runCatching { announcementLoudnessEnhancer?.release() }
+            announcementLoudnessEnhancer = null
             if (pendingVinheta) finishVinhetas(activeRadioName) else finishNewsBreak()
         }
     }
@@ -3519,6 +3535,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         announcementPlayer?.release()
         announcementPlayer = null
+        announcementLoudnessEnhancer?.release()
+        announcementLoudnessEnhancer = null
         runCatching {
             MediaPlayer().apply {
                 setDataSource(file.absolutePath)
@@ -3529,6 +3547,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     Log.d(TAG_RADIO_VOICE, "announcement file completed bytes=${file.length()}")
                     it.release()
                     if (announcementPlayer === it) announcementPlayer = null
+                    announcementLoudnessEnhancer?.release()
+                    announcementLoudnessEnhancer = null
                     if (deleteOnCompletion) file.delete()
                     onFinished()
                 }
@@ -3536,11 +3556,23 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                     Log.w(TAG_RADIO_VOICE, "announcement file error what=$what extra=$extra bytes=${file.length()}")
                     player.release()
                     if (announcementPlayer === player) announcementPlayer = null
+                    announcementLoudnessEnhancer?.release()
+                    announcementLoudnessEnhancer = null
                     onError()
                     onFinished()
                     true
                 }
                 prepare()
+                // Ganho de verdade por cima do teto de 1f do setVolume (pedido do usuario
+                // 20/09/2026: "aumenta o som dos boletins") - ver announcementLoudnessEnhancer.
+                // So um efeito colateral de audio (nao afeta o volume da musica/radio), falha
+                // silenciosa (runCatching) se o aparelho nao suportar o efeito.
+                runCatching {
+                    announcementLoudnessEnhancer = LoudnessEnhancer(audioSessionId).apply {
+                        setTargetGain(ANNOUNCEMENT_LOUDNESS_GAIN_MB)
+                        enabled = true
+                    }
+                }
                 start()
                 announcementPlayer = this
             }
@@ -3953,6 +3985,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         controller?.removeListener(playerListener)
         controllerFuture?.let(MediaController::releaseFuture)
         announcementPlayer?.release()
+        announcementLoudnessEnhancer?.release()
         previewPlayer?.release()
         controller = null
         super.onCleared()
@@ -4037,6 +4070,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val REMOTE_FEED_TIMEOUT_MS = 15_000L
         const val TAG_RADIO_VOICE = "PailerRadioVoice"
         const val TAG_REMOTE_PLAYBACK = "PailerRemote"
+        // +12dB (millibels) de ganho real em cima do boletim via LoudnessEnhancer, alem do teto
+        // de 1f do MediaPlayer.setVolume (pedido do usuario 20/09/2026: "aumenta o som dos
+        // boletins") - ver playAnnouncementFile. LoudnessEnhancer tem compressor de faixa
+        // dinamica embutido, entao nao estoura/clipa mesmo nesse ganho.
+        const val ANNOUNCEMENT_LOUDNESS_GAIN_MB = 1_200
 
         // Chave = nome da radio normalizado (lowercase, so letras/digitos) — ver
         // normalizeRadioKey(). Nomes vem de MusicLibraryRepository (GENRE_DISPLAY_NAMES e
