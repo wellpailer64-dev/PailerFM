@@ -85,6 +85,61 @@ object LrcParser {
         return result
     }
 
+    // Normaliza uma linha pra comparacao (minusculo, sem pontuacao, espacos colapsados) - usado so
+    // por chorusWindows() abaixo, pra "Refrão!" e "refrão" contarem como a mesma linha.
+    private val NON_WORD_CHARS = Regex("[^\\p{L}\\p{N} ]")
+    private val EXTRA_SPACES = Regex("\\s+")
+    private fun normalizeForMatch(text: String): String =
+        text.lowercase().replace(NON_WORD_CHARS, " ").replace(EXTRA_SPACES, " ").trim()
+
+    /**
+     * Heuristica de deteccao de refrao (pedido do usuario 20/09/2026, pra saber QUANDO mostrar um
+     * take especial durante o refrao): so funciona com letra SINCRONIZADA (linhas com timeMs), sem
+     * isso nao ha como saber o instante exato de cada trecho. Ideia: verso normalmente nao se
+     * repete palavra por palavra, refrao sim - entao qualquer linha cujo texto (normalizado)
+     * aparece 2+ vezes na musica e candidata a refrao. Agrupa linhas candidatas CONSECUTIVAS (sem
+     * nenhuma linha "nao repetida" no meio) em blocos - cada bloco de 2+ linhas e uma OCORRENCIA do
+     * refrao, e vira uma janela de tempo (inicio da 1a linha do bloco ate o inicio da linha
+     * seguinte, ou +4s se for a ultima linha da musica). Retorna uma janela por ocorrencia (o
+     * refrao costuma repetir 2-4x numa musica) - nao so a primeira.
+     *
+     * Nao e perfeito (uma linha de verso que por acaso se repete em outro verso tambem conta), mas
+     * e um heuristico razoavel sem precisar de nenhum servico externo de deteccao de estrutura.
+     */
+    fun chorusWindows(lines: List<LyricsLine>): List<LongRange> {
+        val timed = lines.filter { it.timeMs != null }.sortedBy { it.timeMs }
+        if (timed.size < 4) return emptyList()
+
+        val normalized = timed.map { normalizeForMatch(it.text) }
+        val counts = normalized.filter { it.length >= 2 }.groupingBy { it }.eachCount()
+        val repeatedTexts = counts.filterValues { it >= 2 }.keys
+        if (repeatedTexts.isEmpty()) return emptyList()
+
+        val windows = mutableListOf<LongRange>()
+        var i = 0
+        while (i < timed.size) {
+            if (normalized[i] in repeatedTexts) {
+                var j = i
+                while (j + 1 < timed.size && normalized[j + 1] in repeatedTexts) j++
+                // Bloco de 1 linha so (um "oh oh" solto repetido no meio de versos, por exemplo)
+                // nao conta como refrao de verdade - exige pelo menos 2 linhas seguidas.
+                if (j > i) {
+                    val startMs = timed[i].timeMs!!
+                    val endMs = timed.getOrNull(j + 1)?.timeMs ?: (timed[j].timeMs!! + CHORUS_TAIL_MS)
+                    windows += startMs..endMs
+                }
+                i = j + 1
+            } else {
+                i++
+            }
+        }
+        return windows
+    }
+
+    // Quanto tempo depois da ULTIMA linha do refrao a janela continua, so quando esse refrao e
+    // tambem a ultima coisa cantada na musica (sem proxima linha pra marcar o fim de verdade).
+    private const val CHORUS_TAIL_MS = 4_000L
+
     private fun tagToMs(match: MatchResult): Long {
         val minutes = match.groupValues[1].toLong()
         val seconds = match.groupValues[2].toLong()

@@ -117,6 +117,9 @@ data class PlayerUiState(
     // que da errado em compilacoes com varios artistas sob o mesmo nome de album. Ver
     // LocalAlbum.isVariousArtists e `embeddedSourceUri` em ArtworkBox (LocalTuneApp.kt).
     val artworkSourceUri: android.net.Uri? = null,
+    // Foto de perfil salva pelo usuario (UserProfileUiState.photoUri) - usada pelo take "quadro
+    // de fotos" da radio (RadioAlbumMockupScene), que so entra na rotacao quando essa foto existe.
+    val profilePhotoUri: android.net.Uri? = null,
     val playbackSource: String = "",
     val activeRadioName: String = "",
     val currentNewsHeadline: String = "",
@@ -3792,6 +3795,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             album = metadata?.albumTitle?.toString().orEmpty(),
             artworkUri = metadata?.artworkUri,
             artworkSourceUri = player.currentMediaItem?.localConfiguration?.uri,
+            profilePhotoUri = profileState.value.photoUri,
             playbackSource = playbackSource,
             activeRadioName = activeRadioName,
             currentNewsHeadline = currentNewsHeadline,

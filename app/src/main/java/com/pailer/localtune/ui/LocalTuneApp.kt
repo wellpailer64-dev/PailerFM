@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BlurMaskFilter
 import android.graphics.LinearGradient
@@ -52,11 +53,16 @@ import androidx.compose.ui.input.pointer.pointerInput
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -228,6 +234,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -839,6 +848,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         // RadioDetailScreen.isInSession + LiveNowRadioCard(edgeToEdge = true) mais abaixo) -
         // hoisted aqui porque header e navbar sao irmaos da tela da radio, nao filhos dela.
         val radioCinematicIdle = rememberRadioCinematicIdleState(enabled = isInsideActiveRadio)
+        // Tela sempre acesa + barras do sistema escondidas enquanto o usuario esta DENTRO de uma
+        // radio tocando (pedido do usuario 20/09/2026) - mesma condicao do modo cinema acima.
+        RadioImmersiveModeEffect(active = isInsideActiveRadio)
         val selectMainTab: (MainTab) -> Unit = { tab ->
             selectedAlbum = null
             selectedArtist = null
@@ -6327,9 +6339,25 @@ private val RadioAlbumMockupCorners = listOf(
 // video (12s). Ver rememberRadioMockupSequencer().
 private const val RadioEndingCutoverMs = 12_000L
 
-// Quanto antes do fim real da musica a transicao de trocar o disco comeca (pedido do usuario
-// 18/09/2026, ajuste fino depois de ver ao vivo: "pode começar a transição só um pouco antes").
-private const val RadioDiscSwapLeadMs = 900L
+// Duracao real do video radio_scene_trocando_disco.mp4 (Fran trocando o disco na vitrola),
+// medida via ffprobe - 6.5s. Usada como referencia pra alinhar o inicio da transicao (abaixo) e
+// o tempo que ela fica visivel (RadioDiscSwapHoldMs) com a duracao de VERDADE do clipe, em vez de
+// numeros arbitrarios - pedido do usuario 20/09/2026: "veja a duração do clipe atual... toque ele
+// exatamente na quantidade que o clipe tem de segundos pra acabar junto com a quantidade de
+// segundos que a musica tem pra acabar".
+private const val RadioDiscSwapClipDurationMs = 6_500L
+
+// Quanto antes do fim real da musica a transicao de trocar o disco comeca. Precisa ser o tamanho
+// do proprio clipe (RadioDiscSwapClipDurationMs, 6.5s) MAIS a folga do fade de entrada da tela
+// preta (450ms = RadioSceneTransitionFadeInMs la embaixo, so entao o video e trocado de verdade -
+// ver flashThroughBlack; nao da pra referenciar a constante direto aqui, ela e declarada depois
+// no arquivo e top-level const val nao aceita forward reference), senao o video comeca cedo demais
+// mas so fica visivel tarde demais e acaba cortado no meio (era o caso antes, com 900ms fixos pra
+// um clipe de 6.5s - a troca de disco mal comecava a aparecer e ja levava o corte pro ciclo
+// normal, ou pior, so aparecia DEPOIS da musica acabar, parecendo a capa trocando sozinha). Com
+// essa conta o clipe termina de tocar bem na hora que a musica antiga acaba, nao antes nem (pior
+// ainda) so depois.
+private const val RadioDiscSwapLeadMs = RadioDiscSwapClipDurationMs + 450L
 
 @Composable
 private fun RadioAlbumMockupScene(
@@ -6349,6 +6377,13 @@ private fun RadioAlbumMockupScene(
     // reagindo depois que songId ja mudou.
     val discSwapImminent = player.durationMs > 0 &&
         (player.durationMs - player.positionMs) in 0..RadioDiscSwapLeadMs
+    // Janelas de refrao da musica atual (pedido do usuario 20/09/2026) - so existe algo aqui com
+    // letra SINCRONIZADA (ver LrcParser.chorusWindows); recalcula so quando a letra muda de
+    // verdade (troca de musica, ou sync chegando depois de um fetch online), nao a cada posicao.
+    val chorusWindows = remember(lyrics.lyrics) {
+        if (lyrics.lyrics.synced) LrcParser.chorusWindows(lyrics.lyrics.lines) else emptyList()
+    }
+    val chorusWindowStartMs = chorusWindows.firstOrNull { player.positionMs in it }?.first
     val scrim = rememberRadioTransitionScrimState()
     val sequencer = rememberRadioMockupSequencer(
         songId = player.songId,
@@ -6357,6 +6392,8 @@ private fun RadioAlbumMockupScene(
         // Boletim ao vivo tocando: trava no take de cima em loop, sem capa (pedido do usuario
         // 18/09/2026); quando termina, volta pra capa/disco.
         isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
+        hasProfilePhoto = player.profilePhotoUri != null,
+        chorusWindowStartMs = chorusWindowStartMs,
         scrim = scrim,
     )
 
@@ -6379,6 +6416,28 @@ private fun RadioAlbumMockupScene(
                 uri = player.artworkUri,
                 embeddedSourceUri = player.artworkSourceUri,
                 modifier = Modifier.fillMaxSize(),
+            )
+        }
+        if (sequencer.showProfilePhotoBoard) {
+            PerspectiveProfilePhotoOverlay(
+                photoUri = player.profilePhotoUri,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        if (sequencer.showTvScreen) {
+            // Sorteia de novo a cada ocorrencia desse take (nunca mais de 1 corte por take - ver
+            // comentario em RadioTvCutsPool).
+            val corteRes = remember(sequencer.currentOccurrence) { RadioTvCutsPool.random() }
+            PerspectiveTvScreenVideo(
+                rawRes = corteRes,
+                corners = RadioTvScreenCorners,
+                modifier = Modifier.fillMaxSize(),
+            )
+            Image(
+                painter = painterResource(R.drawable.radio_scene_take_tv),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
             )
         }
         Canvas(Modifier.matchParentSize()) {
@@ -6453,14 +6512,27 @@ private fun RadioAlbumMockupScene(
                 .padding(start = 18.dp, top = 62.dp, end = 18.dp, bottom = 100.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            HomeLyricsSubtitle(
-                lyrics = lyrics,
-                songId = player.songId,
-                positionMs = player.positionMs,
-                isPlaying = player.isPlaying,
-                enabled = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            // Durante o take de ceu do refrao a legenda normal vira a versao cinematografica
+            // (maior, bold, caps, com animacao de entrada - pedido do usuario 20/09/2026); fora
+            // disso e a legenda de sempre.
+            if (sequencer.chorusCaptionActive) {
+                RadioChorusCaption(
+                    lyrics = lyrics,
+                    songId = player.songId,
+                    positionMs = player.positionMs,
+                    isPlaying = player.isPlaying,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                HomeLyricsSubtitle(
+                    lyrics = lyrics,
+                    songId = player.songId,
+                    positionMs = player.positionMs,
+                    isPlaying = player.isPlaying,
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             Spacer(Modifier.height(8.dp))
             // No player expandido, some depois de alguns segundos parado e volta ao tocar na tela
             // (pedido do usuario 18/09/2026) - no card pequeno da Home fica sempre visivel.
@@ -6505,7 +6577,13 @@ private fun RadioAlbumMockupScene(
 private class RadioMockupSequencerState(
     val exoPlayer: ExoPlayer,
     val showAlbumArt: Boolean,
+    val showProfilePhotoBoard: Boolean,
+    val showTvScreen: Boolean,
+    val currentOccurrence: Int,
     val currentMediaId: String,
+    // true enquanto um dos takes de ceu (pedido do usuario 20/09/2026) esta tocando - a legenda
+    // troca pro estilo cinematografico nesse momento (ver RadioChorusCaption).
+    val chorusCaptionActive: Boolean,
 )
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
@@ -6562,6 +6640,34 @@ private fun rememberRadioCinematicIdleState(enabled: Boolean): RadioCinematicIdl
     )
 }
 
+// Modo imersivo da radio ativa (pedido do usuario 20/09/2026): dentro da radio a tela nao pode
+// apagar sozinha nem a barra de notificacao/status por cima atrapalhar a "apresentacao" - esconde
+// as barras do sistema (feito igual video em fullscreen, reversivel com um swipe da borda - mesmo
+// comportamento do imersive sticky do Android) e mantem a tela acesa enquanto a sessao durar.
+// Restaura os dois (barras + tela pode apagar de novo) ao sair de verdade da radio.
+@Composable
+private fun RadioImmersiveModeEffect(active: Boolean) {
+    val activity = LocalContext.current.findActivity() ?: return
+    val window = activity.window
+    val view = LocalView.current
+    DisposableEffect(window, view) {
+        onDispose {
+            view.keepScreenOn = false
+            WindowInsetsControllerCompat(window, view).show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+    LaunchedEffect(window, view, active) {
+        view.keepScreenOn = active
+        val controller = WindowInsetsControllerCompat(window, view)
+        if (active) {
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+}
+
 @Composable
 private fun RadioCinematicSystemBars(dim: Boolean) {
     val activity = LocalContext.current.findActivity() ?: return
@@ -6605,9 +6711,40 @@ private fun buildRadioCycleChunk(environmentPool: List<MediaItem>, coverItem: Me
     return listOf(coverItem, coverItem) + scenes
 }
 
+// Quanto tempo o take de ceu do refrao fica visivel (pedido do usuario 20/09/2026, "nao precisa
+// durar o refrao todo"). Os 4 clipes (radio_scene_ceu_madrugada/manha/tarde/noite) sao um loop
+// "ida e volta" de 8s cada (4s pra frente + os mesmos 4s de tras pra frente, pedido do usuario
+// depois: "deixa eles com a mesma duração também... algo que funcione em loop") - ultimo frame do
+// clipe = primeiro frame, entao REPEAT_MODE_ONE (ver abaixo) nao da nenhum salto visivel no corte
+// do loop, sobra ou falta o hold nao importa mais.
+private const val RadioChorusSkyHoldMs = 10_000L
+
+// Escolhe o take de ceu pelo RELOGIO REAL do aparelho (pedido do usuario 20/09/2026: "os takes
+// sempre vão aparecer de acordo com o horário") - nao e sorteado nem depende da musica, e sempre o
+// horario batendo com a hora local de quem esta ouvindo:
+//   madrugada 00h-07h (usuario pediu 00h-05h; o buraco 05h-07h ficou aqui por padrao, mais perto
+//   tematicamente de madrugada do que de manha), manha 07h-12h, tarde 12h-19h, noite 19h-00h.
+private fun skyMediaItemForNow(
+    madrugada: MediaItem,
+    manha: MediaItem,
+    tarde: MediaItem,
+    noite: MediaItem,
+): MediaItem {
+    val hour = java.time.LocalTime.now().hour
+    return when {
+        hour < 7 -> madrugada
+        hour < 12 -> manha
+        hour < 19 -> tarde
+        else -> noite
+    }
+}
+
 // Quanto tempo o take de trocar o disco fica visivel de fato (depois do fade de entrada) antes
-// de voltar pro ciclo normal - ver LaunchedEffect de songId abaixo.
-private const val RadioDiscSwapHoldMs = 5_000L
+// de voltar pro ciclo normal - ver LaunchedEffect de songId abaixo. Igual a duracao real do
+// proprio clipe (RadioDiscSwapClipDurationMs), nao um numero arbitrario menor/maior: o video toca
+// UMA vez, do inicio ao fim (REPEAT_MODE_OFF, ver abaixo), e some exatamente quando termina -
+// antes (5s fixos pra um clipe de 6.5s) ele era cortado no meio, no talho errado.
+private const val RadioDiscSwapHoldMs = RadioDiscSwapClipDurationMs
 
 // Sequencia de takes da radio (pedido do usuario 18/09/2026, refinado no mesmo dia): capa do
 // disco em loop 2x, depois 1-2 cenas de ambiente aleatorias, volta pra capa - ciclo continuo com
@@ -6624,6 +6761,16 @@ private fun rememberRadioMockupSequencer(
     nearEnd: Boolean,
     discSwapImminent: Boolean,
     isBulletinPlaying: Boolean,
+    // true quando o usuario tem foto de perfil salva (UserProfileUiState.photoUri) - so entao o
+    // take "quadro de fotos" entra no pool de cenas de ambiente (pedido do usuario 19/09/2026:
+    // "esse take só aparece se tiver foto lá"). Muda o pool pra frente (proxima extensao da fila),
+    // sem interromper o que ja esta tocando.
+    hasProfilePhoto: Boolean,
+    // Instante (ms na musica atual) de INICIO da ocorrencia do refrao que esta rolando AGORA, ou
+    // null fora de refrao / sem letra sincronizada (pedido do usuario 20/09/2026, ver
+    // LrcParser.chorusWindows) - muda de valor a cada nova ocorrencia do refrao, usado como
+    // "chave" pra saber se essa ocorrencia especifica ja mostrou o take de ceu ou nao.
+    chorusWindowStartMs: Long?,
     scrim: RadioTransitionScrimState,
 ): RadioMockupSequencerState {
     val context = LocalContext.current
@@ -6646,14 +6793,43 @@ private fun rememberRadioMockupSequencer(
     val discoGirandoItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_disco_girando, "disco_girando")
     }
+    // Imagem estatica (sem nenhum movimento, de proposito - pedido do usuario 19/09/2026) do
+    // mural de polaroids; a janela em branco do polaroid do meio ganha a foto do usuario via
+    // PerspectiveProfilePhotoOverlay, desenhada por cima quando esse take esta ativo (mesma
+    // logica de showAlbumArt/PerspectiveAlbumArtwork pra capa do disco).
+    val quadroFotosItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_quadro_fotos, "quadro_fotos")
+    }
+    // Imagem estatica da estante com a TV (pedido do usuario 19/09/2026) - o visor e transparente
+    // na arte original (RadioTvScreenCorners) e recebe, por cima, 1 dos cortes 1:1 de abertura de
+    // serie escolhido na hora (nunca mais de 1 por take - ver RadioTvCutsPool/currentOccurrence).
+    val tvItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_take_tv, "take_tv")
+    }
     val discoItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_disco_final, "disco")
     }
     val trocandoDiscoItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_trocando_disco, "trocando_disco")
     }
-    val environmentPool = remember(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem) {
-        listOf(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem)
+    // Takes de ceu (pedido do usuario 20/09/2026) - so tocam durante um refrao (ver watcher de
+    // refrao mais abaixo), NAO fazem parte do environmentPool sorteado do ciclo normal. Um por
+    // horario do dia, ver skyMediaItemForNow().
+    val skyMadrugadaItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada, "ceu_madrugada")
+    }
+    val skyManhaItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha, "ceu_manha")
+    }
+    val skyTardeItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde, "ceu_tarde")
+    }
+    val skyNoiteItem = remember(context) {
+        radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite, "ceu_noite")
+    }
+    val environmentPool = remember(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem, quadroFotosItem, tvItem, hasProfilePhoto) {
+        val base = listOf(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem, tvItem)
+        if (hasProfilePhoto) base + quadroFotosItem else base
     }
 
     val exoPlayer = remember(context) {
@@ -6661,6 +6837,10 @@ private fun rememberRadioMockupSequencer(
     }
 
     var currentMediaId by remember(exoPlayer) { mutableStateOf(coverItem.mediaId) }
+    // Incrementa a cada troca de item - usado so pra sortear de novo qual corte 1:1 passa na TV
+    // toda vez que o take "take_tv" volta a tocar (currentMediaId sozinho nao muda entre duas
+    // ocorrencias desse MESMO take).
+    var currentOccurrence by remember(exoPlayer) { mutableStateOf(0) }
     var discoActiveForSong by remember(exoPlayer) { mutableStateOf<Long?>(null) }
     var isFirstSetup by remember(exoPlayer) { mutableStateOf(true) }
     var hasHandledBulletinOnce by remember(exoPlayer) { mutableStateOf(false) }
@@ -6684,6 +6864,7 @@ private fun rememberRadioMockupSequencer(
         val listener = object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 currentMediaId = mediaItem?.mediaId ?: currentMediaId
+                currentOccurrence++
             }
         }
         exoPlayer.addListener(listener)
@@ -6747,7 +6928,11 @@ private fun rememberRadioMockupSequencer(
                     dynamicCycleEnabled = false
                     scrim.flashThroughBlack(onBlack = {
                         exoPlayer.setMediaItem(trocandoDiscoItem)
-                        exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                        // REPEAT_MODE_OFF (era ONE) - agora o hold bate com a duracao real do
+                        // clipe (RadioDiscSwapHoldMs = RadioDiscSwapClipDurationMs), entao o video
+                        // so precisa tocar UMA vez do inicio ao fim; deixa-lo em loop so arriscava
+                        // reiniciar bem quando o hold ia estourar, cortando o final da animacao.
+                        exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
                         exoPlayer.prepare()
                         exoPlayer.playWhenReady = true
                     })
@@ -6802,8 +6987,61 @@ private fun rememberRadioMockupSequencer(
         }
     }
 
+    // Take de ceu no refrao (pedido do usuario 20/09/2026): entra so quando chorusWindowStartMs
+    // aponta uma ocorrencia de refrao que essa musica ainda nao mostrou - guarda por
+    // songId+startMs (chorusShownForSongId/chorusShownWindowStart) pra nao repetir a cada
+    // recomposicao enquanto a musica continua dentro da MESMA ocorrencia (a janela dura varias
+    // linhas, esse efeito roda em loop de polling). !nearEnd evita colidir com a transicao de
+    // encerramento/troca de disco perto do fim da musica (dynamicCycleEnabled ja e a trava
+    // compartilhada contra rodar 2 transicoes especiais ao mesmo tempo). Um so take por ocorrencia
+    // e o suficiente - "nao precisa durar o refrao todo" (pedido do usuario).
+    val currentChorusWindowStart = rememberUpdatedState(chorusWindowStartMs)
+    var chorusShownForSongId by remember(exoPlayer) { mutableStateOf<Long?>(null) }
+    var chorusShownWindowStart by remember(exoPlayer) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(exoPlayer, skyMadrugadaItem, skyManhaItem, skyTardeItem, skyNoiteItem) {
+        while (isActive) {
+            val windowStart = currentChorusWindowStart.value
+            val songNow = currentSongId.value
+            if (songNow != chorusShownForSongId) {
+                chorusShownForSongId = songNow
+                chorusShownWindowStart = null
+            }
+            val alreadyShownThisOccurrence = windowStart != null && windowStart == chorusShownWindowStart
+            if (!isFirstSetup && dynamicCycleEnabled && !nearEnd && windowStart != null && !alreadyShownThisOccurrence) {
+                chorusShownWindowStart = windowStart
+                val skyItem = skyMediaItemForNow(skyMadrugadaItem, skyManhaItem, skyTardeItem, skyNoiteItem)
+                dynamicCycleEnabled = false
+                scrim.flashThroughBlack(onBlack = {
+                    exoPlayer.setMediaItem(skyItem)
+                    // REPEAT_MODE_ONE (loop "ida e volta" de 8s, ver RadioChorusSkyHoldMs) - o
+                    // hold pode durar mais ou menos que o clipe sem cortar feio no meio.
+                    exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
+                })
+                delay(RadioChorusSkyHoldMs)
+                scrim.flashThroughBlack(onBlack = startFreshCycle)
+            }
+            delay(150)
+        }
+    }
+
     val showAlbumArt = currentMediaId == coverItem.mediaId || currentMediaId == discoItem.mediaId
-    return RadioMockupSequencerState(exoPlayer, showAlbumArt, currentMediaId)
+    val showProfilePhotoBoard = currentMediaId == quadroFotosItem.mediaId
+    val showTvScreen = currentMediaId == tvItem.mediaId
+    val chorusCaptionActive = currentMediaId == skyMadrugadaItem.mediaId ||
+        currentMediaId == skyManhaItem.mediaId ||
+        currentMediaId == skyTardeItem.mediaId ||
+        currentMediaId == skyNoiteItem.mediaId
+    return RadioMockupSequencerState(
+        exoPlayer,
+        showAlbumArt,
+        showProfilePhotoBoard,
+        showTvScreen,
+        currentOccurrence,
+        currentMediaId,
+        chorusCaptionActive,
+    )
 }
 
 // Cobre o corte entre takes com um flash preto ANTECIPADO (pedido do usuario 18/09/2026: o fade
@@ -7076,6 +7314,227 @@ private fun PerspectiveAlbumArtwork(
                 },
             )
             nativeCanvas.restoreToCount(saveCount)
+        }
+    }
+}
+
+// Pedido do usuario 19/09/2026: novo take "quadro de fotos" (mural com polaroids penduradas por
+// um barbante) - so entra na rotacao de takes de ambiente quando o usuario tem foto de perfil
+// salva (ver UserProfileUiState.photoUri); a foto do usuario ocupa a janela do polaroid do meio,
+// que fica em branco quando nao ha foto. Pontos calibrados em cima da imagem de referencia do take
+// ("quadro para animar.webp", 941x1672 - mesma proporcao de RadioAlbumMockupAspectRatio). Usa
+// exatamente a mesma tecnica/opacidade de PerspectiveAlbumArtwork (perspectiva via
+// setPolyToPoly + alpha 226/255 + escurecida/gradiente quente) pra parecer uma foto real
+// pendurada ali, nao um sticker colado por cima.
+private val RadioProfilePhotoMockupCorners = listOf(
+    Offset(0.3634f, 0.4026f), // janela do polaroid em branco: topo-esquerda
+    Offset(0.6280f, 0.4008f), // topo-direita
+    Offset(0.6280f, 0.5502f), // baixo-direita
+    Offset(0.3634f, 0.5520f), // baixo-esquerda
+)
+
+@Composable
+private fun PerspectiveProfilePhotoOverlay(
+    photoUri: Uri?,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var photo by remember(photoUri) { mutableStateOf(peekCachedArtwork(photoUri, null)) }
+
+    LaunchedEffect(photoUri) {
+        photo = if (photoUri == null) {
+            null
+        } else {
+            peekCachedArtwork(photoUri, null)
+                ?: withContext(Dispatchers.IO) { loadScaledArtwork(context, photoUri) }
+        }
+    }
+
+    val currentPhoto = photo ?: return
+    Canvas(modifier = modifier) {
+        val bitmap = currentPhoto.asAndroidBitmap()
+        val p1 = Offset(size.width * RadioProfilePhotoMockupCorners[0].x, size.height * RadioProfilePhotoMockupCorners[0].y)
+        val p2 = Offset(size.width * RadioProfilePhotoMockupCorners[1].x, size.height * RadioProfilePhotoMockupCorners[1].y)
+        val p3 = Offset(size.width * RadioProfilePhotoMockupCorners[2].x, size.height * RadioProfilePhotoMockupCorners[2].y)
+        val p4 = Offset(size.width * RadioProfilePhotoMockupCorners[3].x, size.height * RadioProfilePhotoMockupCorners[3].y)
+        val destination = floatArrayOf(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y)
+        val cropSide = minOf(bitmap.width, bitmap.height).toFloat()
+        val cropLeft = (bitmap.width - cropSide) / 2f
+        val cropTop = (bitmap.height - cropSide) / 2f
+        val source = floatArrayOf(
+            cropLeft, cropTop,
+            cropLeft + cropSide, cropTop,
+            cropLeft + cropSide, cropTop + cropSide,
+            cropLeft, cropTop + cropSide,
+        )
+        val matrix = Matrix().apply { setPolyToPoly(source, 0, destination, 0, 4) }
+        val photoPath = Path().apply {
+            val cornerRadius = cropSide * 0.02f
+            addRoundRect(
+                RectF(cropLeft, cropTop, cropLeft + cropSide, cropTop + cropSide),
+                cornerRadius,
+                cornerRadius,
+                Path.Direction.CW,
+            )
+            transform(matrix)
+        }
+        drawIntoCanvas { canvas ->
+            val nativeCanvas = canvas.nativeCanvas
+            val saveCount = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
+            nativeCanvas.clipPath(photoPath)
+            nativeCanvas.drawBitmap(
+                bitmap,
+                matrix,
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).apply {
+                    // ~90% de opacidade (pedido do usuario: "tirar uns 10% de opacidade" pra nao
+                    // parecer um sticker colado por cima, e sim uma foto real ali na moldura).
+                    alpha = 226
+                },
+            )
+            nativeCanvas.drawRect(
+                0f,
+                0f,
+                size.width,
+                size.height,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.argb(34, 0, 0, 0)
+                },
+            )
+            nativeCanvas.drawRect(
+                0f,
+                0f,
+                size.width,
+                size.height,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    shader = LinearGradient(
+                        p1.x,
+                        p1.y,
+                        p3.x,
+                        p3.y,
+                        intArrayOf(
+                            android.graphics.Color.argb(58, 20, 14, 10),
+                            android.graphics.Color.TRANSPARENT,
+                            android.graphics.Color.argb(34, 255, 178, 94),
+                        ),
+                        floatArrayOf(0f, 0.52f, 1f),
+                        Shader.TileMode.CLAMP,
+                    )
+                },
+            )
+            nativeCanvas.drawPath(
+                photoPath,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = size.minDimension * 0.008f
+                    color = android.graphics.Color.argb(34, 0, 0, 0)
+                    maskFilter = BlurMaskFilter(size.minDimension * 0.0025f, BlurMaskFilter.Blur.NORMAL)
+                    xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+                },
+            )
+            nativeCanvas.restoreToCount(saveCount)
+        }
+    }
+}
+
+// Pedido do usuario 19/09/2026: take da estante com a TV antiga - a arte (radio_scene_take_tv,
+// drawable-nodpi) e uma foto estatica com o visor deixado por proposito semi-transparente
+// (alpha ~102/255 so ali dentro, resto 100% opaco); pontos extraidos direto do canal alpha da
+// PNG (nao estimados a olho como no quadro de polaroids). Por cima do video sorteado (perspectiva
+// via setPolyToPoly, igual PerspectiveAlbumArtwork/PerspectiveProfilePhotoOverlay) desenhamos essa
+// MESMA png com alpha normal: a moldura/estante opaca cobre qualquer sobra fora do visor, e o
+// visor semi-transparente da aquele efeito de estatica/fosforo por cima do video, de graca.
+private val RadioTvScreenCorners = listOf(
+    Offset(225f / 941f, 556f / 1672f), // topo-esquerda
+    Offset(581f / 941f, 544f / 1672f), // topo-direita
+    Offset(571f / 941f, 901f / 1672f), // baixo-direita
+    Offset(215f / 941f, 873f / 1672f), // baixo-esquerda
+)
+
+// Aberturas de serie cortadas em 1:1 (6s cada) - 1 sorteada por ocorrencia do take, nunca mais de
+// uma ao mesmo tempo (pedido do usuario 19/09/2026: "vai passar 1 vídeo por take... nunca passar
+// mais de um"). Ver sorteio em RadioAlbumMockupScene, com remember(currentOccurrence).
+private val RadioTvCutsPool = listOf(
+    R.raw.radio_tv_corte_better_call_saul,
+    R.raw.radio_tv_corte_familia_addams,
+    R.raw.radio_tv_corte_kenan_kel,
+    R.raw.radio_tv_corte_maluco_no_pedaco,
+    R.raw.radio_tv_corte_sopranos,
+)
+
+// Video "de verdade" (nao um bitmap estatico) dentro de uma moldura em perspectiva - diferente de
+// PerspectiveAlbumArtwork/PerspectiveProfilePhotoOverlay (que so tem um bitmap pra desenhar), aqui
+// precisamos capturar o frame atual de um TextureView pra poder aplicar o MESMO Matrix.setPolyToPoly
+// usado nos outros overlays (TextureView.setTransform nao da suporte confiavel a perspectiva de
+// verdade, so afim). O TextureView real fica escondido (alpha 0, tamanho pequeno so pra manter a
+// decodificacao/textura vivas) e so o bitmap capturado e desenhado, na posicao certa.
+private const val RadioTvFrameCaptureIntervalMs = 55L // ~18fps, mesmo frame rate dos cortes
+
+@Composable
+private fun PerspectiveTvScreenVideo(
+    rawRes: Int,
+    corners: List<Offset>,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val exoPlayer = remember(rawRes) {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 0f
+            repeatMode = Player.REPEAT_MODE_ONE
+            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/$rawRes")))
+            prepare()
+            playWhenReady = true
+        }
+    }
+    DisposableEffect(exoPlayer) { onDispose { exoPlayer.release() } }
+
+    var textureView by remember(exoPlayer) { mutableStateOf<TextureView?>(null) }
+    var frame by remember(exoPlayer) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(textureView) {
+        val view = textureView ?: return@LaunchedEffect
+        while (isActive) {
+            if (view.isAvailable) {
+                runCatching { view.bitmap }.getOrNull()?.let { frame = it }
+            }
+            delay(RadioTvFrameCaptureIntervalMs)
+        }
+    }
+
+    Box(modifier) {
+        AndroidView(
+            // So precisa ser grande o bastante pra capturar com nitidez razoavel (fonte e 400x400)
+            // - o tamanho aqui nao afeta o tamanho final na tela, que quem manda e o Canvas abaixo.
+            modifier = Modifier.size(200.dp).alpha(0f),
+            factory = { viewContext ->
+                TextureView(viewContext).also {
+                    exoPlayer.setVideoTextureView(it)
+                    textureView = it
+                }
+            },
+        )
+        val bitmap = frame
+        if (bitmap != null) {
+            Canvas(Modifier.matchParentSize()) {
+                val p1 = Offset(size.width * corners[0].x, size.height * corners[0].y)
+                val p2 = Offset(size.width * corners[1].x, size.height * corners[1].y)
+                val p3 = Offset(size.width * corners[2].x, size.height * corners[2].y)
+                val p4 = Offset(size.width * corners[3].x, size.height * corners[3].y)
+                val destination = floatArrayOf(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y)
+                val source = floatArrayOf(
+                    0f, 0f,
+                    bitmap.width.toFloat(), 0f,
+                    bitmap.width.toFloat(), bitmap.height.toFloat(),
+                    0f, bitmap.height.toFloat(),
+                )
+                val matrix = Matrix().apply { setPolyToPoly(source, 0, destination, 0, 4) }
+                drawIntoCanvas { canvas ->
+                    canvas.nativeCanvas.drawBitmap(
+                        bitmap,
+                        matrix,
+                        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
+                    )
+                }
+            }
         }
     }
 }
@@ -8430,6 +8889,63 @@ private fun HomeLyricsSubtitle(
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
     )
+}
+
+// Legenda "cinematografica" (pedido do usuario 20/09/2026), so usada enquanto um take de ceu do
+// refrao esta tocando (ver RadioMockupSequencerState.chorusCaptionActive): maior, bold de peso,
+// sem serifa, em CAPS, trocando de linha com uma animacao de entrada/saida (fade + escala) em vez
+// de so aparecer/sumir seco - mesma fonte de linha atual de HomeLyricsSubtitle (LrcParser.
+// currentLineIndex), so o estilo visual muda.
+@OptIn(ExperimentalAnimationApi::class)
+@Composable
+private fun RadioChorusCaption(
+    lyrics: LyricsUiState,
+    songId: Long?,
+    positionMs: Long,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (
+        !isPlaying ||
+        songId == null ||
+        lyrics.songId != songId ||
+        lyrics.lyrics.songId != songId ||
+        lyrics.isLoading ||
+        lyrics.isFetching ||
+        lyrics.lyrics.isEmpty ||
+        !lyrics.lyrics.synced
+    ) return
+    val lines = lyrics.lyrics.lines
+    val currentIndex = LrcParser.currentLineIndex(lines, positionMs)
+    val currentText = lines.getOrNull(currentIndex)?.text?.takeIf { it.isNotBlank() } ?: return
+
+    AnimatedContent(
+        targetState = currentText,
+        modifier = modifier,
+        transitionSpec = {
+            (fadeIn(tween(320)) + scaleIn(tween(320), initialScale = 0.82f)) togetherWith
+                (fadeOut(tween(200)) + scaleOut(tween(200), targetScale = 1.1f))
+        },
+        label = "radioChorusCaption",
+    ) { text ->
+        Text(
+            text = text.uppercase(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            color = Color.White,
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.Black,
+            // Maior e alinhada a esquerda (pedido do usuario 20/09/2026, ajuste depois de ver ao
+            // vivo) - era 26sp/centralizada.
+            fontSize = 38.sp,
+            lineHeight = 42.sp,
+            letterSpacing = 0.4.sp,
+            textAlign = TextAlign.Start,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 @Composable
