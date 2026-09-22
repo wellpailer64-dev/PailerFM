@@ -299,19 +299,40 @@ class MusicLibraryRepository(private val context: Context) {
             description = "Escolhida pelo seu gosto",
             songs = songs,
             coverSongs = previewCovers(topAffinitySongs.ifEmpty { songs }, "surprise"),
+            isPinned = true,
         )
 
-        val fallback = LocalRadio(
+        val recentRadio = LocalRadio(
             name = "Radio recente",
             description = "${recent.size} faixas mais novas",
             songs = recent,
             coverSongs = previewCovers(recent, "recent"),
+            isPinned = true,
+        )
+
+        // Radio fixa "Musicas Curtidas" (pedido do usuario 22/09/2026) - so os favoritos do
+        // proprio usuario (favoriteIds, mesma fonte de favoriteSongIdsForAffinity acima usada pro
+        // vies do Surprise Me), na ordem que ja vem de `songs`. Fica de proposito mesmo vazia
+        // quando o usuario ainda nao favoritou nada - e uma das 3 fixas, nao soma/some da lista.
+        val likedSongs = songs.filter { it.id in favoriteIds }
+        val likedRadio = LocalRadio(
+            name = LIKED_SONGS_RADIO_NAME,
+            description = "${likedSongs.size} favoritas",
+            songs = likedSongs,
+            coverSongs = previewCovers(likedSongs, "liked"),
+            isPinned = true,
         )
 
         val hidden = hiddenRadioKeys()
-        return (listOf(surpriseRadio) + customRadios + listOfNotNull(grungeRadio, anos2000Radio) + genreRadios + fallback)
-            .distinctBy { normalizeLookupKey(it.name) }
-            .filterNot { normalizeLookupKey(it.name) in hidden }
+        // As 3 fixas (isPinned) sempre primeiro e NESSA ordem especifica (pedido do usuario
+        // 22/09/2026: "Surprise Me e a radio recente no topo... e adicionar uma radio (musicas
+        // curtidas)... essas 3 radios padrao no topo, fixas") - o resto mantem a ordem de sempre
+        // atras delas. Nao passam pelo filtro de "ocultas" (hidden) - fixas nao podem ser
+        // escondidas, RadioGridCard/RadioSettingsPanel ja nao oferecem essa opcao pra elas.
+        return listOf(surpriseRadio, recentRadio, likedRadio) +
+            (customRadios + listOfNotNull(grungeRadio, anos2000Radio) + genreRadios)
+                .distinctBy { normalizeLookupKey(it.name) }
+                .filterNot { normalizeLookupKey(it.name) in hidden }
     }
 
     // --- Radios ocultas (perfil/genero/fallback - as personalizadas usam deleteCustomRadio) ---
@@ -1956,6 +1977,8 @@ class MusicLibraryRepository(private val context: Context) {
         // "escolhida pelo seu gosto" sem furar as penalidades de repetir artista, que sao maiores).
         const val SURPRISE_RADIO_NAME = "Surprise Me"
         const val SURPRISE_AFFINITY_WEIGHT = 4.0
+        // Radio fixa de favoritos (pedido do usuario 22/09/2026, ver radiosFrom).
+        const val LIKED_SONGS_RADIO_NAME = "Músicas Curtidas"
         const val ARTWORK_CANDIDATE_LIMIT = 10
         const val METADATA_SCHEMA_VERSION = 2
         const val RADIO_LIMIT = 30

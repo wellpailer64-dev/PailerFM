@@ -95,11 +95,37 @@ pra um nome/lugar estável (o `build/` é apagado a cada `gradle clean` ou build
 Fica fora do git (`.gitignore`, mesmo motivo dos zips grandes em `voice-models/`) —
 binário grande, sem sentido versionar.
 
-Não é atualizada automaticamente pelo build — depois de gerar um `app-release.apk` novo
-que valeu a pena distribuir, copiar por cima:
+**IMPORTANTE (achado ao vivo 21/09/2026 — "meus amigos não estão recebendo o popup de
+atualização"):** este APK vai pra fora do fluxo de CI (é o que o usuário manda direto
+pros amigos instalarem), então **`APP_RELEASE_TAG` precisa ser setado ANTES do
+`assembleRelease`**, senão `BuildConfig.RELEASE_TAG` cai no default `"local-dev"` (ver
+`app/build.gradle.kts`) — e `UpdateCheckRepository.isNewerThanCurrent()` DESLIGA A
+CHECAGEM DE ATUALIZAÇÃO PRA SEMPRE nesse caso (`if (BuildConfig.RELEASE_TAG ==
+"local-dev") return false`, de propósito, pra não incomodar quem só está testando uma
+build local). Quem instala um `dist/PailerFM.apk` gerado SEM essa env var nunca mais vai
+ver o popup de atualização automaticamente, não importa quantas releases novas o CI
+publicar depois — foi exatamente essa a causa raiz descoberta 21/09/2026 (o CI em si
+sempre esteve publicando normalmente, ver `gh run list`/`gh release list`).
+
+Usar a tag da ÚLTIMA release real do GitHub (`gh release list --limit 1`) como valor —
+não precisa ser um número novo: por ser uma tag `vAAAA.MM.DD-N` já existente, qualquer
+release futura do CI (data igual ou maior, ou mesmo dia com número de run maior) sempre
+vai comparar como mais nova, então a auto-atualização volta a funcionar normalmente pro
+próximo push:
 
 ```powershell
+$tag = (gh release list --limit 1) -split "`t" | Select-Object -Index 2
+$env:APP_RELEASE_TAG = $tag
+& "<workspace>\tools\gradle-8.7\bin\gradle" :app:assembleRelease --offline
 copy app\build\outputs\apk\release\app-release.apk dist\PailerFM.apk
+```
+
+(bash/Git Bash equivalente: `APP_RELEASE_TAG=$(gh release list --limit 1 | cut -f3)
+./gradlew :app:assembleRelease`.) Pra conferir que a tag certa foi embutida sem precisar
+instalar (`BuildConfig` vira string crua no dex, `isMinifyEnabled = false` não ofusca):
+
+```bash
+unzip -p app/build/outputs/apk/release/app-release.apk classes3.dex | grep -ao "v202[0-9]\.[0-9]*\.[0-9]*-[0-9]*"
 ```
 
 ## keystore.properties

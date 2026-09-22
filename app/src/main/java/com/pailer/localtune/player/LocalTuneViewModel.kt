@@ -2,6 +2,7 @@ package com.pailer.localtune.player
 
 import android.app.PendingIntent
 import android.app.Application
+import com.pailer.localtune.BuildConfig
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -10,6 +11,7 @@ import android.media.MediaPlayer
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
@@ -121,6 +123,14 @@ data class PlayerUiState(
     // Foto de perfil salva pelo usuario (UserProfileUiState.photoUri) - usada pelo take "quadro
     // de fotos" da radio (RadioAlbumMockupScene), que so entra na rotacao quando essa foto existe.
     val profilePhotoUri: android.net.Uri? = null,
+    // Nome + level/plays/horas do OUVINTE (nao da musica) - mostrados no rodape do take "quadro
+    // de fotos" da radio (RadioListenerStatsFooter em LocalTuneApp.kt), pedido do usuario
+    // 21/09/2026. Espelham profileState/listeningStatsState igual profilePhotoUri acima espelha
+    // profileState.value.photoUri.
+    val listenerName: String = "",
+    val listenerLevel: Int = 1,
+    val listenerSongsCompleted: Int = 0,
+    val listenerListeningMs: Long = 0L,
     val playbackSource: String = "",
     val activeRadioName: String = "",
     val currentNewsHeadline: String = "",
@@ -249,6 +259,12 @@ data class UpdateUiState(
     val downloadedApkFile: File? = null,
     val dismissed: Boolean = false,
     val message: String? = null,
+    // Resultado da checagem MANUAL (botao "Buscar atualizacoes" em Configuracoes, pedido do
+    // usuario 21/09/2026) - mostrado como Toast (ver LocalTuneApp.kt) e limpo logo em seguida
+    // (consumeManualCheckMessage), pra nao reaparecer sozinho numa recomposicao futura. Campo
+    // separado de `message` de proposito: `message` fica preso ao popup automatico (erro de
+    // download), esse aqui e so o feedback pontual do botao manual.
+    val manualCheckMessage: String? = null,
 )
 
 // Pasta oficial do Pailer FM (ver AppFolderRepository) - onde o app organiza Backup, Logs,
@@ -264,6 +280,22 @@ data class UserProfileUiState(
     val appliedVersion: Int = 0,
     val message: String? = null,
 )
+
+// Horas ouvidas + level (pedido do usuario 21/09/2026, ver listeningStatsPrefs) - songsCompleted
+// conta toda faixa que TERMINA sozinha (Player.MEDIA_ITEM_TRANSITION_REASON_AUTO), radio ou
+// biblioteca normal, junto; radioListeningMs e o SUBCONJUNTO de totalListeningMs tocado com uma
+// radio ativa (activeRadioName != ""), nao um acumulador a parte. Level e derivado (nao salvo em
+// disco separado) pra nunca dessincronizar de songsCompleted - "a cada 50 musicas escutadas, 1
+// level" (nivel 1 comeca em 0 musicas).
+data class ListeningStatsUiState(
+    val totalListeningMs: Long = 0L,
+    val radioListeningMs: Long = 0L,
+    val songsCompleted: Int = 0,
+) {
+    val level: Int get() = songsCompleted / 50 + 1
+    val songsIntoCurrentLevel: Int get() = songsCompleted % 50
+    val songsToNextLevel: Int get() = 50 - songsIntoCurrentLevel
+}
 
 // Sessao "arraste pra revelar" da Home com noticias/curiosidades dos artistas favoritados (ver
 // ArtistNewsRepository) - pedido do usuario 06/09/2026. hasLoaded fica true mesmo em caso de erro
@@ -356,6 +388,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
     private val radioPrefs = application.getSharedPreferences("radio_bulletins", Context.MODE_PRIVATE)
     private val profilePrefs = application.getSharedPreferences("user_profile", Context.MODE_PRIVATE)
+    // Horas ouvidas + level (pedido do usuario 21/09/2026: "contabilizar quantas horas de radio
+    // eu tenho... quantas horas de musica que já ouvi... a cada 50 musicas escutadas, eu subo 1
+    // level"). Prefs separada (nao dentro de "user_profile") mas incluida em
+    // BackupRepository.BACKED_UP_PREFS_NAMES do mesmo jeito - "acumulado de uso real", mesma
+    // categoria de favorites/playback_history/radio_affinity (ver comentario la).
+    private val listeningStatsPrefs = application.getSharedPreferences("listening_stats", Context.MODE_PRIVATE)
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     // Cast pra TV: o controller local (ExoPlayer/MediaController) continua tocando NORMALMENTE
@@ -417,6 +455,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // parado em STATE_ENDED (varios eventos chegam nesse estado) - reseta assim que a fila muda.
     private var autoplayHandledForEndedQueue = false
     private var completedRadioSongs = 0
+    // Ultimo tick real (SystemClock.elapsedRealtime, sobrevive ajuste de hora do sistema) do
+    // acumulador de tempo ouvido (ver accumulateListeningTime, chamado no polling de
+    // updatePlayerState) - o delta entre ticks e o que vira "tempo ouvido", so quando
+    // player.isPlaying. Limitado a LISTENING_TICK_MAX_GAP_MS pra um app suspenso/Doze por minutos
+    // no meio de uma musica tocando nao inflar o total inteiro daquele hiato como "ouvido".
+    private var lastListeningTickAtMs: Long = SystemClock.elapsedRealtime()
     private val recentBulletinStoryKeys = ArrayDeque<String>().apply {
         radioPrefs.getString(KEY_RECENT_BULLETIN_STORY_KEYS, null)
             ?.lineSequence()
@@ -557,6 +601,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     var profileState = androidx.compose.runtime.mutableStateOf(loadProfile())
         private set
 
+    var listeningStatsState = androidx.compose.runtime.mutableStateOf(loadListeningStats())
+        private set
+
     var artistNewsState = androidx.compose.runtime.mutableStateOf(ArtistNewsUiState())
         private set
 
@@ -637,6 +684,49 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    private fun loadListeningStats(): ListeningStatsUiState = ListeningStatsUiState(
+        totalListeningMs = listeningStatsPrefs.getLong(KEY_TOTAL_LISTENING_MS, 0L),
+        radioListeningMs = listeningStatsPrefs.getLong(KEY_RADIO_LISTENING_MS, 0L),
+        songsCompleted = listeningStatsPrefs.getInt(KEY_SONGS_COMPLETED, 0),
+    )
+
+    // Chamado a cada volta do polling que ja existe em updatePlayerState (ver init, delay de
+    // 1.5-3s) - soma o tempo REAL desde o ultimo tick (nao um valor fixo por tick, pra nao errar
+    // se o polling atrasar) so quando o player esta tocando de verdade. radioListeningMs e um
+    // SUBCONJUNTO de totalListeningMs (ver ListeningStatsUiState) - as duas linhas somam o MESMO
+    // elapsed, so a segunda e condicional a estar numa radio.
+    private fun accumulateListeningTime(player: Player) {
+        val now = SystemClock.elapsedRealtime()
+        val elapsed = (now - lastListeningTickAtMs).coerceIn(0L, LISTENING_TICK_MAX_GAP_MS)
+        lastListeningTickAtMs = now
+        if (!player.isPlaying || elapsed <= 0L) return
+        val editor = listeningStatsPrefs.edit()
+        val newTotal = listeningStatsState.value.totalListeningMs + elapsed
+        editor.putLong(KEY_TOTAL_LISTENING_MS, newTotal)
+        val newRadio = if (activeRadioName.isNotBlank()) {
+            listeningStatsState.value.radioListeningMs + elapsed
+        } else {
+            listeningStatsState.value.radioListeningMs
+        }
+        if (activeRadioName.isNotBlank()) editor.putLong(KEY_RADIO_LISTENING_MS, newRadio)
+        editor.apply()
+        listeningStatsState.value = listeningStatsState.value.copy(
+            totalListeningMs = newTotal,
+            radioListeningMs = newRadio,
+        )
+    }
+
+    // Chamado em toda faixa que termina SOZINHA (reason AUTO no onMediaItemTransition, radio ou
+    // biblioteca normal) - "a cada 50 musicas escutadas, 1 level" (pedido do usuario 21/09/2026).
+    // De proposito NAO conta faixa pulada manualmente (skip/anterior) nem trocada por outra
+    // selecionada na hora - so o que tocou ate o fim de verdade, mesmo criterio de
+    // completedRadioSongs/recordRadioPlayThrough (afinidade da radio) acima.
+    private fun recordSongCompleted() {
+        val newCount = listeningStatsState.value.songsCompleted + 1
+        listeningStatsPrefs.edit().putInt(KEY_SONGS_COMPLETED, newCount).apply()
+        listeningStatsState.value = listeningStatsState.value.copy(songsCompleted = newCount)
+    }
+
     // Bytes da capa baixada pro candidato selecionado - fora do StateFlow/State de proposito
     // (ByteArray nao tem equals estrutural util pra Compose, e o dado so importa no momento de
     // aplicar). Fica nulo ate selectArtworkCandidate() terminar o download.
@@ -665,6 +755,13 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            // Level (pedido do usuario 21/09/2026, ver ListeningStatsUiState) - toda faixa que
+            // termina SOZINHA conta, radio ou biblioteca normal junto, por isso fica FORA do "if
+            // (radioNewsEnabled...)" abaixo (aquele bloco e so a logica de boletim/afinidade,
+            // exclusiva da radio).
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                recordSongCompleted()
+            }
             if (radioNewsEnabled && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 // Heuristica de afinidade da radio (ADR-028) - lastRecordedMediaId ainda e a
                 // faixa que ACABOU de tocar aqui (recordCurrentSong so atualiza pra faixa nova
@@ -697,6 +794,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 controller?.let {
                     updatePlayerState(it)
                     checkForEarlyNewsBreak(it)
+                    accumulateListeningTime(it)
                 }
                 // Achado 11/09/2026 ao vivo: um item pode ficar "pronto" no buffer sem chance real
                 // de tocar com voz - seja porque a sintese nunca gerou arquivo (file == null,
@@ -820,8 +918,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun updateRadioBulletinSettings(settings: RadioBulletinSettings) {
         radioPrefs.edit()
             .putString(KEY_RADIO_BULLETIN_MODE, settings.mode.name)
+            .putInt(KEY_RADIO_BULLETIN_SONGS_BETWEEN, settings.songsBetweenBulletins)
             .apply()
         radioBulletinState.value = loadRadioBulletinUiState()
+    }
+
+    // Botao de Configuracoes de Radio (pedido do usuario 22/09/2026: "adiciona mais uma função,
+    // que é poder escolher a partir de quantas músicas toca uma notícia, o padrão é 3, mas
+    // adicionar a opção pra escolher 4 e 5 músicas"). So esse campo muda por essa funcao - reusa
+    // updateRadioBulletinSettings (que ja persiste mode+songsBetweenBulletins juntos) com o mode
+    // atual intacto.
+    fun updateSongsBetweenBulletins(value: Int) {
+        updateRadioBulletinSettings(radioBulletinState.value.settings.copy(songsBetweenBulletins = value))
     }
 
     private fun loadRadioBulletinUiState(): RadioBulletinUiState {
@@ -832,7 +940,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // (BroadcastFeedRepository), sem nada mais pra configurar aqui.
         val settings = RadioBulletinSettings(
             mode = RadioBulletinMode.Dialogue,
-            songsBetweenBulletins = RADIO_BULLETIN_DEFAULT_INTERVAL,
+            songsBetweenBulletins = radioPrefs.getInt(KEY_RADIO_BULLETIN_SONGS_BETWEEN, RADIO_BULLETIN_DEFAULT_INTERVAL),
         )
         return RadioBulletinUiState(settings = settings)
     }
@@ -1483,6 +1591,45 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun dismissUpdatePrompt() {
         updateState.value = updateState.value.copy(dismissed = true)
+    }
+
+    // Botao "Buscar atualizacoes" em Configuracoes (pedido do usuario 21/09/2026: "meus amigos
+    // que instalaram o App parecem nao estar recebendo o popup de atualizacao mesmo depois de eu
+    // fazer push"). Diferenca pro checkForUpdate() automatico acima: 1) ignora o guard de "ja
+    // checou uma vez" (latestRelease != null) e o "dismissed" de um popup fechado antes, pra
+    // sempre rodar de novo quando o usuario pede; 2) SEMPRE da uma resposta visivel (achou versao
+    // nova / ja esta atualizado / falha de rede) em vez do silencio de sempre - a causa mais
+    // provavel do sumico dos amigos e o APK deles ser de ANTES desse sistema existir (ou um build
+    // local, BuildConfig.RELEASE_TAG == "local-dev" - ver isNewerThanCurrent), caso em que nem
+    // esse botao aparece porque o codigo dele simplesmente nao esta instalado no aparelho: so
+    // reinstalar uma build nova (desta vez vinda de uma release do CI, nao local) resolve pra
+    // sempre a partir daí.
+    fun checkForUpdateManually() {
+        if (updateState.value.isChecking) return
+        updateState.value = updateState.value.copy(isChecking = true, manualCheckMessage = null)
+        viewModelScope.launch {
+            val release = runCatching { updateCheckRepository.fetchLatestRelease() }.getOrNull()
+            val hasUpdate = release != null && updateCheckRepository.isNewerThanCurrent(release.tagName)
+            updateState.value = when {
+                hasUpdate -> updateState.value.copy(
+                    isChecking = false,
+                    latestRelease = release,
+                    dismissed = false,
+                )
+                release != null -> updateState.value.copy(
+                    isChecking = false,
+                    manualCheckMessage = "Você já está na versão mais recente (${BuildConfig.RELEASE_TAG}).",
+                )
+                else -> updateState.value.copy(
+                    isChecking = false,
+                    manualCheckMessage = "Não consegui checar agora. Confira sua internet e tente de novo.",
+                )
+            }
+        }
+    }
+
+    fun consumeManualCheckMessage() {
+        updateState.value = updateState.value.copy(manualCheckMessage = null)
     }
 
     // Baixa o APK da release (streaming, com progresso - ver UpdateCheckRepository.downloadApk) e
@@ -3828,6 +3975,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             artworkUri = metadata?.artworkUri,
             artworkSourceUri = player.currentMediaItem?.localConfiguration?.uri,
             profilePhotoUri = profileState.value.photoUri,
+            listenerName = profileState.value.name,
+            listenerLevel = listeningStatsState.value.level,
+            listenerSongsCompleted = listeningStatsState.value.songsCompleted,
+            listenerListeningMs = listeningStatsState.value.totalListeningMs,
             playbackSource = playbackSource,
             activeRadioName = activeRadioName,
             currentNewsHeadline = currentNewsHeadline,
@@ -4002,7 +4153,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_PROFILE_BIRTHDAY = "profile_birthday"
         const val KEY_PROFILE_PHOTO_PATH = "profile_photo_path"
         const val PROFILE_PHOTO_FILE_NAME = "profile.jpg"
+        const val KEY_TOTAL_LISTENING_MS = "total_listening_ms"
+        const val KEY_RADIO_LISTENING_MS = "radio_listening_ms"
+        const val KEY_SONGS_COMPLETED = "songs_completed"
+        // Teto do delta somado por tick em accumulateListeningTime - se o processo ficar
+        // suspenso (Doze, app em segundo plano por minutos) com o player marcado isPlaying=true
+        // de antes, o proximo tick nao pode contar o hiato inteiro como "tempo ouvido de
+        // verdade". 5s cobre folga normal entre ticks do polling (1.5-3s) sem risco de inflar.
+        const val LISTENING_TICK_MAX_GAP_MS = 5_000L
         const val KEY_RADIO_BULLETIN_MODE = "radio_bulletin_mode"
+        const val KEY_RADIO_BULLETIN_SONGS_BETWEEN = "radio_bulletin_songs_between"
         const val KEY_RECENT_BULLETIN_STORY_KEYS = "recent_bulletin_story_keys"
         const val DOWNLOAD_PROGRESS_STEP_BYTES = 2L * 1024L * 1024L
         const val DOWNLOAD_PROGRESS_STEP_MS = 700L

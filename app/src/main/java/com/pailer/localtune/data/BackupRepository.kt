@@ -248,6 +248,10 @@ class BackupRepository(private val context: Context) {
             // categoria de favorites/playback_history acima, não é cache técnico. Sem isso, um
             // restore de backup apagaria semanas de aprendizado da "Surprise Me"/afinidade.
             "radio_affinity",
+            // Horas ouvidas + level (pedido do usuario 21/09/2026, ver
+            // LocalTuneViewModel.listeningStatsPrefs) - mesmo motivo de radio_affinity acima:
+            // acumulado de uso real, um restore de backup nao pode zerar o progresso do usuario.
+            "listening_stats",
         )
     }
 }

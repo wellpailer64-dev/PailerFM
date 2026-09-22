@@ -143,4 +143,10 @@ data class LocalRadio(
     // em ordem de faixa (ver radioSessionFrom); a partir de 2 fontes vira sempre embaralhada,
     // nao faz mais sentido "ordem de album" misturando material de fontes diferentes.
     val hasMultipleSources: Boolean = false,
+    // As 3 radios padrao fixas no topo da grade (pedido do usuario 22/09/2026: "Surprise Me e a
+    // rádio recente no topo... e adicionar uma rádio (músicas curtidas)... essas 3 rádios padrão
+    // no topo, fixas") - ver MusicLibraryRepository.radiosFrom (ordem/geracao) e
+    // MinimalRadioCard/PlaylistsScreen em LocalTuneApp.kt (stroke vermelho fino + fixadas antes
+    // do resto, independente de ordenacao alfabetica/uso).
+    val isPinned: Boolean = false,
 )

@@ -12,6 +12,7 @@ import android.graphics.BitmapFactory
 import android.graphics.BlurMaskFilter
 import android.graphics.LinearGradient
 import android.graphics.Matrix
+import android.graphics.BitmapShader
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
@@ -56,11 +57,13 @@ import kotlin.math.roundToInt
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.slideInHorizontally
@@ -166,6 +169,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.SubtitlesOff
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
@@ -219,6 +223,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -257,10 +262,12 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.VideoSize
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
+import com.pailer.localtune.BuildConfig
 import com.pailer.localtune.R
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
@@ -288,6 +295,7 @@ import com.pailer.localtune.player.BackupUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
 import com.pailer.localtune.player.RadioBulletinUiState
+import com.pailer.localtune.player.ListeningStatsUiState
 import com.pailer.localtune.player.UpdateUiState
 import com.pailer.localtune.player.UserProfileUiState
 import com.pailer.localtune.ui.theme.LocalTuneTheme
@@ -298,11 +306,6 @@ import com.pailer.localtune.ui.theme.PailerSilver
 import com.pailer.localtune.ui.theme.PailerSurface
 import com.pailer.localtune.ui.theme.PailerSurfaceHigh
 import com.pailer.localtune.ui.theme.PailerSurfaceHighest
-import com.pailer.localtune.util.DayPeriod
-import coil.ImageLoader
-import coil.compose.AsyncImage
-import coil.decode.GifDecoder
-import coil.decode.ImageDecoderDecoder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -521,6 +524,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // pendingDeleteArtist acima (o popover so abre o dialogo de confirmacao existente).
     var albumActionsTarget by remember { mutableStateOf<LocalAlbum?>(null) }
     var artistActionsTarget by remember { mutableStateOf<LocalArtist?>(null) }
+    // Popover de 3 pontinhos da aba Radio (pedido do usuario 22/09/2026: "faz um botão de 3
+    // pontinhos no topo da tela canto direito, ao clicar, abre um pop over (criar nova rádio) e
+    // radio settings") - ver RadioMenuButton/AddSourceToRadioDialog(title = "Criar nova rádio")
+    // mais abaixo. "Radio Settings" reusa o MESMO SettingsDrawer/RadioSettingsPanel de
+    // Configuracoes (so um atalho direto pra la, nao uma tela duplicada).
+    var showCreateRadioDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val tagWriteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
@@ -622,6 +631,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     LaunchedEffect(Unit) { viewModel.checkForUpdate() }
     LaunchedEffect(updateState.downloadedApkFile) {
         updateState.downloadedApkFile?.let { installApkUpdate(updateContext, it) }
+    }
+    LaunchedEffect(updateState.manualCheckMessage) {
+        updateState.manualCheckMessage?.let {
+            Toast.makeText(updateContext, it, Toast.LENGTH_LONG).show()
+            viewModel.consumeManualCheckMessage()
+        }
     }
     if (updateState.latestRelease != null && !updateState.dismissed) {
         UpdateAvailableDialog(
@@ -954,6 +969,19 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     // sem lista textual pra filtrar ali.
                     showSearch = selectedTab == MainTab.Library,
                     dimmed = radioCinematicIdle.dimSystemBars,
+                    extraAction = if (selectedTab == MainTab.Radio) {
+                        {
+                            RadioMenuButton(
+                                onCreateRadio = { showCreateRadioDialog = true },
+                                onOpenRadioSettings = {
+                                    settingsPage = SettingsPage.RadioSettings
+                                    showSettings = true
+                                },
+                            )
+                        }
+                    } else {
+                        null
+                    },
                 )
 
                 val openedAlbum = selectedAlbum
@@ -1291,6 +1319,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             onRestoreHiddenLibraryItems = viewModel::restoreHiddenArtistsAndAlbums,
             radioDislikedSongs = viewModel.radioDislikedSongs(),
             onUndislikeSong = viewModel::undislikeSongForRadio,
+            updateState = updateState,
+            onCheckForUpdate = viewModel::checkForUpdateManually,
+            listeningStats = viewModel.listeningStatsState.value,
             backup = viewModel.backupState.value,
             onChooseBackupDestination = { backupCreateLauncher.launch("pailer_fm_backup.json") },
             onBackupNow = viewModel::performBackupNow,
@@ -1299,7 +1330,30 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             appFolder = viewModel.appFolderState.value,
             onChooseAppFolder = { appFolderLauncher.launch(null) },
             onClearAppFolder = viewModel::clearAppFolder,
+            songsBetweenBulletins = radioBulletins.settings.songsBetweenBulletins,
+            onChangeSongsBetweenBulletins = viewModel::updateSongsBetweenBulletins,
         )
+
+        // Pedido do usuario 22/09/2026 (popover de 3 pontinhos na aba Radio, ver RadioMenuButton/
+        // LibraryHeader.extraAction acima) - reusa o MESMO dialogo de escolher artista/album
+        // usado dentro de uma radio ja existente (AddSourceToRadioDialog), so com titulo
+        // diferente e criando uma radio NOVA em vez de somar fonte numa que ja existe.
+        if (showCreateRadioDialog) {
+            AddSourceToRadioDialog(
+                title = "Criar nova rádio",
+                artists = artists,
+                albums = albums,
+                onPickArtist = { artist ->
+                    showCreateRadioDialog = false
+                    viewModel.createRadioFromArtist(artist)
+                },
+                onPickAlbum = { album ->
+                    showCreateRadioDialog = false
+                    viewModel.createRadioFromAlbum(album)
+                },
+                onDismiss = { showCreateRadioDialog = false },
+            )
+        }
 
         pendingDeleteSong?.let { song ->
             DeleteConfirmDialog(
@@ -1607,6 +1661,10 @@ private fun LibraryHeader(
     // "Modo cinema" da radio ativa (pedido do usuario 18/09/2026): fica preto depois de um tempo
     // parado, ver rememberRadioCinematicIdleState/LibraryShell.
     dimmed: Boolean = false,
+    // Botao extra so na aba Radio (pedido do usuario 22/09/2026: "faz um botão de 3 pontinhos no
+    // topo da tela canto direito" - abre popover com "Criar nova rádio"/"Radio Settings", ver
+    // RadioMenuButton em LibraryShell) - null nas outras abas, sem espaco reservado.
+    extraAction: (@Composable () -> Unit)? = null,
 ) {
     val backgroundColor by animateColorAsState(
         targetValue = if (dimmed) Color.Black else PailerSurface,
@@ -1686,6 +1744,10 @@ private fun LibraryHeader(
             )
             Spacer(Modifier.width(14.dp))
             HeaderNewsButton(onNews = onNews, hasNewNews = hasNewNews)
+            if (extraAction != null) {
+                Spacer(Modifier.width(14.dp))
+                extraAction()
+            }
         }
     }
 }
@@ -1742,6 +1804,47 @@ private fun HeaderNewsButton(onNews: () -> Unit, hasNewNews: Boolean, modifier: 
                         .background(PailerRed),
                 )
             }
+        }
+    }
+}
+
+// Botao de 3 pontinhos so na aba Radio (pedido do usuario 22/09/2026: "faz um botão de 3
+// pontinhos no topo da tela canto direito, ao clicar, abre um pop over (criar nova rádio) e radio
+// settings") - popover simples com 2 opcoes; "Radio Settings" so navega pro MESMO
+// SettingsDrawer/RadioSettingsPanel que ja existe em Configuracoes (evita duplicar a tela).
+@Composable
+private fun RadioMenuButton(
+    onCreateRadio: () -> Unit,
+    onOpenRadioSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier) {
+        IconButton(onClick = { expanded = true }, modifier = Modifier.size(30.dp)) {
+            Icon(
+                Icons.Filled.MoreVert,
+                contentDescription = "Mais opções da rádio",
+                tint = Color.White.copy(alpha = 0.92f),
+                modifier = Modifier.size(21.dp),
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text("Criar nova rádio") },
+                leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                onClick = {
+                    expanded = false
+                    onCreateRadio()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Radio Settings") },
+                leadingIcon = { Icon(Icons.Filled.Radio, contentDescription = null) },
+                onClick = {
+                    expanded = false
+                    onOpenRadioSettings()
+                },
+            )
         }
     }
 }
@@ -1952,6 +2055,11 @@ private fun SettingsDrawer(
     onClearAppFolder: () -> Unit = {},
     radioDislikedSongs: List<LocalSong> = emptyList(),
     onUndislikeSong: (LocalSong) -> Unit = {},
+    updateState: UpdateUiState = UpdateUiState(),
+    onCheckForUpdate: () -> Unit = {},
+    listeningStats: ListeningStatsUiState = ListeningStatsUiState(),
+    songsBetweenBulletins: Int = 3,
+    onChangeSongsBetweenBulletins: (Int) -> Unit = {},
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -1990,9 +2098,12 @@ private fun SettingsDrawer(
                             onOpenProfile = { onPageChange(SettingsPage.Profile) },
                             onOpenLibraryMaintenance = { onPageChange(SettingsPage.LibraryMaintenance) },
                             onOpenRadioSettings = { onPageChange(SettingsPage.RadioSettings) },
+                            updateState = updateState,
+                            onCheckForUpdate = onCheckForUpdate,
                         )
                         SettingsPage.Profile -> UserProfileSettingsPanel(
                             profile = profile,
+                            listeningStats = listeningStats,
                             onBack = { onPageChange(SettingsPage.Main) },
                             onChoosePhoto = onChooseProfilePhoto,
                             onSave = onSaveProfile,
@@ -2004,6 +2115,8 @@ private fun SettingsDrawer(
                             onRestoreHiddenRadios = onRestoreHiddenRadios,
                             hasRadioDislikedSongs = radioDislikedSongs.isNotEmpty(),
                             onOpenRadioDislikedSongs = { onPageChange(SettingsPage.RadioDislikedSongs) },
+                            songsBetweenBulletins = songsBetweenBulletins,
+                            onChangeSongsBetweenBulletins = onChangeSongsBetweenBulletins,
                         )
                         SettingsPage.LibraryMaintenance -> LibraryMaintenanceSettingsPanel(
                             onBack = { onPageChange(SettingsPage.Main) },
@@ -2096,6 +2209,8 @@ private fun SettingsMainPanel(
     onOpenProfile: () -> Unit,
     onOpenLibraryMaintenance: () -> Unit,
     onOpenRadioSettings: () -> Unit,
+    updateState: UpdateUiState = UpdateUiState(),
+    onCheckForUpdate: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -2150,6 +2265,17 @@ private fun SettingsMainPanel(
                 icon = Icons.Filled.Tune,
                 onClick = onOpenLibraryMaintenance,
             )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+            // Botao manual (pedido do usuario 21/09/2026) - o app ja checa sozinho ao abrir (ver
+            // LocalTuneApp.kt/checkForUpdate), mas quem instalou um APK de ANTES desse sistema
+            // existir nunca vai ganhar o popup automatico sozinho; esse botao da uma resposta na
+            // hora (achou/nao achou/falhou) em vez do silencio de sempre.
+            SettingsActionRow(
+                title = "Buscar atualizações",
+                subtitle = if (updateState.isChecking) "Checando..." else "Versão instalada: ${BuildConfig.RELEASE_TAG}",
+                icon = Icons.Filled.CloudUpload,
+                onClick = { if (!updateState.isChecking) onCheckForUpdate() },
+            )
         }
         HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
         ProfileFooter(profile = profile, onOpenProfile = onOpenProfile)
@@ -2163,6 +2289,8 @@ private fun RadioSettingsPanel(
     onRestoreHiddenRadios: () -> Unit,
     hasRadioDislikedSongs: Boolean,
     onOpenRadioDislikedSongs: () -> Unit,
+    songsBetweenBulletins: Int = 3,
+    onChangeSongsBetweenBulletins: (Int) -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -2188,6 +2316,40 @@ private fun RadioSettingsPanel(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
+        // Pedido do usuario 22/09/2026: "poder escolher a partir de quantas músicas toca uma
+        // notícia, o padrão é 3, mas adicionar a opção pra escolher 4 e 5 músicas".
+        Text(
+            "Notícias a cada quantas músicas",
+            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            listOf(3, 4, 5).forEach { option ->
+                val selected = songsBetweenBulletins == option
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (selected) MaterialTheme.colorScheme.primary else PailerSurfaceHigh)
+                        .clickable { onChangeSongsBetweenBulletins(option) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "$option",
+                        color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(16.dp))
         if (hasHiddenRadios) {
             SettingsActionRow(
                 title = "Radios ocultas",
@@ -2271,6 +2433,7 @@ private fun ProfileAvatar(photoUri: Uri?, modifier: Modifier = Modifier) {
 @Composable
 private fun UserProfileSettingsPanel(
     profile: UserProfileUiState,
+    listeningStats: ListeningStatsUiState = ListeningStatsUiState(),
     onBack: () -> Unit,
     onChoosePhoto: () -> Unit,
     onSave: (String, String) -> Unit,
@@ -2310,6 +2473,8 @@ private fun UserProfileSettingsPanel(
                 Text("Escolher foto")
             }
         }
+        Spacer(Modifier.height(18.dp))
+        ListeningStatsCard(listeningStats)
         Spacer(Modifier.height(18.dp))
         OutlinedTextField(
             value = nameDraft,
@@ -2352,6 +2517,92 @@ private fun UserProfileSettingsPanel(
             icon = Icons.Filled.CloudUpload,
             onClick = onOpenBackup,
         )
+    }
+}
+
+// Level + horas ouvidas (pedido do usuario 21/09/2026: "podemos acompanhar essa pontuação dentro
+// do meu perfil, onde fica minha foto e nome e niver"). Nivel 1 comeca em 0 musicas - a barra
+// mostra o progresso DENTRO do nivel atual (songsIntoCurrentLevel de 50), nao o total acumulado.
+@Composable
+private fun ListeningStatsCard(stats: ListeningStatsUiState) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(PailerGunmetal.copy(alpha = 0.5f))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Star, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "Nível ${stats.level}",
+                color = MaterialTheme.colorScheme.onBackground,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                "${stats.songsCompleted} músicas ouvidas",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        LinearProgressIndicator(
+            progress = { stats.songsIntoCurrentLevel / 50f },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(CircleShape),
+            color = MaterialTheme.colorScheme.primary,
+            trackColor = Color.White.copy(alpha = 0.12f),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Faltam ${stats.songsToNextLevel} músicas para o nível ${stats.level + 1}",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelSmall,
+        )
+        Spacer(Modifier.height(14.dp))
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    formatListeningHours(stats.totalListeningMs),
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "Tempo ouvido",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    formatListeningHours(stats.radioListeningMs),
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "Na rádio",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+    }
+}
+
+private fun formatListeningHours(ms: Long): String {
+    val totalMinutes = ms / 60_000L
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return when {
+        hours > 0 -> "${hours}h ${minutes}min"
+        else -> "${minutes}min"
     }
 }
 
@@ -2739,7 +2990,7 @@ private fun BackupSettingsPanel(
             if (state.usingOfficialFolder) {
                 "Guarda favoritos, fotos de artista e correcoes de album/artista dentro da pasta oficial acima."
             } else {
-                "Guarda favoritos, fotos de artista e correcoes de album/artista num arquivo que voce escolhe (ex.: no seu Google Drive)."
+                "Guarda favoritos, fotos de artista e correcoes de album/artista num arquivo que voce escolhe - normalmente dentro do seu Google Drive, com a conta que ja esta logada no aparelho."
             },
             modifier = Modifier.padding(top = 4.dp),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2793,7 +3044,13 @@ private fun BackupSettingsPanel(
             if (!state.usingOfficialFolder) {
                 Spacer(Modifier.height(10.dp))
                 OutlinedButton(onClick = onChooseDestination, modifier = Modifier.fillMaxWidth()) {
-                    Text("Trocar arquivo de backup")
+                    Icon(
+                        painterResource(R.drawable.ic_google_drive),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Trocar pasta do Google Drive")
                 }
                 Spacer(Modifier.height(10.dp))
                 TextButton(onClick = onClearDestination, modifier = Modifier.fillMaxWidth()) {
@@ -2801,12 +3058,25 @@ private fun BackupSettingsPanel(
                 }
             }
         } else {
+            // Pedido do usuario 22/09/2026: "não estou achando o botão enviar backup pro google
+            // drive, talvez devesse ser mais explícito, até ter o logo do drive" - texto generico
+            // "Escolher arquivo de backup" virou explicito com o nome do Drive + o logo dele
+            // (ic_google_drive, ver drawable) do lado. onChooseDestination continua abrindo o
+            // seletor de documentos padrao do Android (SAF) - Google Drive so aparece como opcao
+            // ali PORQUE o app do Drive ja esta instalado/logado no aparelho, o app em si nao fala
+            // com a API do Drive diretamente.
             Button(
                 onClick = onChooseDestination,
                 enabled = !state.isWorking,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Escolher arquivo de backup")
+                Icon(
+                    painterResource(R.drawable.ic_google_drive),
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Enviar backup para o Google Drive")
             }
         }
 
@@ -5765,17 +6035,17 @@ private fun PlaylistsScreen(
                 }
             } else {
                 item(span = { GridItemSpan(maxLineSpan) }) {
-                    DayPeriodGifBackground(
+                    RadioHostsVideoBanner(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(170.dp)
+                            .aspectRatio(1f)
                             .clip(RoundedCornerShape(14.dp)),
                     )
                 }
             }
         }
         gridItems(radios, key = { it.name }) { radio ->
-            RadioGridCard(radio = radio, onClick = { onOpenRadio(radio) })
+            MinimalRadioCard(radio = radio, onClick = { onOpenRadio(radio) })
         }
     }
 }
@@ -5956,18 +6226,25 @@ private fun RadioDetailScreen(
                                     )
                                 }
                             }
-                            IconButton(
-                                onClick = { showDeleteConfirm = true },
-                                modifier = Modifier
-                                    .size(52.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(PailerCharcoal.copy(alpha = 0.6f)),
-                            ) {
-                                Icon(
-                                    Icons.Filled.Delete,
-                                    contentDescription = "Remover radio",
-                                    tint = MaterialTheme.colorScheme.onBackground,
-                                )
+                            // Radios fixas (Surprise Me/Radio recente/Musicas Curtidas, pedido do
+                            // usuario 22/09/2026) nao podem ser removidas/ocultadas - deleteRadio
+                            // chamaria hideRadio() nelas, mas radiosFrom nao filtra mais as fixas
+                            // por hiddenRadioKeys (ver comentario la), entao "remover" nunca
+                            // faria efeito nenhum e ainda mostraria um toast enganoso de sucesso.
+                            if (!radio.isPinned) {
+                                IconButton(
+                                    onClick = { showDeleteConfirm = true },
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = "Remover radio",
+                                        tint = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
                             }
                         }
                         }
@@ -6414,7 +6691,16 @@ private fun RadioAlbumMockupScene(
                 },
             ),
     ) {
-        RadioMockupVideoBackground(sequencer.exoPlayer, Modifier.fillMaxSize())
+        // Um pouco maior durante o take de ceu do refrao (pedido do usuario 21/09/2026, ver
+        // RadioChorusSkyScale) - Box pai ja tem clipToBounds(), entao o zoom nunca vaza pra fora
+        // da tela; RESIZE_MODE_ZOOM (RadioMockupVideoBackground) ja corta as bordas por conta
+        // propria, esse scale so aumenta ainda mais em cima disso.
+        val videoScale by animateFloatAsState(
+            targetValue = if (sequencer.chorusCaptionActive) RadioChorusSkyScale else 1f,
+            animationSpec = tween(600),
+            label = "radioSkyVideoScale",
+        )
+        RadioMockupVideoBackground(sequencer.exoPlayer, Modifier.fillMaxSize().scale(videoScale))
         if (sequencer.showAlbumArt) {
             PerspectiveAlbumArtwork(
                 uri = player.artworkUri,
@@ -6459,6 +6745,19 @@ private fun RadioAlbumMockupScene(
                 center = Offset(size.width * 0.73f, size.height * 0.38f),
             )
         }
+        // Fade de transicao (pedido do usuario 18/09/2026: precisa cobrir a capa/video de
+        // verdade, pra esconder o atraso da PerspectiveAlbumArtwork (des)aparecendo exatamente no
+        // corte) - mas ATRAS do header/legenda/rodape agora (pedido do usuario 22/09/2026: "a
+        // legenda tem que ficar sempre por cima de tudo, nunca em baixo do fade"), nao mais por
+        // cima de tudo feito antes. Ainda cobre 100% do video/capa/TV/gradiente acima (essa e a
+        // parte que precisa mesmo ficar escondida no corte); noise/VHS abaixo continuam por cima
+        // do fade tambem, ja eram "sempre por cima de tudo, independente da cena" por definicao
+        // propria deles.
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color.Black.copy(alpha = scrim.alphaValue)),
+        )
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -6480,29 +6779,52 @@ private fun RadioAlbumMockupScene(
                 )
             }
             Spacer(Modifier.height(12.dp))
-            Text(
-                player.title.ifBlank { "Tocando agora" },
-                color = Color.White,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Black,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                listOf(player.artist, player.album).filter { it.isNotBlank() }.joinToString(" • "),
-                color = Color.White.copy(alpha = 0.76f),
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                player.playbackSource.ifBlank { "Rádio" },
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Miniatura da capa ao lado do titulo: so nas cenas de ambiente/refrao, onde a
+                // capa NAO esta desenhada grande em perspectiva por cima do video (showAlbumArt)
+                // - pedido do usuario 21/09/2026, "quando estamos vendo outras imagens... pode
+                // fazer a capa aparecer ao lado esquerdo do nome". Some ao voltar pra cena da
+                // capa/disco pra nao duplicar a mesma arte na tela.
+                AnimatedVisibility(
+                    visible = !sequencer.showAlbumArt,
+                    enter = fadeIn(tween(280)) + expandHorizontally(tween(280)),
+                    exit = fadeOut(tween(200)) + shrinkHorizontally(tween(200)),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ArtworkBox(
+                            uri = player.artworkUri,
+                            embeddedSourceUri = player.artworkSourceUri,
+                            modifier = Modifier.size(44.dp),
+                        )
+                        Spacer(Modifier.width(10.dp))
+                    }
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        player.title.ifBlank { "Tocando agora" },
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOf(player.artist, player.album).filter { it.isNotBlank() }.joinToString(" • "),
+                        color = Color.White.copy(alpha = 0.76f),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        player.playbackSource.ifBlank { "Rádio" },
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
         Column(
             modifier = Modifier
@@ -6517,25 +6839,45 @@ private fun RadioAlbumMockupScene(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // Durante o take de ceu do refrao a legenda normal vira a versao cinematografica
-            // (maior, bold, caps, com animacao de entrada - pedido do usuario 20/09/2026); fora
-            // disso e a legenda de sempre.
-            if (sequencer.chorusCaptionActive) {
-                RadioChorusCaption(
-                    lyrics = lyrics,
-                    songId = player.songId,
-                    positionMs = player.positionMs,
-                    isPlaying = player.isPlaying,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            } else {
-                HomeLyricsSubtitle(
-                    lyrics = lyrics,
-                    songId = player.songId,
-                    positionMs = player.positionMs,
-                    isPlaying = player.isPlaying,
-                    enabled = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            // (maior, bold, caps, com animacao de entrada - pedido do usuario 20/09/2026); no take
+            // do quadro de fotos (a foto do OUVINTE, nao da musica) a legenda vira nome+level/
+            // plays/horas do ouvinte (pedido do usuario 21/09/2026: "naquela tela onde aparece a
+            // foto de perfil do ouvinte... nome dele, embaixo do nome o level > plays > horas") -
+            // lyrics da musica atual nao fazem sentido nenhum numa cena que e sobre o ouvinte, nao
+            // sobre a faixa. Fora dos dois casos e a legenda de sempre.
+            when {
+                sequencer.showProfilePhotoBoard -> {
+                    // "bem mais pra baixo" (pedido do usuario 22/09/2026) - empurra o bloco pra
+                    // perto do rodape de verdade em vez de nascer logo no topo dessa area (onde a
+                    // legenda normal/chorus comecam). Altura fixa (nao weight(1f) - essa Column e
+                    // wrap-content, sem altura propria pra distribuir peso nenhum).
+                    Spacer(Modifier.height(64.dp))
+                    RadioListenerStatsFooter(
+                        name = player.listenerName,
+                        level = player.listenerLevel,
+                        songsCompleted = player.listenerSongsCompleted,
+                        listeningMs = player.listenerListeningMs,
+                    )
+                }
+                sequencer.chorusCaptionActive -> {
+                    RadioChorusCaption(
+                        lyrics = lyrics,
+                        songId = player.songId,
+                        positionMs = player.positionMs,
+                        isPlaying = player.isPlaying,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                else -> {
+                    HomeLyricsSubtitle(
+                        lyrics = lyrics,
+                        songId = player.songId,
+                        positionMs = player.positionMs,
+                        isPlaying = player.isPlaying,
+                        enabled = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
             Spacer(Modifier.height(8.dp))
             // No player expandido, some depois de alguns segundos parado e volta ao tocar na tela
@@ -6563,18 +6905,10 @@ private fun RadioAlbumMockupScene(
             )
         }
         RadioMockupNoiseOverlay(Modifier.matchParentSize())
-        // Filtro VHS: sempre por cima de tudo, em loop proprio, independente da cena de fundo
-        // trocando por baixo dele.
-        RadioVhsFilterOverlay(Modifier.matchParentSize())
-        // Fade de transicao por ULTIMO (acima de tudo, inclusive do filtro vintage e do
-        // granulado) - pedido do usuario 18/09/2026: o atraso da capa (des)aparecendo exatamente
-        // no corte pra/da cena do disco só ficou escondido de verdade com o fade cobrindo
-        // literalmente todas as camadas, nao so o video e a capa por baixo do texto.
-        Box(
-            modifier = Modifier
-                .matchParentSize()
-                .background(Color.Black.copy(alpha = scrim.alphaValue)),
-        )
+        // Filtro VHS trocado pelo teste do CTR (pedido do usuario 22/09/2026) - ver
+        // RadioCtrOverlayTest acima. Pra voltar ao VHS: trocar essa linha de volta por
+        // RadioVhsFilterOverlay(Modifier.matchParentSize()).
+        RadioCtrOverlayTest(Modifier.matchParentSize())
     }
 }
 
@@ -6696,6 +7030,33 @@ private fun radioMockupMediaItem(context: Context, rawRes: Int, mediaId: String)
         .setUri(Uri.parse("android.resource://${context.packageName}/$rawRes"))
         .setMediaId(mediaId)
         .build()
+
+// Take de ceu do refrao SEM o "volta" espelhado (pedido do usuario 21/09/2026 - ver comentario
+// nos pools sky*Pool) - forwardHalfMs e a metade real do arquivo (ffprobe), cortada via
+// ClippingConfiguration em vez de reeditar o .mp4 (reversivel na hora, sem precisar reprocessar
+// os 12 arquivos de video).
+private fun radioMockupSkyMediaItem(context: Context, rawRes: Int, mediaId: String, forwardHalfMs: Long): MediaItem =
+    MediaItem.Builder()
+        .setUri(Uri.parse("android.resource://${context.packageName}/$rawRes"))
+        .setMediaId(mediaId)
+        .setClippingConfiguration(
+            MediaItem.ClippingConfiguration.Builder()
+                .setEndPositionMs(forwardHalfMs)
+                .build(),
+        )
+        .build()
+
+// Compensa a metade cortada acima (pedido do usuario 21/09/2026: "diminuir a velocidade do vídeo
+// pra durar mais e deixar um pouquinho maior"): mais devagar pra nao passar rapido demais so com
+// a metade do conteudo, e um pouco maior (RadioMockupVideoBackground ja usa RESIZE_MODE_ZOOM/
+// corta as bordas, entao um scale por cima nao deixa tarja nem estica proporcao).
+private const val RadioChorusSkyPlaybackSpeed = 0.6f
+private const val RadioChorusSkyScale = 1.08f
+
+// Volume do efeito sonoro da vitrola por cima da musica (pedido do usuario 22/09/2026) - baixo o
+// bastante pra ficar so como camada de ambiente, nunca competir com a musica que continua tocando
+// no player de verdade (esse e um player extra so pra esse som, ver vitrolaSfxPlayer).
+private const val RadioVitrolaSfxVolume = 0.7f
 
 // Um "pedaco" do ciclo normal: capa em loop 2x + 1 ou 2 cenas de ambiente aleatorias (pedido do
 // usuario 18/09/2026: "não precisa aparecer todos os takes em sequência de uma vez... em ordem
@@ -6823,22 +7184,46 @@ private fun rememberRadioMockupSequencer(
     val trocandoDiscoItem = remember(context) {
         radioMockupMediaItem(context, R.raw.radio_scene_trocando_disco, "trocando_disco")
     }
+    // Pedido do usuario 22/09/2026: "vamos manter [o fade], toda vez que for trocar pra tela da
+    // capa do disco e sair da tela da capa do disco... e manter o fade quando aparece também a
+    // tela com a foto do perfil do ouvinte, e quando sai dessa tela. o resto, corte seco." - so
+    // essas 4 (capa/disco/trocando-disco, que sao a MESMA "familia" visual da capa - ver
+    // showAlbumArt acima -, e o quadro de fotos) disparam o flash preto numa transicao; qualquer
+    // corte que nao envolva nenhuma delas (nem como origem nem como destino) fica sem flash -
+    // ver RadioTransitionScrimState.transition mais abaixo.
+    val fadeFamilyMediaIds = remember(coverItem, discoItem, trocandoDiscoItem, quadroFotosItem) {
+        setOf(coverItem.mediaId, discoItem.mediaId, trocandoDiscoItem.mediaId, quadroFotosItem.mediaId)
+    }
     // Takes de ceu (pedido do usuario 20/09/2026) - so tocam durante um refrao (ver watcher de
     // refrao mais abaixo), NAO fazem parte do environmentPool sorteado do ciclo normal. Um POOL
     // de 3 clipes por horario do dia (pedido do usuario depois: "pega 2 opções a mais de cada
     // cena... faz eles tocar um após o outro" - ver skyPoolForNow), nao so 1 fixo.
+    //
+    // Cada arquivo e gravado em "ida e volta" (a mesma filmagem tocada pra frente e depois de
+    // tras pra frente, pra fechar o loop sem salto - so percebido comparando frame a frame,
+    // frame(t) ~= frame(duracao-t)); pedido do usuario 21/09/2026: "nos takes que aparecem no
+    // refrão, vamos tirar o reverse? ao invés disso, pode diminuir a velocidade do vídeo pra
+    // durar mais e deixar um pouquinho maior". radioMockupSkyMediaItem corta cada clipe na
+    // METADE real dele via MediaItem.ClippingConfiguration (so a parte de ida, sem o "volta"
+    // espelhado) - a metade fica mais devagar/maior compensando (ver RadioChorusSkyPlaybackSpeed/
+    // RadioChorusSkyScale, aplicados no LaunchedEffect do refrao e em RadioAlbumMockupScene).
+    // radio_scene_ceu_madrugada_2/_3 REMOVIDOS do pool (pedido do usuario 22/09/2026: "estão
+    // aparecendo 2 imagens que claramente está de dia, deveria estar escuro o céu, estrelado,
+    // lua, mas não de dia") - checado frame a frame: os dois sao na verdade nascer/por do sol
+    // (sol visivel, ceu laranja vivo), nao madrugada de verdade. So radio_scene_ceu_madrugada.mp4
+    // (ceu escuro estrelado) e correto pra essa faixa de horario; fica sozinho no pool ate ter um
+    // clipe de madrugada de verdade pra substituir os outros dois (sem variedade de 3 por enquanto,
+    // so repete o mesmo - melhor que mostrar sol ao meio da madrugada).
     val skyMadrugadaPool = remember(context) {
         listOf(
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada, "ceu_madrugada_1"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada_2, "ceu_madrugada_2"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_madrugada_3, "ceu_madrugada_3"),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_madrugada, "ceu_madrugada_1", 4_000L),
         )
     }
     val skyManhaPool = remember(context) {
         listOf(
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha, "ceu_manha_1"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha_2, "ceu_manha_2"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_manha_3, "ceu_manha_3"),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_manha, "ceu_manha_1", 4_000L),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_manha_2, "ceu_manha_2", 4_000L),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_manha_3, "ceu_manha_3", 4_000L),
         )
     }
     // Take antigo de radio_scene_ceu_tarde.mp4 foi SUBSTITUIDO (pedido do usuario 20/09/2026:
@@ -6847,16 +7232,18 @@ private fun rememberRadioMockupSequencer(
     // servir de céu de QUALQUER cidade).
     val skyTardePool = remember(context) {
         listOf(
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde, "ceu_tarde_1"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde_2, "ceu_tarde_2"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_tarde_3, "ceu_tarde_3"),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_tarde, "ceu_tarde_1", 4_000L),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_tarde_2, "ceu_tarde_2", 4_000L),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_tarde_3, "ceu_tarde_3", 4_000L),
         )
     }
     val skyNoitePool = remember(context) {
         listOf(
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite, "ceu_noite_1"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite_2, "ceu_noite_2"),
-            radioMockupMediaItem(context, R.raw.radio_scene_ceu_noite_3, "ceu_noite_3"),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_noite, "ceu_noite_1", 4_000L),
+            // Esse clipe especifico e mais curto que os outros 11 (4.004s vs 8s de duracao real,
+            // ffprobe) - a metade dele e proporcionalmente menor (2002ms, nao 4000ms).
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_noite_2, "ceu_noite_2", 2_002L),
+            radioMockupSkyMediaItem(context, R.raw.radio_scene_ceu_noite_3, "ceu_noite_3", 4_000L),
         )
     }
     val environmentPool = remember(takeDeCimaItem, franItem, dogItem, cafeNicoItem, discoGirandoItem, quadroFotosItem, tvItem, hasProfilePhoto) {
@@ -6866,6 +7253,26 @@ private fun rememberRadioMockupSequencer(
 
     val exoPlayer = remember(context) {
         ExoPlayer.Builder(context).build().apply { volume = 0f }
+    }
+
+    // Som ambiente da Fran ajeitando a vitrola (pedido do usuario 22/09/2026: "coloquei uma
+    // trilha nova... pra gente tocar de background quando estiver no fim da música e começar o
+    // take da fran colocando o disco na vitrola") - exoPlayer acima (o video) fica sempre mudo, o
+    // audio de verdade da radio e outro player la no ViewModel; esse aqui e um 3o player, so pra
+    // esse efeito sonoro, tocando por cima da musica como camada de ambiente (nao mudo, mas bem
+    // mais baixo que a musica - mesma ideia das vinhetas/boletim, que tambem tocam num canal a
+    // parte). Disparado 1x (sem loop) exatamente quando o take radio_scene_trocando_disco entra
+    // (ver LaunchedEffect de songId abaixo) - os 5s do audio cabem dentro do RadioDiscSwapHoldMs
+    // (6.5s) do clipe.
+    val vitrolaSfxPlayer = remember(context) {
+        ExoPlayer.Builder(context).build().apply {
+            volume = RadioVitrolaSfxVolume
+            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/${R.raw.radio_sfx_fran_ajeitando_vitrola}")))
+            prepare()
+        }
+    }
+    DisposableEffect(vitrolaSfxPlayer) {
+        onDispose { vitrolaSfxPlayer.release() }
     }
 
     var currentMediaId by remember(exoPlayer) { mutableStateOf(coverItem.mediaId) }
@@ -6886,6 +7293,11 @@ private fun rememberRadioMockupSequencer(
 
     val startFreshCycle: suspend () -> Unit = {
         dynamicCycleEnabled = true
+        // Sempre volta pra velocidade normal aqui (nao so no fim do bloco de ceu que a ligou) -
+        // e o unico ponto de retorno ao ciclo comum de TODAS as transicoes especiais (trocando
+        // disco, boletim, disco final), entao cobre qualquer caminho de volta sem precisar
+        // lembrar de resetar em cada um deles.
+        exoPlayer.setPlaybackParameters(PlaybackParameters(1f))
         exoPlayer.setMediaItems(freshCyclePlaylist())
         exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
         exoPlayer.prepare()
@@ -6908,7 +7320,7 @@ private fun rememberRadioMockupSequencer(
 
     // Cortes NATURAIS do playlist (teto->fran, fran->capa, etc.) - antecipados por polling, ver
     // RadioNaturalTransitionWatcher.
-    RadioNaturalTransitionWatcher(exoPlayer, scrim)
+    RadioNaturalTransitionWatcher(exoPlayer, scrim, fadeFamilyMediaIds)
 
     // Fila dinamica: enquanto no ciclo normal, mantem sempre um pedaco de folga na frente
     // (nunca deixa o ExoPlayer ficar sem "proximo item" real, que faria REPEAT_MODE_OFF parar
@@ -6929,12 +7341,31 @@ private fun rememberRadioMockupSequencer(
         }
     }
 
-    // Primeira composicao: so aplica o ciclo normal a partir da capa, sem flash nem transicao -
-    // nao ha musica anterior nenhuma, a tela esta abrindo agora.
-    LaunchedEffect(exoPlayer, environmentPool, coverItem) {
+    // Primeira composicao (pedido do usuario 22/09/2026: "podemos começar a rádio com o take da
+    // fran ajeitando a vitrola? já que ela está ajeitando o primeiro cd da primeira música" - so
+    // pulava direto pra capa antes) - toca o MESMO take/som de troca de disco
+    // (trocandoDiscoItem + vitrolaSfxPlayer, ver LaunchedEffect de songId mais abaixo) uma vez ao
+    // abrir a tela. Sem flash preto NESSA entrada especifica (a tela esta abrindo agora, nao ha
+    // nada por tras pra esconder - mesma logica de antes); a SAIDA pro ciclo normal, sim, ja passa
+    // pelo scrim.transition normal (trocando_disco -> capa, os dois na fadeFamily, entao sempre
+    // funde).
+    LaunchedEffect(exoPlayer, environmentPool, coverItem, trocandoDiscoItem) {
         if (isFirstSetup) {
             isFirstSetup = false
-            startFreshCycle()
+            dynamicCycleEnabled = false
+            exoPlayer.setMediaItem(trocandoDiscoItem)
+            exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+            vitrolaSfxPlayer.seekTo(0)
+            vitrolaSfxPlayer.playWhenReady = true
+            delay(RadioDiscSwapHoldMs)
+            scrim.transition(
+                sourceMediaId = trocandoDiscoItem.mediaId,
+                destMediaId = coverItem.mediaId,
+                fadeFamily = fadeFamilyMediaIds,
+                onBlack = startFreshCycle,
+            )
         }
     }
 
@@ -6958,18 +7389,34 @@ private fun rememberRadioMockupSequencer(
                     // dynamicCycleEnabled = false enquanto isso pra o watcher de extensao nao
                     // mexer na fila de item unico do trocando-disco.
                     dynamicCycleEnabled = false
-                    scrim.flashThroughBlack(onBlack = {
-                        exoPlayer.setMediaItem(trocandoDiscoItem)
-                        // REPEAT_MODE_OFF (era ONE) - agora o hold bate com a duracao real do
-                        // clipe (RadioDiscSwapHoldMs = RadioDiscSwapClipDurationMs), entao o video
-                        // so precisa tocar UMA vez do inicio ao fim; deixa-lo em loop so arriscava
-                        // reiniciar bem quando o hold ia estourar, cortando o final da animacao.
-                        exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
-                        exoPlayer.prepare()
-                        exoPlayer.playWhenReady = true
-                    })
+                    scrim.transition(
+                        sourceMediaId = currentMediaId,
+                        destMediaId = trocandoDiscoItem.mediaId,
+                        fadeFamily = fadeFamilyMediaIds,
+                        onBlack = {
+                            exoPlayer.setMediaItem(trocandoDiscoItem)
+                            // REPEAT_MODE_OFF (era ONE) - agora o hold bate com a duracao real do
+                            // clipe (RadioDiscSwapHoldMs = RadioDiscSwapClipDurationMs), entao o
+                            // video so precisa tocar UMA vez do inicio ao fim; deixa-lo em loop so
+                            // arriscava reiniciar bem quando o hold ia estourar, cortando o final
+                            // da animacao.
+                            exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
+                            exoPlayer.prepare()
+                            exoPlayer.playWhenReady = true
+                            // Som da vitrola por cima (pedido do usuario 22/09/2026) - seekTo(0)
+                            // pra sempre comecar do inicio, mesmo se o efeito ainda estivesse
+                            // tocando de uma troca de disco anterior muito rapida.
+                            vitrolaSfxPlayer.seekTo(0)
+                            vitrolaSfxPlayer.playWhenReady = true
+                        },
+                    )
                     delay(RadioDiscSwapHoldMs)
-                    scrim.flashThroughBlack(onBlack = startFreshCycle)
+                    scrim.transition(
+                        sourceMediaId = trocandoDiscoItem.mediaId,
+                        destMediaId = coverItem.mediaId,
+                        fadeFamily = fadeFamilyMediaIds,
+                        onBlack = startFreshCycle,
+                    )
                     lastSongId = currentSongId.value
                 }
             }
@@ -6986,12 +7433,17 @@ private fun rememberRadioMockupSequencer(
         if (nearEnd && !isBulletinPlaying && discoActiveForSong != songId) {
             discoActiveForSong = songId
             dynamicCycleEnabled = false
-            scrim.flashThroughBlack(onBlack = {
-                exoPlayer.setMediaItem(discoItem)
-                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
-                exoPlayer.prepare()
-                exoPlayer.playWhenReady = true
-            })
+            scrim.transition(
+                sourceMediaId = currentMediaId,
+                destMediaId = discoItem.mediaId,
+                fadeFamily = fadeFamilyMediaIds,
+                onBlack = {
+                    exoPlayer.setMediaItem(discoItem)
+                    exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
+                },
+            )
         }
     }
 
@@ -7007,15 +7459,25 @@ private fun rememberRadioMockupSequencer(
         }
         if (isBulletinPlaying) {
             dynamicCycleEnabled = false
-            scrim.flashThroughBlack(onBlack = {
-                exoPlayer.setMediaItem(takeDeCimaItem)
-                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
-                exoPlayer.prepare()
-                exoPlayer.playWhenReady = true
-            })
+            scrim.transition(
+                sourceMediaId = currentMediaId,
+                destMediaId = takeDeCimaItem.mediaId,
+                fadeFamily = fadeFamilyMediaIds,
+                onBlack = {
+                    exoPlayer.setMediaItem(takeDeCimaItem)
+                    exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
+                },
+            )
         } else {
             discoActiveForSong = null
-            scrim.flashThroughBlack(onBlack = startFreshCycle)
+            scrim.transition(
+                sourceMediaId = takeDeCimaItem.mediaId,
+                destMediaId = coverItem.mediaId,
+                fadeFamily = fadeFamilyMediaIds,
+                onBlack = startFreshCycle,
+            )
         }
     }
 
@@ -7044,18 +7506,34 @@ private fun rememberRadioMockupSequencer(
             if (!isFirstSetup && dynamicCycleEnabled && !nearEnd && window != null && !alreadyShownThisOccurrence) {
                 chorusShownWindowStart = window.first
                 val skyPool = skyPoolForNow(skyMadrugadaPool, skyManhaPool, skyTardePool, skyNoitePool)
+                val shuffledSkyPool = skyPool.shuffled()
                 dynamicCycleEnabled = false
-                scrim.flashThroughBlack(onBlack = {
-                    exoPlayer.setMediaItems(skyPool.shuffled())
-                    // REPEAT_MODE_ALL (era ONE com 1 clipe so) - agora e um POOL de varios
-                    // clipes, toca um apos o outro e recomeca do inicio se o refrao continuar
-                    // mais que uma volta completa do pool.
-                    exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = true
-                })
+                scrim.transition(
+                    sourceMediaId = currentMediaId,
+                    destMediaId = shuffledSkyPool.first().mediaId,
+                    fadeFamily = fadeFamilyMediaIds,
+                    onBlack = {
+                        exoPlayer.setMediaItems(shuffledSkyPool)
+                        // REPEAT_MODE_ALL (era ONE com 1 clipe so) - agora e um POOL de varios
+                        // clipes, toca um apos o outro e recomeca do inicio se o refrao continuar
+                        // mais que uma volta completa do pool.
+                        exoPlayer.repeatMode = Player.REPEAT_MODE_ALL
+                        // Mais devagar (pedido do usuario 21/09/2026, ver
+                        // RadioChorusSkyPlaybackSpeed e radioMockupSkyMediaItem) - compensa cada
+                        // clipe agora so ter a metade "de ida" (sem o "volta" espelhado).
+                        // startFreshCycle acima de volta pra 1f.
+                        exoPlayer.setPlaybackParameters(PlaybackParameters(RadioChorusSkyPlaybackSpeed))
+                        exoPlayer.prepare()
+                        exoPlayer.playWhenReady = true
+                    },
+                )
                 delay(holdMsForChorusWindow(window))
-                scrim.flashThroughBlack(onBlack = startFreshCycle)
+                scrim.transition(
+                    sourceMediaId = currentMediaId,
+                    destMediaId = coverItem.mediaId,
+                    fadeFamily = fadeFamilyMediaIds,
+                    onBlack = startFreshCycle,
+                )
             }
             delay(150)
         }
@@ -7098,6 +7576,23 @@ private class RadioTransitionScrimState(private val alpha: Animatable<Float, *>)
         delay(RadioSceneTransitionHoldMs)
         alpha.animateTo(0f, tween(RadioSceneTransitionFadeOutMs))
     }
+
+    // Decide fade vs corte seco pela FAMILIA da cena de origem/destino (pedido do usuario
+    // 22/09/2026, ver fadeFamilyMediaIds em rememberRadioMockupSequencer) - fade so quando origem
+    // OU destino for capa/disco/trocando-disco ou quadro de fotos; caso contrario so executa a
+    // troca direto (onBlack), sem flash nenhum - a propria troca do ExoPlayer ja e um corte seco.
+    suspend fun transition(
+        sourceMediaId: String,
+        destMediaId: String,
+        fadeFamily: Set<String>,
+        onBlack: suspend () -> Unit,
+    ) {
+        if (sourceMediaId in fadeFamily || destMediaId in fadeFamily) {
+            flashThroughBlack(onBlack)
+        } else {
+            onBlack()
+        }
+    }
 }
 
 @Composable
@@ -7113,8 +7608,8 @@ private fun rememberRadioTransitionScrimState(): RadioTransitionScrimState {
 // setMediaItem (ver rememberRadioMockupSequencer) - ai sabemos exatamente quando o corte
 // acontece, nao precisa adivinhar por polling.
 @Composable
-private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTransitionScrimState) {
-    LaunchedEffect(exoPlayer, scrim) {
+private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTransitionScrimState, fadeFamily: Set<String>) {
+    LaunchedEffect(exoPlayer, scrim, fadeFamily) {
         var armed = true
         while (isActive) {
             val duration = exoPlayer.duration
@@ -7138,7 +7633,17 @@ private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTran
                 when {
                     armed && !sameContentLoop && remaining in 0..RadioSceneTransitionLeadMs -> {
                         armed = false
-                        scrim.flashThroughBlack()
+                        // Corte seco por padrao (pedido do usuario 22/09/2026: "o resto, corte
+                        // seco") - so passa pelo flash quando a cena de origem OU destino for
+                        // capa/disco/quadro de fotos (fadeFamily). Cobre TODOS os cortes naturais
+                        // do ciclo comum: capa->ambiente, ambiente->capa, ambiente->ambiente
+                        // (quando sceneCount=2) e clipe->clipe dentro do pool de ceu do refrao.
+                        val nextIndex = if (currentIndex + 1 < itemCount) currentIndex + 1 else currentIndex
+                        val sourceId = exoPlayer.getMediaItemAt(currentIndex).mediaId
+                        val destId = exoPlayer.getMediaItemAt(nextIndex).mediaId
+                        if (sourceId in fadeFamily || destId in fadeFamily) {
+                            scrim.flashThroughBlack()
+                        }
                     }
                     remaining > RadioSceneTransitionLeadMs + RadioSceneTransitionRearmMarginMs -> {
                         armed = true
@@ -7223,6 +7728,40 @@ private fun RadioVhsFilterOverlay(modifier: Modifier = Modifier) {
             if (!exoPlayer.isPlaying) exoPlayer.play()
         },
     )
+}
+
+// TESTE (pedido do usuario 22/09/2026): "coloquei uma imagem chamada CTR overlay na pasta do
+// projeto, vamos fazer um teste, substituir o filtro overlay que está atualmente por cima das
+// imagens e colocar esse CTR, em 25% só pra ver como fica" - troca RadioVhsFilterOverlay (video)
+// por essa textura ESTATICA (foto real de perto de uma tela CRT, grade de subpixel RGB) por cima
+// das cenas. Ladrilhada (BitmapShader TileMode.REPEAT) em vez de esticada pra tela inteira - o
+// padrao e bem fininho, esticar 1 imagem so ia borrar tudo; repetindo em mosaico mantem o
+// pontilhado nitido em qualquer tamanho de tela. Comprimida de proposito (pedido do usuario:
+// "tirar o peso da imagem comprimindo, deixar bem leve") - original 31.9MB/5472x3648, aqui
+// 640x640/~250KB (radio_filter_ctr.jpg), denso o bastante pra nao perder o padrao de pontinhos.
+// So um dos dois filtros fica ativo por vez (ver call site em RadioAlbumMockupScene) - e um teste
+// visual, facil de voltar pro VHS se nao ficar bom.
+// v2 (pedido do usuario 22/09/2026: "EU COLOQUEI UM CTR V2, vamos testar esse outro a 13%?") -
+// arquivo original vinha em paisagem (612x400, linhas verticais); girado 90 graus pra retrato
+// (400x612, pedido do usuario: "na vertical claro" - a tela do celular e vertical) antes de virar
+// recurso. radio_filter_ctr (v1) continua no projeto, sem uso - so trocar a linha de volta pra
+// comparar.
+private const val RadioCtrOverlayAlpha = 0.18f
+
+@Composable
+private fun RadioCtrOverlayTest(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val bitmap = remember(context) {
+        BitmapFactory.decodeResource(context.resources, R.drawable.radio_filter_ctr_v2)
+    }
+    Canvas(modifier.alpha(RadioCtrOverlayAlpha)) {
+        drawIntoCanvas { canvas ->
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                shader = BitmapShader(bitmap, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+            }
+            canvas.nativeCanvas.drawRect(0f, 0f, size.width, size.height, paint)
+        }
+    }
 }
 
 @Composable
@@ -7925,6 +8464,10 @@ private fun AddSourceToRadioDialog(
     onPickArtist: (LocalArtist) -> Unit,
     onPickAlbum: (LocalAlbum) -> Unit,
     onDismiss: () -> Unit,
+    // Mesmo dialogo de escolher artista/album reusado pra "Criar nova rádio" (pedido do usuario
+    // 22/09/2026, ver popover do botao de 3 pontinhos na aba Radio) - so o titulo muda, o dialogo
+    // em si (busca, lista, alternar artista/album) e identico.
+    title: String = "Adicionar à rádio",
 ) {
     var showAlbums by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -7939,7 +8482,7 @@ private fun AddSourceToRadioDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-        title = { Text("Adicionar à rádio") },
+        title = { Text(title) },
         text = {
             Column {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -8396,35 +8939,58 @@ private fun AlbumCoverMosaic(songs: List<LocalSong>, modifier: Modifier = Modifi
     }
 }
 
+// Card minimalista (pedido do usuario 22/09/2026: primeiro pras Categorias - "ao invés de mostrar
+// várias capas em cada categoria, vamos fazer um card minimalista, estreito, e continuar de 3x3
+// por fileira" -, depois estendido pras Radios de verdade - "na rádio, fazer a mesma coisa, deixar
+// os cards de cada rádio minimalista, 3x3") - substituiu de vez o card antigo (RadioGridCard,
+// removido) que mostrava um mosaico grande de capas (RadioCoverMosaic - ainda usada em
+// RadioCoverTicker, so o card em si que sumiu) em cima do nome/descricao. Agora e so nome +
+// contagem de musicas num retangulo baixo, sem imagem nenhuma. Paleta neutra igual o resto do app
+// (PailerSurfaceHigh) - sem icone algum (pedido do usuario 22/09/2026: "pode tirar esse simbolo de
+// nota musical vermelho do card" - era um toque de cor a mais, mas ficou poluindo o minimalismo).
 @Composable
-private fun RadioGridCard(radio: LocalRadio, onClick: () -> Unit) {
+private fun MinimalRadioCard(radio: LocalRadio, onClick: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .aspectRatio(1.5f)
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick),
+            .background(PailerSurfaceHigh)
+            // As 3 radios fixas (Surprise Me/Radio recente/Musicas Curtidas, pedido do usuario
+            // 22/09/2026: "com cor vermelha no stroke bem fino") ganham um contorno fino na cor
+            // primaria (PailerRed) pra se destacar como padrao/fixas das demais, sem precisar de
+            // nenhum icone ou texto extra - o resto do card continua identico.
+            .then(
+                if (radio.isPinned) {
+                    Modifier.border(1.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
+                } else {
+                    Modifier
+                },
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.Center,
     ) {
-        RadioCoverMosaic(
-            songs = radio.coverSongs,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(1f),
-        )
-        Spacer(Modifier.height(8.dp))
+        // Fonte reduzida (pedido do usuario 22/09/2026: "pode diminuir o tamanho da fonte dos
+        // cards da radio pra caber") - nomes mais longos (ex.: "Músicas Curtidas") estouravam o
+        // card pequeno/estreito com bodyMedium; tamanho explicito em vez do style padrao pra
+        // controlar exatamente o quanto cabe em 2 linhas sem cortar.
         Text(
             radio.name,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.SemiBold,
-            style = MaterialTheme.typography.bodyMedium,
+            fontSize = 12.sp,
+            lineHeight = 14.sp,
         )
+        Spacer(Modifier.height(2.dp))
         Text(
-            radio.description,
-            maxLines = 2,
+            "${radio.songs.size} músicas",
+            maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodySmall,
+            fontSize = 10.sp,
         )
     }
 }
@@ -8979,6 +9545,63 @@ private fun RadioChorusCaption(
             lineHeight = 42.sp,
             letterSpacing = 0.4.sp,
             textAlign = TextAlign.Start,
+        )
+    }
+}
+
+// Legenda do take "quadro de fotos" (a foto do OUVINTE, nao da musica - pedido do usuario
+// 21/09/2026: "naquela tela onde aparece a foto de perfil do ouvinte... no rodapé, lá em baixo,
+// vai aparecer nome dele, embaixo do nome o level > plays > horas"). Mesma identidade visual do
+// resto do overlay da radio: titulo branco bold igual RadioAlbumMockupScene, level em destaque na
+// cor primaria (mesma logica de ListeningStatsCard em Configuracoes > Meu perfil), stats
+// secundarios em branco 76% opaco igual a linha de artista/album do header.
+@Composable
+private fun RadioListenerStatsFooter(
+    name: String,
+    level: Int,
+    songsCompleted: Int,
+    listeningMs: Long,
+    modifier: Modifier = Modifier,
+) {
+    // Pedido do usuario 22/09/2026: "as informações de ouvinte na tela da foto de perfil, tem que
+    // ficar bem mais pra baixo, e alinhadas a esquerda" - horizontalAlignment.Start (era
+    // CenterHorizontally); a posicao mais pra baixo fica no CALL SITE (RadioAlbumMockupScene,
+    // Spacer antes desse composable), nao aqui dentro.
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.Start,
+    ) {
+        Text(
+            name.ifBlank { "Ouvinte" },
+            color = Color.White,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Black,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Filled.Star,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "Nível $level",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "$songsCompleted músicas tocadas • ${formatListeningHours(listeningMs)} ouvidas",
+            color = Color.White.copy(alpha = 0.76f),
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -10397,43 +11020,66 @@ private fun appBackgroundBrush(): Brush = Brush.verticalGradient(
     )
 )
 
+// Banner do topo da aba Radio (pedido do usuario 22/09/2026: "o Gif que fica em cima, vamos
+// trocar pra aquele gif que mostra o nico e a fran de cima, só que 1:1 e centralizando eles 2" -
+// substitui de vez o antigo DayPeriodGifBackground, um .gif generico de ceu que trocava por
+// horario do dia). radio_scene_take_de_cima.mp4 (720x1280, plano aereo dos dois na sala de vinil)
+// e o MESMO clipe usado como um dos takes de ambiente da radio imersiva (rememberRadioMockupSequencer)
+// - aqui toca sozinho, em loop, mudo, so como pano de fundo da lista. Mesmo padrao de
+// ExoPlayer+TextureView+AspectRatioFrameLayout(RESIZE_MODE_ZOOM) de RadioMockupVideoBackground:
+// o container de fora ja forca aspectRatio(1f) (ver PlaylistsScreen), e RESIZE_MODE_ZOOM enche
+// esse quadrado cortando os excessos (aqui, as laterais - o video e mais alto que largo) SEM
+// esticar, sempre centralizado - com os dois (Nico em cima escrevendo no laptop, Fran embaixo
+// escrevendo no caderno) ocupando o miolo vertical do enquadramento original, o corte central ja
+// deixa os dois dentro do quadro.
 @Composable
-private fun rememberCurrentDayPeriod(): DayPeriod {
-    var period by remember { mutableStateOf(DayPeriod.current()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(60_000L)
-            period = DayPeriod.current()
+private fun RadioHostsVideoBanner(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val exoPlayer = remember(context) {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 0f
+            repeatMode = Player.REPEAT_MODE_ALL
+            setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://${context.packageName}/${R.raw.radio_scene_take_de_cima}")))
+            prepare()
+            playWhenReady = true
         }
     }
-    return period
-}
-
-@Composable
-private fun rememberGifImageLoader(): ImageLoader {
-    val context = LocalContext.current
-    return remember(context) {
-        ImageLoader.Builder(context)
-            .components {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    add(ImageDecoderDecoder.Factory())
-                } else {
-                    add(GifDecoder.Factory())
+    DisposableEffect(exoPlayer) {
+        onDispose { exoPlayer.release() }
+    }
+    val aspectRatioFrame = remember { mutableStateOf<AspectRatioFrameLayout?>(null) }
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.height > 0 && videoSize.width > 0) {
+                    val aspect = videoSize.width.toFloat() * videoSize.pixelWidthHeightRatio / videoSize.height
+                    aspectRatioFrame.value?.setAspectRatio(aspect)
                 }
             }
-            .build()
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
     }
-}
-
-@Composable
-private fun DayPeriodGifBackground(modifier: Modifier = Modifier, contentScale: ContentScale = ContentScale.Crop) {
-    val period = rememberCurrentDayPeriod()
-    AsyncImage(
-        model = period.gifRes,
-        imageLoader = rememberGifImageLoader(),
-        contentDescription = null,
+    AndroidView(
         modifier = modifier,
-        contentScale = contentScale,
+        factory = { viewContext ->
+            AspectRatioFrameLayout(viewContext).apply {
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                val textureView = TextureView(viewContext)
+                addView(
+                    textureView,
+                    ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
+                )
+                exoPlayer.setVideoTextureView(textureView)
+                aspectRatioFrame.value = this
+            }
+        },
+        update = { frame ->
+            aspectRatioFrame.value = frame
+            val textureView = frame.getChildAt(0) as TextureView
+            exoPlayer.setVideoTextureView(textureView)
+            if (!exoPlayer.isPlaying) exoPlayer.play()
+        },
     )
 }
 
