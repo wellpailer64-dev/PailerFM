@@ -99,8 +99,19 @@ class BroadcastFeedRepository(private val context: Context) {
             // menos recente a nunca mais tocar nenhum - so nao repete um item que ja esta
             // sentado no buffer AGORA (fallbackReservedKeys), mesmo criterio de fail-open ja
             // usado pra "expires_at" ausente acima.
+            //
+            // `candidates.shuffled()` aqui, NAO `ordered` (que poe especial primeiro) - achado ao
+            // vivo 22/09/2026: com o pool do feed pequeno, esse fallback disparava TODA vez que
+            // abria uma vaga, e `ordered` sempre devolvia o mesmo especial primeiro (ele passa no
+            // fallbackReservedKeys fraco porque acabou de SAIR do buffer, nao porque nao jah
+            // tocou) - a radio travava so nele, nunca chegando nos outros boletins aprovados
+            // disponiveis. A prioridade do especial (ADR-037) e sobre CONTEUDO NOVO furar fila
+            // pra tocar mais cedo - nao faz sentido nesse modo de "repetir o que ja tocou", onde
+            // todos os candidatos ja sao repeticao mesmo; usuario confirmou (22/09/2026): pode
+            // tocar o especial em prioridade uma vez, mas depois precisa variar entre os outros
+            // disponiveis, "mesmo que antigos", em vez de sempre repetir soh ele.
             if (!specialOnly && ordered.isNotEmpty()) {
-                for (item in ordered) {
+                for (item in candidates.shuffled()) {
                     val bulletin = tryDownloadApprovedItem(item, targetDir, fallbackReservedKeys, logSkipReason = false)
                     if (bulletin != null) {
                         Log.w(TAG, "boletim: pool do feed esgotado contra o historico anti-repeticao - repetindo boletim ja tocado")

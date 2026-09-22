@@ -2386,3 +2386,110 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   só viu UMA troca de música acontecer durante o teste, antes desse ajuste) e a cena do
   café do Nico / disco girando (adicionadas na correção seguinte, sem uma troca de
   música real ter acontecido ainda durante o teste pra confirmar visualmente).
+
+## ADR-044 — Cena visual da rádio reiniciava sozinha ao navegar, perdendo fade/sincronia (compartilha 1 só player entre Home/aba Rádio/tela cheia/FullPlayer)
+
+- **Contexto (22/09/2026):** usuário reportou que sair da tela da rádio (ir pra Home,
+  deixar em segundo plano) e voltar sempre mostrava a cena "Fran colocando o disco" de
+  novo, mesmo no meio da música, "como se fosse uma reiniciação" - e depois disso a
+  rádio "ficava bugada": perdia o efeito de fade in/out ou ficava sem sincronia.
+- **Causa raiz:** `rememberRadioMockupSequencer()` (o `ExoPlayer` mudo de fundo + todo o
+  estado que decide qual cena mostrar - `isFirstSetup`, `dynamicCycleEnabled`,
+  `discoActiveForSong` etc., ver ADR-042/043) era criado com `remember` LOCAL dentro de
+  `RadioAlbumMockupScene`, que por sua vez é chamada em 4 lugares independentes:
+  `LiveNowRadioCard` (usado 3x - Home, aba Rádio, `RadioDetailScreen` em sessão) e
+  `FullPlayer`. Cada composição tinha seu PRÓPRIO `ExoPlayer` e estado, sem
+  compartilhamento nenhum - por isso a Home podia mostrar uma cena diferente da tela da
+  rádio. E toda vez que uma dessas composições saía e voltava (trocar de aba, abrir/
+  fechar o `FullPlayer`, o Compose recompor o app voltando do segundo plano), TODO esse
+  estado local era destruído e recriado do zero: `isFirstSetup` voltava a `true`,
+  disparando de novo a animação de abertura "trocando disco"
+  (`radio_scene_trocando_disco.mp4`) incondicionalmente - não importando em que ponto
+  real da música o áudio (esse sim persistente, mora só no ViewModel/`MediaController`)
+  estava. Se essa recriação caísse perto do fim de uma música de verdade
+  (`discSwapImminent`/`nearEnd` já `true`, vindos do `PlayerUiState`), DOIS
+  `LaunchedEffect`s disparavam JUNTOS na composição nova - o de "primeira composição"
+  (incondicional) e o de "disco/música mudando" - os dois chamando `scrim.transition()`
+  concorrentemente sobre o MESMO `Animatable` de fade e o MESMO `ExoPlayer`, sem nenhum
+  lock entre eles. Isso explica tanto o reinício quanto a perda de fade/sincronia
+  relatada.
+- **Correção (`LocalTuneApp.kt`):** o sequenciador (ExoPlayer + estado + scrim de fade)
+  passou a ser criado UMA ÚNICA VEZ em `LibraryShell`, no mesmo lugar que já hospeda
+  `radioCinematicIdle`/os estados de scroll hoisted pra sobreviver à navegação entre
+  abas (ver comentário lá sobre "sobrevive a navegação"), dentro de um
+  `if (isRadioActive) { ... } else { null }` - NÃO um `remember` incondicional: só
+  existe enquanto uma rádio está de fato tocando (`player.activeRadioName.isNotBlank()
+  && player.hasMedia`), e reinicia de verdade (nova animação de abertura) só quando uma
+  sessão NOVA começa (rádio desligada → ligada), nunca por navegação. Novo
+  `RadioMockupSharedState(sequencer, scrim)` passado por parâmetro a partir daí pra
+  `HomeScreen`/`PlaylistsScreen`/`RadioDetailScreen`/`FullPlayer`/`LiveNowRadioCard`/
+  `RadioAlbumMockupScene`, substituindo as chamadas internas antigas de
+  `rememberRadioMockupSequencer()`/`rememberRadioTransitionScrimState()` (que sobram só
+  como definição de função, chamadas 1x só agora). `radioMockup` é nulável nos pontos
+  onde a tela pode não ter rádio ativa (ex.: `RadioDetailScreen` fora de sessão); o
+  consumo trata isso com `?.let`/checagem explícita (`radioIsActive && radioMockup !=
+  null`), não `!!` - `activeRadioName` e `hasMedia` no `PlayerUiState` nem sempre
+  atualizam no mesmo frame ao iniciar uma sessão nova, então existe uma janela de 1
+  frame rara onde `radioMockup` ainda seria `null` com a UI já achando a rádio "ativa".
+- **Efeito colateral cuidado - disputa pela superfície de vídeo:** com o `ExoPlayer`
+  agora compartilhado, `FullPlayer` aberto por cima de `RadioDetailScreen` (mesma cena
+  nas duas, ambas compostas ao mesmo tempo, uma só coberta visualmente pela outra)
+  passou a arriscar as duas chamando `exoPlayer.setVideoTextureView()` a cada
+  recomposição, brigando pela única superfície de vídeo que o player tem - antes cada
+  uma tinha seu PRÓPRIO player, então essa disputa simplesmente não existia. Corrigido
+  com um novo parâmetro `videoActive: Boolean` (`RadioMockupVideoBackground` →
+  `RadioAlbumMockupScene` → `LiveNowRadioCard` → `HomeScreen`/`PlaylistsScreen`/
+  `RadioDetailScreen`), `false` nas 3 telas "de fundo" (Home/aba Rádio/tela da rádio)
+  sempre que `showFullPlayer` estiver `true` (`radioVideoActive = !showFullPlayer`) - só
+  a instância realmente visível no topo chama `setVideoTextureView`/`play()`.
+- **Verificado:** `./gradlew :app:compileDebugKotlin` limpo (zero warning novo nos
+  arquivos tocados), `assembleRelease` + `adb install -r` no Motorola físico (mantém
+  dados). Confirmação visual ao vivo do comportamento de navegação/fade pendente do
+  usuário no dia a dia (não presenciada durante a sessão de implementação).
+
+## ADR-045 — Boletim "especial" monopolizava a rádio quando o pool do feed ficava pequeno (resolve a rotação injusta aceita no ADR-041)
+
+- **Contexto (22/09/2026):** usuário reportou "só está tocando 1 notícia repetidas vezes
+  sem parar... um recado especial da rádio, e não toca outras notícias, parece que
+  travou nisso".
+- **Causa raiz:** exatamente a limitação já registrada e conscientemente aceita no
+  ADR-041/TODO.md ("rotação não é justa") interagindo mal com o boletim `especial` do
+  ADR-037. No modo de fallback de
+  `BroadcastFeedRepository.downloadNextApprovedBulletinBlocking()` (pool do feed
+  esgotado contra o histórico anti-repetição de 80 chaves), os candidatos continuavam
+  ordenados com `especial` primeiro (`ordered`, o mesmo `sortedByDescending` usado pra
+  fazer o especial furar fila de conteúdo NOVO no caminho normal). Com um pool pequeno
+  de itens aprovados no feed, esse fallback disparava toda vez que uma vaga nova abria -
+  e como o especial tinha acabado de SAIR do `bulletinBuffer` (tocou, foi consumido via
+  `removeFirst()`), ele passava tranquilo pelo `fallbackReservedKeys` fraco (só o que
+  está no buffer AGORA, não o histórico completo de `recentBulletinStoryKeys`) e vencia
+  esse sorteio de novo, sempre, virando o primeiro candidato tentado. Resultado: a rádio
+  ficava travada repetindo só o especial, nunca chegando nos outros boletins aprovados
+  disponíveis no feed.
+- **Correção (`BroadcastFeedRepository.kt`):** o loop de fallback passou a iterar
+  `candidates.shuffled()` (todos os candidatos do manifest, em ordem embaralhada) em vez
+  de `ordered` (especial sempre primeiro) - a prioridade do especial (ADR-037) é sobre
+  conteúdo NOVO furar fila pra tocar mais cedo; não faz sentido continuar valendo nesse
+  modo de "repetir o que já tocou", onde todo candidato já é uma repetição mesmo.
+- **Correção complementar (`LocalTuneViewModel.kt`):** novo
+  `currentFallbackBulletinReservedKeys()` = `currentBulletinBufferKeys()` + os últimos
+  `BULLETIN_FALLBACK_AVOID_RECENT_COUNT` (3) itens de `recentBulletinStoryKeys` (ou
+  seja, também o boletim que ACABOU de tocar, não só o que está sentado no buffer agora)
+  - trava só a repetição IMEDIATA (o mesmo item de novo na vaga seguinte, o sintoma
+  relatado), sem impedir repetir algo mais antigo quando o pool for mesmo pequeno
+  (mantém o espírito fail-open do ADR-041: melhor repetir algo velho que nada). Passou a
+  substituir `currentBulletinBufferKeys()` puro como `fallbackReservedKeys` no ponto de
+  chamada de `refillBulletinBuffer()`.
+- **Decisão de design (pedido explícito do usuário, confirmado durante a correção):** o
+  especial CONTINUA furando fila e tocando em prioridade da primeira vez - comportamento
+  do ADR-037, intacto. A mudança é só que, DEPOIS disso, se a rádio precisar repetir algo
+  (pool pequeno), ele passa a ser só mais um candidato entre os outros, "mesmo que
+  antigos", em vez de monopolizar a rádio nele sozinho.
+- **Resolve:** a limitação aceita no ADR-041 ("rotação não é justa... favorece sempre o
+  mesmo item") e o item correspondente do `TODO.md` (marcado como feito).
+- **Verificado:** `./gradlew :app:compileDebugKotlin` limpo, `assembleRelease` + `adb
+  install -r` no Motorola físico. Diagnóstico em campo feito por leitura de código (o
+  mecanismo bate exatamente com o sintoma relatado) + confirmação do usuário sobre o
+  comportamento esperado; não foi possível capturar um ciclo completo de fallback ao
+  vivo via `adb logcat` durante a sessão de correção (o gatilho depende de uma vaga de
+  boletim abrir, o que não aconteceu dentro da janela de observação).

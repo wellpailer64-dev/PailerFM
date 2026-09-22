@@ -134,10 +134,20 @@ histórico e a rodada normal (`reservedKeys`) nunca mais acha nada — sem esse 
 buffer ficava vazio pra sempre e a rádio parava de anunciar boletim, em silêncio (bug real,
 visto ao vivo). Se a rodada normal não devolve nada mas o manifest TINHA candidatos
 válidos, `downloadNextApprovedBulletinBlocking()` tenta de novo ignorando o histórico —
-só evita repetir um item que já está sentado no `bulletinBuffer` agora mesmo
-(`fallbackReservedKeys`/`currentBulletinBufferKeys()`) — preferindo repetir um boletim
-antigo a nunca mais tocar nenhum. Não roda em `specialOnly` (o "especial" é aviso avulso,
-não faz sentido repetir sozinho).
+preferindo repetir um boletim antigo a nunca mais tocar nenhum. Não roda em `specialOnly`
+(o "especial" é aviso avulso, não faz sentido repetir sozinho).
+
+**Esse fallback gira o pool de forma justa (ADR-045, 22/09/2026):** os candidatos são
+tentados em ordem embaralhada (`candidates.shuffled()`), SEM a prioridade que o boletim
+"especial" tem no caminho normal (ver ADR-037 em DECISIONS.md — `content_type ==
+"especial"` fura fila de conteúdo NOVO) — sem isso, um especial que tinha acabado de
+tocar (e por isso já não estava mais no `bulletinBuffer`) vencia esse sorteio de novo
+toda vez que uma vaga abria, travando a rádio só nele (bug real, visto ao vivo: "só está
+tocando 1 notícia repetidas vezes"). `fallbackReservedKeys` também não é mais só
+`currentBulletinBufferKeys()` — é `currentFallbackBulletinReservedKeys()`, que soma os
+últimos `BULLETIN_FALLBACK_AVOID_RECENT_COUNT` (3) itens de `recentBulletinStoryKeys`,
+travando a repetição imediata do que acabou de tocar sem impedir repetir algo mais antigo
+quando o pool for mesmo pequeno.
 
 **Sem alternativa quando o feed está genuinamente vazio ou fora do ar:** se o manifest não
 tem NENHUM candidato aprovado/não-vencido (nem pro fallback acima), ou o WAV baixado não é

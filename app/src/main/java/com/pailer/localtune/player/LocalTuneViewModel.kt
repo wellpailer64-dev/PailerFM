@@ -2964,6 +2964,18 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private fun currentBulletinBufferKeys(): Set<String> =
         bulletinBuffer.mapNotNull { item -> item.script.newsReservationKey().takeIf { it.isNotBlank() } }.toSet()
 
+    // fallbackReservedKeys de verdade passado pro feed (ver downloadNextApprovedBulletin) - alem
+    // do que ja esta no buffer AGORA, tambem bloqueia os ultimos poucos boletins que JA tocaram
+    // (nao o historico inteiro de RECENT_BULLETIN_STORY_KEY_LIMIT, que e justamente o que faz
+    // esse modo de fallback disparar num pool pequeno). Sem isso, um item que acabou de tocar -
+    // e por isso ja NAO esta mais no buffer - podia ser escolhido de novo na mesma hora que a
+    // proxima vaga abria, travando a radio nele pra sempre (relatado ao vivo 22/09/2026: "só está
+    // tocando 1 notícia repetidas vezes... um recado especial"). Janela curta de proposito - so
+    // trava a repeticao IMEDIATA, sem impedir repetir algo mais antigo quando o pool for mesmo
+    // curto (pedido do usuario: "mesmo que antigos, ao invés de repetir um só").
+    private fun currentFallbackBulletinReservedKeys(): Set<String> =
+        currentBulletinBufferKeys() + recentBulletinStoryKeys.takeLast(BULLETIN_FALLBACK_AVOID_RECENT_COUNT)
+
     private fun RadioScript.newsReservationKey(): String =
         "${story.source.normalizedBulletinKeyPart()}|${story.title.normalizedBulletinKeyPart()}"
 
@@ -3082,7 +3094,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                             broadcastFeedRepository.downloadNextApprovedBulletin(
                                 targetDir = coreBufferDir,
                                 reservedKeys = currentReservedBulletinStoryKeys(),
-                                fallbackReservedKeys = currentBulletinBufferKeys(),
+                                fallbackReservedKeys = currentFallbackBulletinReservedKeys(),
                                 specialOnly = specialOnly,
                             )
                         }
@@ -4201,6 +4213,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // tocados), sem precisar esperar o buffer inteiro esvaziar.
         const val BULLETIN_BUFFER_SPECIAL_RESERVED_SLOTS = 3
         const val RECENT_BULLETIN_STORY_KEY_LIMIT = 80
+        // Ver currentFallbackBulletinReservedKeys() - quantos dos ultimos boletins TOCADOS ficam
+        // proibidos de repetir imediatamente no fallback de pool esgotado (alem do que ja esta no
+        // buffer agora). Pequeno de proposito: so evita repeticao costas-com-costas do mesmo item,
+        // sem impedir repetir algo mais antigo quando o pool do feed for mesmo pequeno.
+        const val BULLETIN_FALLBACK_AVOID_RECENT_COUNT = 3
 
         // Margem de seguranca da limpeza de .wav orfaos em saveCoreBufferManifest() - so precisa
         // cobrir um download do feed remoto em andamento (REMOTE_FEED_TIMEOUT_MS, 15s) com folga;

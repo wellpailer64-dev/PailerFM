@@ -866,6 +866,43 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         // Tela sempre acesa + barras do sistema escondidas enquanto o usuario esta DENTRO de uma
         // radio tocando (pedido do usuario 20/09/2026) - mesma condicao do modo cinema acima.
         RadioImmersiveModeEffect(active = isInsideActiveRadio)
+        // Video mudo de fundo + orquestrador de cenas da radio (ver comentario em
+        // RadioAlbumMockupScene) - hoisted AQUI, e nao mais dentro de cada lugar que mostra a
+        // cena, pelo mesmo motivo do modo cinema/immersive acima: header/navbar/FullPlayer sao
+        // irmaos das telas que mostram a radio, nao filhos delas, e essa Box raiz e o unico ponto
+        // que sobrevive a troca de aba (Home <-> Radio), abrir/fechar o FullPlayer, e o app ir pra
+        // segundo plano e voltar (contanto que o processo nao morra) - exatamente as 3 situacoes
+        // relatadas pelo usuario 22/09/2026 em que a cena reiniciava sozinha (sempre voltando pra
+        // animacao "trocando disco" no meio da musica) e a transicao de fade/sincronia quebrava.
+        // if/else (nao um remember incondicional) de proposito: enquanto isRadioActive for false
+        // nem existe ExoPlayer nenhum rodando (sem gastar bateria/CPU a toa fora de uma sessao de
+        // radio), e QUANDO uma sessao nova comeca de verdade (radio desligada -> ligada) o Compose
+        // descarta o remember antigo e cria um objeto novo do zero - reset correto (nova sessao
+        // pede uma nova animacao de abertura), diferente do reset ESPURIO que motivou essa mudanca
+        // (mera navegacao entre telas com a MESMA sessao ainda tocando).
+        val radioMockup = if (isRadioActive) {
+            val radioMockupNearEnd = player.durationMs > 0 &&
+                (player.durationMs - player.positionMs) in 0..RadioEndingCutoverMs
+            val radioMockupDiscSwapImminent = player.durationMs > 0 &&
+                (player.durationMs - player.positionMs) in 0..RadioDiscSwapLeadMs
+            val radioMockupChorusWindows = remember(lyrics.lyrics) {
+                if (lyrics.lyrics.synced) LrcParser.chorusWindows(lyrics.lyrics.lines) else emptyList()
+            }
+            val radioMockupChorusWindowRange = radioMockupChorusWindows.firstOrNull { player.positionMs in it }
+            val radioMockupScrim = rememberRadioTransitionScrimState()
+            val radioMockupSequencer = rememberRadioMockupSequencer(
+                songId = player.songId,
+                nearEnd = radioMockupNearEnd,
+                discSwapImminent = radioMockupDiscSwapImminent,
+                isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
+                hasProfilePhoto = player.profilePhotoUri != null,
+                chorusWindowRange = radioMockupChorusWindowRange,
+                scrim = radioMockupScrim,
+            )
+            RadioMockupSharedState(radioMockupSequencer, radioMockupScrim)
+        } else {
+            null
+        }
         val selectMainTab: (MainTab) -> Unit = { tab ->
             selectedAlbum = null
             selectedArtist = null
@@ -1082,6 +1119,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     RadioDetailScreen(
                         radio = openedRadio,
                         player = player,
+                        radioMockup = radioMockup,
+                        radioVideoActive = !showFullPlayer,
                         lyrics = lyrics,
                         sessionSongs = radioSession,
                         songsBetweenBulletins = radioBulletins.settings.songsBetweenBulletins,
@@ -1171,6 +1210,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             radios = radios,
                             artists = artists,
                             player = player,
+                            radioMockup = radioMockup,
+                            radioVideoActive = !showFullPlayer,
                             lyrics = lyrics,
                             onContinue = { viewModel.continuePlayback(songs) },
                             onTogglePlayPause = viewModel::togglePlayPause,
@@ -1191,6 +1232,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     selectedTab == MainTab.Radio -> PlaylistsScreen(
                         radios = radios,
                         player = player,
+                        radioMockup = radioMockup,
+                        radioVideoActive = !showFullPlayer,
                         lyrics = lyrics,
                         onOpenRadio = {
                             radioSession = emptyList()
@@ -1248,6 +1291,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                 LibrarySection.Genres -> PlaylistsScreen(
                                     radios = genreRadios,
                                     player = player,
+                                    radioMockup = radioMockup,
                                     lyrics = lyrics,
                                     onOpenRadio = {
                                         radioSession = emptyList()
@@ -1446,6 +1490,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             FullPlayer(
                 player = player,
                 isFavorite = viewModel.isCurrentSongFavorite(),
+                radioMockup = radioMockup,
                 lyrics = lyrics,
                 onFetchLyrics = { player.songId?.let(viewModel::fetchLyricsOnline) },
                 onAutoUpgradeLyrics = { player.songId?.let(viewModel::autoUpgradeLyricsSyncIfNeeded) },
@@ -3856,6 +3901,12 @@ private fun HomeScreen(
     radios: List<LocalRadio>,
     artists: List<LocalArtist>,
     player: PlayerUiState,
+    // Nulo quando nao ha radio ativa - so precisa ser nao-nulo quando radioIsActive for true
+    // aqui dentro (mesma condicao usada em LibraryShell pra criar o valor).
+    radioMockup: RadioMockupSharedState?,
+    // false enquanto o FullPlayer estiver aberto por cima (mostrando a MESMA cena) - ver
+    // comentario em RadioMockupVideoBackground.
+    radioVideoActive: Boolean = true,
     lyrics: LyricsUiState = LyricsUiState(),
     onContinue: () -> Unit,
     onTogglePlayPause: () -> Unit,
@@ -3991,12 +4042,18 @@ private fun HomeScreen(
         if (radioIsActive || homePlaybackContent != null) {
             item {
                 Column(modifier = Modifier.fillParentMaxHeight()) {
-                    if (radioIsActive) {
+                    // radioMockup != null (nao so radioIsActive) de proposito: activeRadioName e
+                    // hasMedia nem sempre atualizam no mesmo frame ao iniciar uma radio (o
+                    // controller carrega a fila de forma assincrona) - sem essa checagem extra,
+                    // uma janela rara entre os dois eventos derrubaria o app num !! nulo.
+                    if (radioIsActive && radioMockup != null) {
                         LiveNowRadioCard(
                             player = player,
+                            radioMockup = radioMockup,
                             lyrics = lyrics,
                             onClick = onOpenPlayer,
                             modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                            videoActive = radioVideoActive,
                         )
                     } else if (homePlaybackContent != null) {
                         ContinueListeningCard(
@@ -6009,6 +6066,12 @@ private fun SongsScreen(
 private fun PlaylistsScreen(
     radios: List<LocalRadio>,
     player: PlayerUiState,
+    // Nulo quando nao ha radio ativa - so precisa ser nao-nulo quando radioIsActive for true
+    // aqui dentro (mesma condicao usada em LibraryShell pra criar o valor).
+    radioMockup: RadioMockupSharedState?,
+    // false enquanto o FullPlayer estiver aberto por cima (mostrando a MESMA cena) - ver
+    // comentario em RadioMockupVideoBackground.
+    radioVideoActive: Boolean = true,
     lyrics: LyricsUiState = LyricsUiState(),
     onOpenRadio: (LocalRadio) -> Unit,
     onOpenPlayer: () -> Unit,
@@ -6029,9 +6092,17 @@ private fun PlaylistsScreen(
         // O banner ambiente some quando ha radio tocando pra nao duplicar o gif junto do
         // LiveNowRadioCard, que ja tem seu proprio fundo animado.
         if (showGifBanner) {
-            if (radioIsActive) {
+            // radioMockup != null (nao so radioIsActive): ver comentario equivalente em
+            // HomeScreen - janela rara onde activeRadioName/hasMedia ainda nao atualizaram juntos.
+            if (radioIsActive && radioMockup != null) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
-                    LiveNowRadioCard(player = player, lyrics = lyrics, onClick = onOpenPlayer)
+                    LiveNowRadioCard(
+                        player = player,
+                        radioMockup = radioMockup,
+                        lyrics = lyrics,
+                        onClick = onOpenPlayer,
+                        videoActive = radioVideoActive,
+                    )
                 }
             } else {
                 item(span = { GridItemSpan(maxLineSpan) }) {
@@ -6054,6 +6125,13 @@ private fun PlaylistsScreen(
 private fun RadioDetailScreen(
     radio: LocalRadio,
     player: PlayerUiState,
+    // Nulo quando essa radio nao e a que esta tocando agora - so precisa ser nao-nulo quando
+    // isInSession for true aqui dentro (implica player.activeRadioName nao-vazio, mesma condicao
+    // usada em LibraryShell pra criar o valor).
+    radioMockup: RadioMockupSharedState?,
+    // false enquanto o FullPlayer estiver aberto por cima (mostrando a MESMA cena) - ver
+    // comentario em RadioMockupVideoBackground.
+    radioVideoActive: Boolean = true,
     lyrics: LyricsUiState = LyricsUiState(),
     sessionSongs: List<LocalSong>,
     // Mesmo default de RadioBulletinSettings.songsBetweenBulletins (RadioBulletin.kt) - so usado
@@ -6104,13 +6182,22 @@ private fun RadioDetailScreen(
         // já cobre isso; a lixeira desceu pra ficar do lado do botao principal (Sair/Entrar).
         if (isInSession) {
             item {
-                LiveNowRadioCard(
-                    player = player,
-                    lyrics = lyrics,
-                    onClick = onOpenPlayer,
-                    edgeToEdge = true,
-                    cinematicIdle = cinematicIdle,
-                )
+                // radioMockup pode chegar nulo por 1 frame bem no instante em que a sessao esta
+                // comecando (activeRadioName e hasMedia nem sempre atualizam juntos - ver
+                // comentario equivalente em HomeScreen) - so entao esse card fica vazio por
+                // instante, sem derrubar o app; os controles abaixo (RadioSessionControls) nao
+                // dependem disso e continuam normais.
+                radioMockup?.let { mockup ->
+                    LiveNowRadioCard(
+                        player = player,
+                        radioMockup = mockup,
+                        lyrics = lyrics,
+                        onClick = onOpenPlayer,
+                        edgeToEdge = true,
+                        cinematicIdle = cinematicIdle,
+                        videoActive = radioVideoActive,
+                    )
+                }
             }
             // Ja mostrando a rádio ao vivo no card acima (nome, faixa atual, capa) - repetir
             // mosaico/nome/descricao aqui embaixo seria redundante. Os controles essenciais ficam
@@ -6578,11 +6665,19 @@ private fun RadioNewsBreakCard() {
 @Composable
 private fun LiveNowRadioCard(
     player: PlayerUiState,
+    // Nao-nulo sempre que esse card e de fato mostrado - todo chamador so renderiza
+    // LiveNowRadioCard quando ja sabe que a radio esta ativa (ver isRadioActive em LibraryShell),
+    // que e exatamente a mesma condicao que garante radioMockup != null la.
+    radioMockup: RadioMockupSharedState,
     lyrics: LyricsUiState = LyricsUiState(),
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     edgeToEdge: Boolean = false,
     cinematicIdle: RadioCinematicIdleState? = null,
+    // false quando o FullPlayer (que mostra a MESMA cena, ver radioMockup) esta aberto por cima
+    // desse card - evita as 2 instancias brigando pela superficie de video do player
+    // compartilhado (ver comentario em RadioMockupVideoBackground).
+    videoActive: Boolean = true,
 ) {
     Card(
         modifier = modifier
@@ -6594,10 +6689,12 @@ private fun LiveNowRadioCard(
         RadioAlbumMockupScene(
             player = player,
             lyrics = lyrics,
+            radioMockup = radioMockup,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(RadioAlbumMockupAspectRatio),
             cinematicIdle = cinematicIdle,
+            videoActive = videoActive,
         )
     }
 }
@@ -6640,43 +6737,32 @@ private const val RadioDiscSwapLeadMs = RadioDiscSwapClipDurationMs + 450L
 private fun RadioAlbumMockupScene(
     player: PlayerUiState,
     lyrics: LyricsUiState,
+    // Video mudo de fundo + orquestrador de cenas (ExoPlayer, scrim de fade, qual take esta
+    // ativo) - SEMPRE hoisted no chamador (LibraryShell, ver radioMockup la) agora, nunca mais
+    // criado aqui dentro (era remember local, entao toda vez que essa composable saia de
+    // composicao - trocar de aba, abrir/fechar o FullPlayer, o app ir pra segundo plano e voltar -
+    // o ExoPlayer e todo o estado (isFirstSetup etc.) eram destruidos e recriados do zero na
+    // proxima composicao, sempre caindo na animacao de abertura "trocando disco" no meio da
+    // musica, como um reinicio - e pior, se isso acontecesse perto do fim de uma musica de
+    // verdade, o efeito de "primeira composicao" e o de "disco/musica mudando" disparavam JUNTOS
+    // na montagem nova, brigando pelo mesmo scrim/exoPlayer - relatado pelo usuario 22/09/2026:
+    // "sempre fica repetindo a imagem da fran colocando o disco... perde o efeito de fade in fade
+    // out, ou fica sem sincronia"). Agora e UM SO objeto compartilhado por todos os lugares que
+    // mostram essa cena (Home, aba Radio, tela da radio, FullPlayer), vivo enquanto a radio
+    // estiver ativa (ver isRadioActive em LibraryShell), independente de qual tela esta na frente.
+    radioMockup: RadioMockupSharedState,
     modifier: Modifier = Modifier,
     // null no card pequeno da Home (barra de progresso sempre visivel, sem "modo cinema") - nas
     // telas de radio em tela cheia (RadioDetailScreen/FullPlayer) quem chama ja tem o estado
     // hoisted (LibraryShell/FullPlayer), porque o header e a navbar do app sao IRMAOS dessa
     // cena, nao filhos dela (pedido do usuario 18/09/2026).
     cinematicIdle: RadioCinematicIdleState? = null,
+    // false quando outra instancia desta mesma cena (mesmo radioMockup) esta na frente - ver
+    // comentario em RadioMockupVideoBackground/LiveNowRadioCard.
+    videoActive: Boolean = true,
 ) {
-    val nearEnd = player.durationMs > 0 &&
-        (player.durationMs - player.positionMs) in 0..RadioEndingCutoverMs
-    // Antecipa um pouco a transicao de trocar o disco (pedido do usuario 18/09/2026: "pode
-    // começar a transição só um pouco antes") - dispara ainda com a musica antiga tocando, nao so
-    // reagindo depois que songId ja mudou.
-    val discSwapImminent = player.durationMs > 0 &&
-        (player.durationMs - player.positionMs) in 0..RadioDiscSwapLeadMs
-    // Janelas de refrao da musica atual (pedido do usuario 20/09/2026) - so existe algo aqui com
-    // letra SINCRONIZADA (ver LrcParser.chorusWindows); recalcula so quando a letra muda de
-    // verdade (troca de musica, ou sync chegando depois de um fetch online), nao a cada posicao.
-    val chorusWindows = remember(lyrics.lyrics) {
-        if (lyrics.lyrics.synced) LrcParser.chorusWindows(lyrics.lyrics.lines) else emptyList()
-    }
-    // A ocorrencia inteira (nao so o inicio) - pedido do usuario 20/09/2026: "faz as cenas
-    // durarem o refrão todo" - antes so um take de ceu tocava (~8-10s) e voltava pro disco no
-    // meio do refrao, cortando de volta pra capa e voltando de novo no verso seguinte do refrao.
-    // Com o range inteiro da pra saber a duracao de VERDADE da ocorrencia (ver sequencer abaixo).
-    val chorusWindowRange = chorusWindows.firstOrNull { player.positionMs in it }
-    val scrim = rememberRadioTransitionScrimState()
-    val sequencer = rememberRadioMockupSequencer(
-        songId = player.songId,
-        nearEnd = nearEnd,
-        discSwapImminent = discSwapImminent,
-        // Boletim ao vivo tocando: trava no take de cima em loop, sem capa (pedido do usuario
-        // 18/09/2026); quando termina, volta pra capa/disco.
-        isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
-        hasProfilePhoto = player.profilePhotoUri != null,
-        chorusWindowRange = chorusWindowRange,
-        scrim = scrim,
-    )
+    val scrim = radioMockup.scrim
+    val sequencer = radioMockup.sequencer
 
     Box(
         modifier = modifier
@@ -6700,7 +6786,11 @@ private fun RadioAlbumMockupScene(
             animationSpec = tween(600),
             label = "radioSkyVideoScale",
         )
-        RadioMockupVideoBackground(sequencer.exoPlayer, Modifier.fillMaxSize().scale(videoScale))
+        RadioMockupVideoBackground(
+            sequencer.exoPlayer,
+            Modifier.fillMaxSize().scale(videoScale),
+            videoActive = videoActive,
+        )
         if (sequencer.showAlbumArt) {
             PerspectiveAlbumArtwork(
                 uri = player.artworkUri,
@@ -6911,6 +7001,14 @@ private fun RadioAlbumMockupScene(
         RadioCtrOverlayTest(Modifier.matchParentSize())
     }
 }
+
+// Par (orquestrador de cenas + scrim de fade) hoisted em LibraryShell e repassado por parametro
+// ate RadioAlbumMockupScene (ver comentario la) - o MESMO objeto em todo lugar que mostra a cena
+// da radio, pra nunca mais reiniciar so por causa de navegacao entre telas.
+private class RadioMockupSharedState(
+    val sequencer: RadioMockupSequencerState,
+    val scrim: RadioTransitionScrimState,
+)
 
 private class RadioMockupSequencerState(
     val exoPlayer: ExoPlayer,
@@ -7656,7 +7754,17 @@ private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTran
 }
 
 @Composable
-private fun RadioMockupVideoBackground(exoPlayer: ExoPlayer, modifier: Modifier = Modifier) {
+private fun RadioMockupVideoBackground(
+    exoPlayer: ExoPlayer,
+    modifier: Modifier = Modifier,
+    // false quando essa instancia esta coberta por outra mostrando o MESMO exoPlayer compartilhado
+    // (ex.: FullPlayer aberto por cima da aba Radio) - so entao ela e a UNICA marcada active=true,
+    // senao as duas ficariam chamando setVideoTextureView em cada recomposicao, roubando a
+    // superficie de video uma da outra (a visivel piscaria/congelaria). Pedido do usuario
+    // 22/09/2026 (compartilhar o player entre telas) so vale a pena sem esse cuidado - antes cada
+    // tela tinha seu PROPRIO ExoPlayer, entao essa disputa simplesmente nao existia.
+    videoActive: Boolean = true,
+) {
     // Preenche o quadro inteiro cortando as bordas (RESIZE_MODE_ZOOM) em vez de deixar tarja
     // preta - achado ao vivo 18/09/2026 com o take do dog, que tem proporcao um pouco diferente
     // dos outros takes e aparecia com letterbox sem isso.
@@ -7689,9 +7797,11 @@ private fun RadioMockupVideoBackground(exoPlayer: ExoPlayer, modifier: Modifier 
         },
         update = { frame ->
             aspectRatioFrame.value = frame
-            val textureView = frame.getChildAt(0) as TextureView
-            exoPlayer.setVideoTextureView(textureView)
-            if (!exoPlayer.isPlaying) exoPlayer.play()
+            if (videoActive) {
+                val textureView = frame.getChildAt(0) as TextureView
+                exoPlayer.setVideoTextureView(textureView)
+                if (!exoPlayer.isPlaying) exoPlayer.play()
+            }
         },
     )
 }
@@ -9906,6 +10016,9 @@ private fun MiniPlayer(
 private fun FullPlayer(
     player: PlayerUiState,
     isFavorite: Boolean,
+    // Nulo quando o player esta mostrando uma musica comum (nao radio), ou por 1 frame raro no
+    // instante em que uma sessao de radio esta comecando - ver radioMockup?.let mais abaixo.
+    radioMockup: RadioMockupSharedState?,
     onClose: () -> Unit,
     onToggleFavorite: () -> Unit,
     onToggle: () -> Unit,
@@ -9999,15 +10112,22 @@ private fun FullPlayer(
             }
             Spacer(Modifier.height(36.dp))
             if (isRadio) {
-                RadioAlbumMockupScene(
-                    player = player,
-                    lyrics = lyrics,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(RadioAlbumMockupAspectRatio)
-                        .clip(RoundedCornerShape(8.dp)),
-                    cinematicIdle = cinematicIdle,
-                )
+                // radioMockup pode chegar nulo por 1 frame bem no instante em que a sessao esta
+                // comecando (activeRadioName e hasMedia nem sempre atualizam juntos - ver
+                // comentario equivalente em HomeScreen); so entao essa cena fica vazia por
+                // instante em vez de derrubar o app num !! nulo.
+                radioMockup?.let { mockup ->
+                    RadioAlbumMockupScene(
+                        player = player,
+                        lyrics = lyrics,
+                        radioMockup = mockup,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(RadioAlbumMockupAspectRatio)
+                            .clip(RoundedCornerShape(8.dp)),
+                        cinematicIdle = cinematicIdle,
+                    )
+                }
             } else {
                 // Arrasta pro lado: pagina 0 = capa (chamada identica de ArtworkBox), pagina 1 = letra.
                 // Travado na MESMA caixa fillMaxWidth().aspectRatio(1f) que a capa ocupava, entao

@@ -34,14 +34,13 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
   órfãos) antes de mexer — não investigado ainda.
 - ~~**Desacoplar caminho sherpa do `ttsReady` legado**~~ — moot, `ttsReady`/TTS Android
   removidos 16/09/2026
-- [ ] **Fallback de repetição do boletim (ADR-041, 18/09/2026) não gira o pool de forma
-  justa**: quando o pool do feed é menor que o histórico anti-repetição de 80, o
-  fallback em `BroadcastFeedRepository.downloadNextApprovedBulletinBlocking()` pega o
-  primeiro item do manifest que não está no `bulletinBuffer` agora (ordem do próprio
-  feed), não o menos tocado recentemente dentro do histórico — pode favorecer sempre o
-  mesmo item em vez de girar o pool inteiro. Não é urgente (o bug crítico corrigido era
-  "nunca mais toca boletim nenhum"), mas seria melhor ordenar os candidatos do fallback
-  pela posição em `recentBulletinStoryKeys` (mais antigo primeiro).
+- ~~**Fallback de repetição do boletim (ADR-041, 18/09/2026) não gira o pool de forma
+  justa**~~ — virou bug real, não só polish: com o boletim "especial" (ADR-037) sempre
+  ordenado primeiro nesse fallback, ele vencia a repetição TODA vez que o pool do feed
+  era pequeno, travando a rádio nele sozinho (usuário: "só está tocando 1 notícia
+  repetidas vezes"). Corrigido 22/09/2026 (ADR-045):
+  `BroadcastFeedRepository`/`LocalTuneViewModel` giram o pool de verdade agora
+  (`candidates.shuffled()` sem prioridade de especial + trava dos últimos 3 tocados).
 
 ## P1 — Pipeline determinístico do boletim
 
