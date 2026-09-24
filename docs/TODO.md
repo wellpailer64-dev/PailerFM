@@ -85,6 +85,9 @@ Referências R1–R7 = races catalogadas em [STATE_MACHINE.md](STATE_MACHINE.md)
 - ~~Boletim "especial" fura fila no buffer~~ — feito 17/09/2026 (ADR-037):
   `BroadcastFeedRepository` baixa `content_type == "especial"` com prioridade,
   `LocalTuneViewModel` insere no início do buffer (`addFirst`) em vez do fim.
+- [ ] **Amigos** (pedido 24/09/2026, adiado): ícone ao lado do sino, lista com
+  online/offline e o que cada um está ouvindo, busca por nome e pedidos de amizade
+  (aceitar/recusar/ignorar). Plano completo em [PLANO_AMIGOS.md](PLANO_AMIGOS.md).
 - [ ] Atualizar este doc conforme itens fecham
 
 ## Backlog sem prioridade

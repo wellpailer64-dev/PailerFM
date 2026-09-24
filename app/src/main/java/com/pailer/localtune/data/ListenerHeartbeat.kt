@@ -41,6 +41,8 @@ object ListenerHeartbeat {
     const val REACTION_WOW = "wow"
     const val REACTION_LAUGH = "laugh"
     const val REACTION_SAD = "sad"
+    const val REACTION_ANGRY = "angry"
+    const val REACTION_DISLIKE = "dislike"
     private const val TAG = "PailerHeartbeat"
     private const val PREFS = "listener_heartbeat"
     private const val KEY_INSTALL_ID = "install_id"

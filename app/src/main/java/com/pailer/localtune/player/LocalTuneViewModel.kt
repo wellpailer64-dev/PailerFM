@@ -170,7 +170,8 @@ data class PlayerUiState(
     val ambienceVolume: Float = DEFAULT_AMBIENCE_VOLUME,
 )
 
-// Sons de ambiencia da radio (res/raw, trechos de 2min processados na pasta Ambiencia) - a ordem
+// Sons de ambiencia da radio (res/raw, loops de 60s em estereo SEM EQ desde 24/09/2026 - copia na
+// pasta Ambiencia, versao antiga so-graves em Ambiencia/versao-graves) - a ordem
 // aqui e a ordem do popup.
 enum class RadioAmbience(val rawRes: Int) {
     Rain(com.pailer.localtune.R.raw.ambience_rain),
@@ -495,6 +496,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // tocar POR CIMA da musica sem pausar ela.
     private var ambiencePlayer: ExoPlayer? = null
     private var activeAmbience: RadioAmbience? = null
+    // Pausa atrasada da ambiencia (ver syncAmbienceWithPlayback) - o fim do boletim zera
+    // speakingNews um instante ANTES do controller?.play() que retoma a musica, e sem essa folga a
+    // chuva daria um "soluco" de pausa/play bem nessa virada.
+    private var ambiencePauseJob: Job? = null
     // "Reproducao automatica" (botao ao lado da legenda na Home, pedido do usuario 15/09/2026,
     // imitando o autoplay do Youtube) - ligado por padrao. So atua fora do modo radio (a radio ja
     // tem sua propria continuacao via vinhetas/boletins) e so dispara quando a fila ACABA sozinha
@@ -843,6 +848,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED)) {
                 maybeAutoplayNextAlbum(player)
             }
+            syncAmbienceWithPlayback(player)
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -853,7 +859,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 recordSongCompleted()
             }
-            if (radioNewsEnabled && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+            if (radioNewsEnabled && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
+                radioQueueStillActive(controller)
+            ) {
                 // Heuristica de afinidade da radio (ADR-028) - lastRecordedMediaId ainda e a
                 // faixa que ACABOU de tocar aqui (recordCurrentSong so atualiza pra faixa nova
                 // no onEvents seguinte, que roda depois deste callback especifico). So conta
@@ -2858,7 +2866,29 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         ambiencePlayer?.volume = if (radioMuted) 0f else ambienceVolume
     }
 
+    // Ambiencia acompanha o pause/play do ouvinte (achado 24/09/2026: pausar a radio deixava a
+    // chuva tocando sozinha). Continua tocando durante boletim/vinheta/fade - nesses momentos a
+    // musica fica pausada pelo PROPRIO app, nao pelo ouvinte.
+    private fun syncAmbienceWithPlayback(player: Player) {
+        val ambience = ambiencePlayer ?: return
+        val keepPlaying = player.playWhenReady || speakingNews || pendingVinheta || newsBreakFadeInProgress
+        if (keepPlaying) {
+            ambiencePauseJob?.cancel()
+            ambiencePauseJob = null
+            if (!ambience.playWhenReady) ambience.play()
+            return
+        }
+        if (!ambience.playWhenReady || ambiencePauseJob?.isActive == true) return
+        ambiencePauseJob = viewModelScope.launch {
+            delay(AMBIENCE_PAUSE_GRACE_MS)
+            val stillPaused = controller?.playWhenReady != true && !speakingNews && !pendingVinheta
+            if (ambiencePlayer === ambience && stillPaused) ambience.pause()
+        }
+    }
+
     private fun stopAmbience() {
+        ambiencePauseJob?.cancel()
+        ambiencePauseJob = null
         ambiencePlayer?.release()
         ambiencePlayer = null
         activeAmbience = null
@@ -2945,6 +2975,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun triggerSleepCheck() {
         if (activeRadioName.isBlank()) return
+        if (!radioQueueStillActive(controller)) return
         sleepCheckPending = true
         controller?.let { updatePlayerState(it) }
         sleepAutoStopJob = viewModelScope.launch {
@@ -3027,6 +3058,21 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // Buffer (100% alimentado pelo feed remoto, ver refillBulletinBuffer) roda desde a
         // abertura do app - no-op aqui se ja estiver cheio.
         refillBulletinBuffer()
+    }
+
+    // Rede de protecao do bug 24/09/2026 (album da biblioteca falando boletim e tocando
+    // "tchauzinho" no fim): a fila de uma radio sempre carrega o nome dela em
+    // MediaMetadata.station (ver LocalSong.toMediaItem). Se este ViewModel ainda acha que esta em
+    // modo radio mas a faixa atual nao e dessa radio, alguem trocou a fila por fora dele (a causa
+    // real era uma 2a MainActivity, corrigida com singleTask no manifest) - desliga o modo radio
+    // em silencio, SEM vinheta de saida e sem mexer na fila. Fila vazia nao decide nada.
+    private fun radioQueueStillActive(player: Player?): Boolean {
+        if (activeRadioName.isBlank()) return false
+        val item = player?.currentMediaItem ?: return true
+        if (item.mediaMetadata.station?.toString() == activeRadioName) return true
+        Log.d(TAG_RADIO_VOICE, "radio: fila atual nao e mais de '$activeRadioName' - saindo do modo radio")
+        stopRadioNewsMode()
+        return false
     }
 
     private fun stopRadioNewsMode() {
@@ -3594,6 +3640,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // deixar o ExoPlayer chegar a avancar pra proxima faixa sozinho.
     private fun checkForEarlyNewsBreak(player: Player) {
         if (!radioNewsEnabled || speakingNews || newsBreakFadeInProgress || !player.isPlaying) return
+        if (!radioQueueStillActive(player)) return
         val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: return
         val remaining = duration - player.currentPosition
         if (remaining !in 0..NEWS_BREAK_LEAD_MS) return
@@ -4384,6 +4431,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_LAST_SONG_ID = "last_song_id"
         const val KEY_LAST_POSITION_MS = "last_position_ms"
         const val KEY_AMBIENCE_VOLUME = "ambience_volume"
+        const val AMBIENCE_PAUSE_GRACE_MS = 800L
         const val KEY_FAVORITE_ALBUMS = "favorite_album_keys"
         const val KEY_FAVORITE_SONGS = "favorite_song_ids"
         const val KEY_FAVORITE_ARTISTS = "favorite_artist_keys"

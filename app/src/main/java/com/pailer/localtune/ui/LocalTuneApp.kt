@@ -6222,14 +6222,44 @@ private fun RadioDetailScreen(
     val canRename = radio.isCustom && radio.customId?.startsWith("genre:") != true
     val canManageSources = radio.isCustom && (extraArtists.isNotEmpty() || extraAlbums.isNotEmpty())
     val isInSession = player.activeRadioName == radio.name && player.hasMedia
+    Box(Modifier.fillMaxSize()) {
+    // Fundo da tela "antes de entrar" (pedido do usuario 24/09/2026): o take de cima do Nico e da
+    // Fran em loop, desfocado e apagado, so como clima - blur so pega no Android 12+, abaixo disso
+    // fica so a opacidade baixa (continua legivel por causa do scrim).
+    if (!isInSession) {
+        RadioHostsVideoBanner(
+            modifier = Modifier
+                .matchParentSize()
+                .blur(14.dp)
+                .alpha(0.6f),
+        )
+        Box(
+            Modifier
+                .matchParentSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            MaterialTheme.colorScheme.background.copy(alpha = 0.05f),
+                            MaterialTheme.colorScheme.background.copy(alpha = 0.5f),
+                        ),
+                    ),
+                ),
+        )
+    }
     LazyColumn(
         state = listState,
         flingBehavior = rememberSoftFlingBehavior(),
+        // Fora da sessao o card fica centralizado na vertical (pedido do usuario 24/09/2026: "ta
+        // muito em cima, fica um espacao vazio embaixo") - dentro da sessao segue colado no topo.
+        modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             horizontal = if (isInSession) 0.dp else 18.dp,
             vertical = if (isInSession) 0.dp else 8.dp,
         ),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(
+            12.dp,
+            if (isInSession) Alignment.Top else Alignment.CenterVertically,
+        ),
     ) {
         // Sem seta de voltar aqui de proposito - o gesto/botao de voltar do proprio Android
         // já cobre isso; a lixeira desceu pra ficar do lado do botao principal (Sair/Entrar).
@@ -6269,126 +6299,121 @@ private fun RadioDetailScreen(
                 )
             }
         } else {
+            // Layout centralizado/simetrico (pedido do usuario 24/09/2026): 2 fileiras de capas
+            // coladas rolando em sentidos opostos, nome/descricao/status centralizados, "Entrar"
+            // largo e baixo numa linha so, e os botoes secundarios pequenos e espalhados embaixo.
             item {
                 Card(
-                    shape = RoundedCornerShape(8.dp),
-                    colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.9f)),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = PailerGunmetal.copy(alpha = 0.72f)),
                 ) {
-                    Column(Modifier.padding(vertical = 18.dp)) {
+                    Column(
+                        modifier = Modifier.padding(bottom = 18.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
                         val radioAlbumSongs = remember(radio.songs) {
                             radio.songs.distinctBy { it.albumId }.filter { it.albumId > 0 }
                         }
                         val radioAlbumNames = remember(radioAlbumSongs) {
                             radioAlbumSongs.map { "${it.artist} – ${it.album}" }
                         }
-                        RadioCoverTicker(songs = radio.songs)
-                        Spacer(Modifier.height(10.dp))
+                        RadioCoverTicker(songs = radio.songs, itemSize = 132.dp, spacing = 0.dp, cornerRadius = 0.dp)
+                        RadioCoverTicker(
+                            songs = radio.songs,
+                            reverse = true,
+                            phase = (radioAlbumSongs.size / 2).coerceAtLeast(1),
+                            itemSize = 132.dp,
+                            spacing = 0.dp,
+                            cornerRadius = 0.dp,
+                        )
+                        Spacer(Modifier.height(12.dp))
                         RadioNameTicker(names = radioAlbumNames)
-                        Spacer(Modifier.height(16.dp))
-                        Column(Modifier.padding(horizontal = 18.dp)) {
+                        Spacer(Modifier.height(18.dp))
                         Text(
                             radio.name,
                             color = MaterialTheme.colorScheme.onBackground,
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.SemiBold,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 18.dp),
                         )
+                        Spacer(Modifier.height(2.dp))
                         Text(
                             radio.description,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 18.dp),
                         )
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(10.dp))
                         LiveRadioBadge(isActive = sessionSongs.isNotEmpty())
-                        Spacer(Modifier.height(18.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Button(
-                                onClick = onEnterRadio,
-                                enabled = !isGenerating,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(52.dp),
-                            ) {
-                                if (isGenerating) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(18.dp),
-                                        strokeWidth = 2.dp,
-                                        color = MaterialTheme.colorScheme.onPrimary,
-                                    )
-                                } else {
-                                    Icon(Icons.Filled.PlayArrow, contentDescription = null)
-                                }
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (isGenerating) "Criando..." else "Entrar")
-                            }
+                        // Radios fixas (Surprise Me/Radio recente/Musicas Curtidas, pedido do
+                        // usuario 22/09/2026) nao podem ser removidas/ocultadas - deleteRadio
+                        // chamaria hideRadio() nelas, mas radiosFrom nao filtra mais as fixas
+                        // por hiddenRadioKeys (ver comentario la), entao "remover" nunca
+                        // faria efeito nenhum e ainda mostraria um toast enganoso de sucesso.
+                        val secondaryActions = buildList {
                             if (radio.isCustom) {
-                                IconButton(
-                                    onClick = { showAddSource = true },
-                                    modifier = Modifier
-                                        .size(52.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Add,
-                                        contentDescription = "Adicionar artista ou álbum a esta rádio",
-                                        tint = MaterialTheme.colorScheme.onBackground,
-                                    )
-                                }
+                                add(Triple(Icons.Filled.Add, "Adicionar artista ou álbum a esta rádio") { showAddSource = true })
                             }
                             if (canManageSources) {
-                                IconButton(
-                                    onClick = { showManageSources = true },
-                                    modifier = Modifier
-                                        .size(52.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Remove,
-                                        contentDescription = "Remover artista ou álbum desta rádio",
-                                        tint = MaterialTheme.colorScheme.onBackground,
-                                    )
-                                }
+                                add(Triple(Icons.Filled.Remove, "Remover artista ou álbum desta rádio") { showManageSources = true })
                             }
                             if (canRename) {
-                                IconButton(
-                                    onClick = { showRenameDialog = true },
-                                    modifier = Modifier
-                                        .size(52.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Edit,
-                                        contentDescription = "Renomear rádio",
-                                        tint = MaterialTheme.colorScheme.onBackground,
-                                    )
-                                }
+                                add(Triple(Icons.Filled.Edit, "Renomear rádio") { showRenameDialog = true })
                             }
-                            // Radios fixas (Surprise Me/Radio recente/Musicas Curtidas, pedido do
-                            // usuario 22/09/2026) nao podem ser removidas/ocultadas - deleteRadio
-                            // chamaria hideRadio() nelas, mas radiosFrom nao filtra mais as fixas
-                            // por hiddenRadioKeys (ver comentario la), entao "remover" nunca
-                            // faria efeito nenhum e ainda mostraria um toast enganoso de sucesso.
                             if (!radio.isPinned) {
-                                IconButton(
-                                    onClick = { showDeleteConfirm = true },
-                                    modifier = Modifier
-                                        .size(52.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(PailerCharcoal.copy(alpha = 0.6f)),
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Delete,
-                                        contentDescription = "Remover radio",
-                                        tint = MaterialTheme.colorScheme.onBackground,
-                                    )
+                                add(Triple(Icons.Filled.Delete, "Remover radio") { showDeleteConfirm = true })
+                            }
+                        }
+                        if (secondaryActions.isNotEmpty()) {
+                            Spacer(Modifier.height(16.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 18.dp),
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                            ) {
+                                secondaryActions.forEach { (icon, description, onClick) ->
+                                    IconButton(
+                                        onClick = onClick,
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape)
+                                            .background(PailerCharcoal.copy(alpha = 0.55f)),
+                                    ) {
+                                        Icon(
+                                            icon,
+                                            contentDescription = description,
+                                            tint = MaterialTheme.colorScheme.onBackground,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                    }
                                 }
                             }
                         }
+                        // "Entrar" por ultimo, fechando o card (pedido do usuario 24/09/2026).
+                        Spacer(Modifier.height(18.dp))
+                        Button(
+                            onClick = onEnterRadio,
+                            enabled = !isGenerating,
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .padding(horizontal = 18.dp)
+                                .fillMaxWidth()
+                                .height(44.dp),
+                        ) {
+                            if (isGenerating) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                            } else {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (isGenerating) "Criando..." else "Entrar", fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
@@ -6446,16 +6471,8 @@ private fun RadioDetailScreen(
                     RadioNewsBreakCard()
                 }
             }
-        } else {
-            item {
-                Text(
-                    "Toque em Entrar para criar uma sequencia nova agora.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(horizontal = 4.dp),
-                )
-            }
         }
+    }
     }
 
     if (showDeleteConfirm) {
@@ -7153,7 +7170,13 @@ private fun RadioAlbumMockupScene(
                         callout = player.currentNewsCallout,
                         selectedReaction = player.currentNewsReaction,
                         onReact = LocalOnRadioNewsReaction.current,
-                        modifier = Modifier.fillMaxWidth(),
+                        // "bem mais pra baixo" (pedido do usuario 24/09/2026: tampava parte
+                        // importante da cena) - desce pra dentro do padding de 100dp do rodape
+                        // desta Column, por cima da barra de progresso (musica pausada durante o
+                        // boletim, a barra nao diz nada nessa hora).
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .offset(y = 84.dp),
                     )
                 }
                 sequencer.showProfilePhotoBoard -> {
@@ -7231,12 +7254,16 @@ private val RadioNewsTagRed = Color(0xFFC62828)
 // passar o callback por LibraryShell -> telas da radio/FullPlayer -> LiveNowRadioCard -> cena.
 private val LocalOnRadioNewsReaction = staticCompositionLocalOf<(String) -> Unit> { {} }
 
-// Ordem pedida pelo usuario: coracao > impressionado > chorando de rir > triste.
+// Ordem pedida pelo usuario: coracao > impressionado > chorando de rir > triste; bravo e
+// deslike entraram no fim em 24/09/2026 (o Worker precisa aceitar a chave - ver REACTIONS em
+// distribuicao-app/src/index.js).
 private val RadioNewsReactions = listOf(
     ListenerHeartbeat.REACTION_HEART to "❤️",
     ListenerHeartbeat.REACTION_WOW to "😮",
     ListenerHeartbeat.REACTION_LAUGH to "😂",
     ListenerHeartbeat.REACTION_SAD to "😢",
+    ListenerHeartbeat.REACTION_ANGRY to "😠",
+    ListenerHeartbeat.REACTION_DISLIKE to "👎",
 )
 
 @Composable
@@ -7272,15 +7299,17 @@ private fun RadioNewsLowerThird(
                 color = Color(0xFF141414),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
-                maxLines = 5,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color.White)
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             )
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Spacer(Modifier.height(8.dp))
+            // 6 reacoes desde 24/09/2026 - bolinhas menores (38dp) pra caber numa linha so e o
+            // bloco inteiro ocupar menos altura da cena.
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 RadioNewsReactions.forEach { (key, emoji) ->
                     val selected = key == selectedReaction
                     val scale by animateFloatAsState(
@@ -7291,7 +7320,7 @@ private fun RadioNewsLowerThird(
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .size(44.dp)
+                            .size(38.dp)
                             .scale(scale)
                             .clip(CircleShape)
                             .background(
@@ -7304,7 +7333,7 @@ private fun RadioNewsLowerThird(
                             )
                             .clickable { onReact(key) },
                     ) {
-                        Text(emoji, fontSize = 22.sp)
+                        Text(emoji, fontSize = 19.sp)
                     }
                 }
             }
@@ -7464,7 +7493,8 @@ private const val RadioChorusSkyScale = 1.08f
 // Volume do efeito sonoro da vitrola por cima da musica (pedido do usuario 22/09/2026) - baixo o
 // bastante pra ficar so como camada de ambiente, nunca competir com a musica que continua tocando
 // no player de verdade (esse e um player extra so pra esse som, ver vitrolaSfxPlayer).
-private const val RadioVitrolaSfxVolume = 0.7f
+// 24/09/2026: usuario pediu mais alto - 0.7 -> 1.0 aqui e o proprio arquivo ganhou +8 dB.
+private const val RadioVitrolaSfxVolume = 1.0f
 
 // Um "pedaco" do ciclo normal: capa em loop 2x + 1 ou 2 cenas de ambiente aleatorias (pedido do
 // usuario 18/09/2026: "não precisa aparecer todos os takes em sequência de uma vez... em ordem
@@ -9302,9 +9332,28 @@ private fun loadEmbeddedArtworkBatch(context: Context, songs: List<LocalSong>): 
 // largura real desenhada nunca cresce com a quantidade de capas - o indice "infinito"
 // (Int.MAX_VALUE itens) com `% covers.size` da a volta pras mesmas capas indefinidamente, e um
 // scroll continuo por frame (em vez de Modifier.offset animado) avanca a lista pra sempre.
+// reverse/phase (pedido do usuario 24/09/2026): a tela da radio usa 2 fileiras coladas, uma
+// rolando pra esquerda e outra pra direita - phase desloca a ordem das capas da 2a fileira pra
+// ela nao repetir a 1a coluna por coluna.
 @Composable
-private fun RadioCoverTicker(songs: List<LocalSong>, modifier: Modifier = Modifier) {
-    val covers = remember(songs) { songs.distinctBy { it.albumId }.filter { it.albumId > 0 } }
+private fun RadioCoverTicker(
+    songs: List<LocalSong>,
+    modifier: Modifier = Modifier,
+    reverse: Boolean = false,
+    phase: Int = 0,
+    itemSize: androidx.compose.ui.unit.Dp = 156.dp,
+    spacing: androidx.compose.ui.unit.Dp = 3.dp,
+    cornerRadius: androidx.compose.ui.unit.Dp = 8.dp,
+) {
+    val covers = remember(songs, phase) {
+        val distinct = songs.distinctBy { it.albumId }.filter { it.albumId > 0 }
+        if (distinct.isEmpty()) {
+            distinct
+        } else {
+            val shift = phase % distinct.size
+            distinct.drop(shift) + distinct.take(shift)
+        }
+    }
     if (covers.isEmpty()) return
     val context = LocalContext.current
     var images by remember(covers) {
@@ -9313,8 +9362,6 @@ private fun RadioCoverTicker(songs: List<LocalSong>, modifier: Modifier = Modifi
     LaunchedEffect(covers) {
         images = withContext(Dispatchers.IO) { loadEmbeddedArtworkBatch(context, covers) }
     }
-    val itemSize = 156.dp
-    val spacing = 3.dp
     val density = LocalDensity.current
     val startIndex = remember(covers) {
         val half = Int.MAX_VALUE / 2
@@ -9322,7 +9369,8 @@ private fun RadioCoverTicker(songs: List<LocalSong>, modifier: Modifier = Modifi
     }
     val listState = rememberLazyListState(initialFirstVisibleItemIndex = startIndex)
     LaunchedEffect(listState) {
-        val pxPerSecond = with(density) { 28.dp.toPx() }
+        // 12dp/s (era 28) - usuario achou rapido demais, "da uma tontura" (24/09/2026).
+        val pxPerSecond = with(density) { 12.dp.toPx() } * if (reverse) -1f else 1f
         listState.scroll(MutatePriority.PreventUserInput) {
             var lastFrameNanos = 0L
             while (true) {
@@ -9350,7 +9398,7 @@ private fun RadioCoverTicker(songs: List<LocalSong>, modifier: Modifier = Modifi
             val bitmap = images.getOrNull(coverIndex)
             val tileModifier = Modifier
                 .size(itemSize)
-                .clip(RoundedCornerShape(8.dp))
+                .clip(RoundedCornerShape(cornerRadius))
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap,
@@ -9374,7 +9422,7 @@ private fun RadioNameTicker(names: List<String>, modifier: Modifier = Modifier) 
     if (names.isEmpty()) return
     val segment = remember(names) { names.joinToString("   •   ") + "   •   " }
     var segmentWidthPx by remember(names) { mutableStateOf(0) }
-    val speedDpPerSecond = 55f
+    val speedDpPerSecond = 30f // era 55 - mais calmo junto com as capas (24/09/2026)
     val density = LocalDensity.current
     val durationMillis = remember(segmentWidthPx, density) {
         if (segmentWidthPx <= 0) {
