@@ -3060,7 +3060,7 @@ private fun BackupSettingsPanel(
 
         if (state.hasDestination) {
             Text(
-                "Backup automatico ativo",
+                "Backup automatico ativo (00h e 12h)",
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,

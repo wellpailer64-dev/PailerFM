@@ -22,8 +22,9 @@ import java.util.UUID
 // - MusicPlaybackService: toda vez que play/pause muda e a cada HEARTBEAT_INTERVAL_MS tocando -
 //   e o servico (nao o ViewModel) porque ele continua vivo com a musica tocando mesmo depois de
 //   o usuario tirar o app da tela de recentes.
-// - LocalTuneViewModel: na abertura do app e ao salvar o perfil (conta como "app aberto" mesmo
-//   sem nada tocando).
+// - MainActivity: toda vez que o app volta pra frente e a cada HEARTBEAT_INTERVAL_MS com a tela
+//   visivel (conta como "app aberto" mesmo sem nada tocando).
+// - LocalTuneViewModel: ao terminar o onboarding e ao salvar o perfil (manda o nome novo na hora).
 //
 // install_id e um UUID aleatorio gerado aqui no primeiro envio - nao e ID do aparelho, some se o
 // app for desinstalado. A foto de perfil NAO e enviada, so se existe ou nao.

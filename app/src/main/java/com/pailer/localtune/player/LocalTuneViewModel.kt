@@ -842,9 +842,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         connectToPlaybackService()
-        // "App aberto" no painel de ouvintes - o resto dos sinais vem do MusicPlaybackService.
-        // Primeiro uso espera o onboarding terminar (finishOnboarding) pra ja chegar com nome.
-        if (!needsOnboarding.value) ListenerHeartbeat.send(application)
+        // "App aberto" no painel de ouvintes agora sai do MainActivity (onStart + repeticao
+        // enquanto a tela esta aberta) - o resto dos sinais vem do MusicPlaybackService.
+        runCatchUpBackupIfStale()
         runCatching {
             CastContext.getSharedInstance(application).sessionManager
                 .addSessionManagerListener(castSessionManagerListener, CastSession::class.java)
@@ -1509,7 +1509,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         // Pasta oficial vira a fonte do backup automaticamente (ver BackupRepository -
         // prioriza a pasta sobre um arquivo manual escolhido antes) - agenda e faz o primeiro
         // backup na hora, mesmo esquema de chooseBackupDestination abaixo.
-        BackupScheduler.scheduleNextMidnight(getApplication())
+        BackupScheduler.scheduleNext(getApplication())
         backupState.value = backupState.value.copy(isWorking = true, message = null)
         viewModelScope.launch {
             val ok = backupRepository.performBackup()
@@ -1544,7 +1544,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun chooseBackupDestination(uri: Uri) {
         backupRepository.saveBackupDestination(uri)
-        BackupScheduler.scheduleNextMidnight(getApplication())
+        BackupScheduler.scheduleNext(getApplication())
         backupState.value = backupState.value.copy(isWorking = true, message = null)
         viewModelScope.launch {
             val ok = backupRepository.performBackup()
@@ -1569,6 +1569,16 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 isWorking = false,
                 message = if (ok) "Backup atualizado agora." else "Nao consegui salvar o backup.",
             )
+        }
+    }
+
+    // Backup de recuperacao na abertura do app quando o alarme das 00h/12h nao rodou (ver
+    // BackupScheduler.isBackupStale) - silencioso, so atualiza o "Ultimo backup" da tela.
+    private fun runCatchUpBackupIfStale() {
+        if (!BackupScheduler.isBackupStale(getApplication())) return
+        viewModelScope.launch {
+            backupRepository.performBackup()
+            backupState.value = backupState.value.copy(lastBackupAtMillis = backupRepository.lastBackupAt())
         }
     }
 

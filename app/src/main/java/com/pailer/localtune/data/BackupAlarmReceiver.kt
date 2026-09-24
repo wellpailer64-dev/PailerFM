@@ -7,14 +7,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-// Recebe tanto o alarme diario (ACTION_DAILY_BACKUP, disparado por BackupScheduler) quanto
+// Recebe tanto o alarme das 00h/12h (ACTION_DAILY_BACKUP, disparado por BackupScheduler) quanto
 // BOOT_COMPLETED (o sistema apaga alarmes agendados no reboot - sem reagendar aqui, o backup
-// automatico parava de rodar silenciosamente no primeiro reboot do aparelho).
+// automatico parava de rodar silenciosamente no primeiro reboot do aparelho). No boot tambem faz
+// o backup de recuperacao se o ultimo ficou velho demais (aparelho desligado na hora do alarme).
 class BackupAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val appContext = context.applicationContext
-        BackupScheduler.scheduleNextMidnightIfConfigured(appContext)
-        if (intent.action != ACTION_DAILY_BACKUP) return
+        BackupScheduler.scheduleNextIfConfigured(appContext)
+        if (intent.action != ACTION_DAILY_BACKUP && !BackupScheduler.isBackupStale(appContext)) return
 
         // BroadcastReceiver.onReceive roda na main thread e o processo pode ser morto assim que
         // ele retornar - goAsync() segura o processo vivo o suficiente pra I/O (escrever o
