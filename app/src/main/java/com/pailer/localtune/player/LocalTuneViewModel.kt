@@ -19,6 +19,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.mediarouter.media.MediaRouteSelector
@@ -134,7 +135,11 @@ data class PlayerUiState(
     val playbackSource: String = "",
     val activeRadioName: String = "",
     val currentNewsHeadline: String = "",
-    val upcomingTracks: List<String> = emptyList(),
+    // true quando a musica atual vai terminar num boletim (ver checkForEarlyNewsBreak) - a cena
+    // da radio usa isso pra NAO tocar a troca de disco antes do boletim, so depois dele (pedido
+    // do usuario 24/09/2026: boletim -> take de cima em loop -> fran arrumando a vitrola -> capa).
+    val bulletinBreakUpcoming: Boolean = false,
+    val upcomingTracks: List<UpcomingTrack> = emptyList(),
     val isPlaying: Boolean = false,
     val isRadioMuted: Boolean = false,
     val autoplayEnabled: Boolean = true,
@@ -148,7 +153,29 @@ data class PlayerUiState(
     // Aviso "voce ainda esta ai?" do timer de inatividade da radio (ver armSleepTimer/
     // triggerSleepCheck em LocalTuneViewModel) - true mostra o dialogo em LocalTuneApp.kt.
     val sleepCheckPending: Boolean = false,
+    // Som de ambiencia tocando em loop por baixo da musica da radio (pedido do usuario
+    // 24/09/2026 - botao "Ambiencia" nos controles da radio). null = nenhum; volume 0..1 e o
+    // volume da camada de ambiencia, independente do volume da musica.
+    val activeAmbience: RadioAmbience? = null,
+    val ambienceVolume: Float = DEFAULT_AMBIENCE_VOLUME,
 )
+
+// Sons de ambiencia da radio (res/raw, trechos de 2min processados na pasta Ambiencia) - a ordem
+// aqui e a ordem do popup.
+enum class RadioAmbience(val rawRes: Int) {
+    Rain(com.pailer.localtune.R.raw.ambience_rain),
+    Fan(com.pailer.localtune.R.raw.ambience_fan),
+    Fireplace(com.pailer.localtune.R.raw.ambience_fireplace),
+    BrownNoise(com.pailer.localtune.R.raw.ambience_brown_noise),
+    Bus(com.pailer.localtune.R.raw.ambience_bus),
+    Sea(com.pailer.localtune.R.raw.ambience_sea),
+}
+
+const val DEFAULT_AMBIENCE_VOLUME = 0.5f
+
+// Item do "A seguir". albumTrackNumber = numero oficial da faixa no album (mesma numeracao da tela
+// do album) - null fora de album (radio), onde a lista numera so a ordem 01, 02, 03...
+data class UpcomingTrack(val label: String, val albumTrackNumber: Int? = null)
 
 // Um unico botao/seletor pra "transmitir pra TV" (ver HeaderCastButton em LocalTuneApp.kt) que
 // lista os dois tipos de dispositivo juntos - Google Cast (Chromecast/Google TV) e UPnP/DLNA
@@ -385,6 +412,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private val updateCheckRepository = UpdateCheckRepository(application)
     private val lyricsRepository = LyricsRepository(application)
     private val historyPrefs = application.getSharedPreferences("playback_history", Context.MODE_PRIVATE)
+    private var ambienceVolume = historyPrefs.getFloat(KEY_AMBIENCE_VOLUME, DEFAULT_AMBIENCE_VOLUME)
     private val favoritePrefs = application.getSharedPreferences("favorites", Context.MODE_PRIVATE)
     private val radioPrefs = application.getSharedPreferences("radio_bulletins", Context.MODE_PRIVATE)
     private val profilePrefs = application.getSharedPreferences("user_profile", Context.MODE_PRIVATE)
@@ -446,6 +474,10 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     // vinheta/passagem/boletim) - ver radioVolume()/toggleRadioMute(). Reseta sozinho em
     // startRadioNewsMode() (cada sessao nova comeca sem mute).
     private var radioMuted = false
+    // ExoPlayer proprio (nao o MediaController da musica) - sem audio focus de proposito, pra
+    // tocar POR CIMA da musica sem pausar ela.
+    private var ambiencePlayer: ExoPlayer? = null
+    private var activeAmbience: RadioAmbience? = null
     // "Reproducao automatica" (botao ao lado da legenda na Home, pedido do usuario 15/09/2026,
     // imitando o autoplay do Youtube) - ligado por padrao. So atua fora do modo radio (a radio ja
     // tem sua propria continuacao via vinhetas/boletins) e so dispara quando a fila ACABA sozinha
@@ -518,7 +550,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var pendingDeleteSongs: List<LocalSong> = emptyList()
     private var contentBuildGeneration = 0
     private var lastUpcomingQueueKey = ""
-    private var cachedUpcomingTracks: List<String> = emptyList()
+    private var cachedUpcomingTracks: List<UpcomingTrack> = emptyList()
     private var bulletinPrepJob: Job? = null
     // Buffer UNICO de boletins prontos (roteiro ja decorado + WAV ja sintetizado, se a voz
     // local/Gemini estiver ativa) - ver refillBulletinBuffer()/ADR-019. Roda o tempo todo,
@@ -2698,7 +2730,45 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         val target = radioVolume()
         controller?.volume = target
         announcementPlayer?.setVolume(target, target)
+        applyAmbienceVolume()
         controller?.let { updatePlayerState(it) }
+    }
+
+    // Liga a ambiencia escolhida (ou desliga, se ja era ela) - so dentro de uma radio.
+    fun toggleAmbience(ambience: RadioAmbience) {
+        if (activeRadioName.isBlank()) return
+        if (activeAmbience == ambience) {
+            stopAmbience()
+        } else {
+            val player = ambiencePlayer ?: ExoPlayer.Builder(getApplication()).build().also {
+                it.repeatMode = Player.REPEAT_MODE_ONE
+                ambiencePlayer = it
+            }
+            val uri = Uri.parse("android.resource://${getApplication<Application>().packageName}/${ambience.rawRes}")
+            player.setMediaItem(MediaItem.fromUri(uri))
+            player.prepare()
+            player.playWhenReady = true
+            activeAmbience = ambience
+            applyAmbienceVolume()
+        }
+        controller?.let { updatePlayerState(it) }
+    }
+
+    fun setAmbienceVolume(volume: Float) {
+        ambienceVolume = volume.coerceIn(0f, 1f)
+        historyPrefs.edit().putFloat(KEY_AMBIENCE_VOLUME, ambienceVolume).apply()
+        applyAmbienceVolume()
+        controller?.let { updatePlayerState(it) }
+    }
+
+    private fun applyAmbienceVolume() {
+        ambiencePlayer?.volume = if (radioMuted) 0f else ambienceVolume
+    }
+
+    private fun stopAmbience() {
+        ambiencePlayer?.release()
+        ambiencePlayer = null
+        activeAmbience = null
     }
 
     // Botao de deslike do mini player em modo radio (pedido do usuario 11/09/2026): faixas que
@@ -2873,6 +2943,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = ""
+        stopAmbience()
         cancelSleepTimer()
         announcementPlayer?.release()
         announcementPlayer = null
@@ -3994,6 +4065,11 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             playbackSource = playbackSource,
             activeRadioName = activeRadioName,
             currentNewsHeadline = currentNewsHeadline,
+            bulletinBreakUpcoming = radioNewsEnabled && !speakingNews && (
+                newsBreakFadeInProgress ||
+                    (completedRadioSongs + 1) %
+                    radioBulletinState.value.settings.songsBetweenBulletins.coerceAtLeast(1) == 0
+                ),
             upcomingTracks = cachedUpcomingTracks,
             isPlaying = player.isPlaying,
             isRadioMuted = radioMuted,
@@ -4006,18 +4082,44 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             queueIndex = player.currentMediaItemIndex + 1,
             queueSize = player.mediaItemCount,
             sleepCheckPending = sleepCheckPending,
+            activeAmbience = activeAmbience,
+            ambienceVolume = ambienceVolume,
         )
     }
 
-    private fun Player.upcomingTracks(): List<String> =
-        ((currentMediaItemIndex + 1) until mediaItemCount)
+    // Numero oficial da faixa (pedido do usuario 24/09/2026): antes o "A seguir" numerava pela
+    // posicao na fila, entao tocar a 3a faixa de um album fazia a 4a aparecer como "01".
+    private fun Player.upcomingTracks(): List<UpcomingTrack> {
+        val inRadio = activeRadioName.isNotBlank()
+        return ((currentMediaItemIndex + 1) until mediaItemCount)
             .take(5)
             .mapNotNull { index ->
-                val metadata = getMediaItemAt(index).mediaMetadata
+                val item = getMediaItemAt(index)
+                val metadata = item.mediaMetadata
                 val title = metadata.title?.toString().orEmpty()
                 val artist = metadata.artist?.toString().orEmpty()
-                if (title.isBlank()) null else "$title${artist.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}"
+                if (title.isBlank()) {
+                    null
+                } else {
+                    UpcomingTrack(
+                        label = "$title${artist.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}",
+                        albumTrackNumber = if (inRadio) null else item.mediaId.toLongOrNull()?.let(::albumTrackNumber),
+                    )
+                }
             }
+    }
+
+    // Posicao 1-based da faixa dentro do album, com a mesma ordenacao de albumsFrom - mesma conta
+    // de AlbumDetailScreen, entao a numeracao bate nas duas telas.
+    fun albumTrackNumber(songId: Long): Int? {
+        val song = libraryState.value.songs.firstOrNull { it.id == songId } ?: return null
+        return libraryState.value.songs
+            .filter { it.albumId == song.albumId && it.album == song.album }
+            .sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
+            .indexOfFirst { it.id == songId }
+            .takeIf { it >= 0 }
+            ?.plus(1)
+    }
 
     private fun recordCurrentSong(player: Player) {
         val mediaId = player.currentMediaItem?.mediaId ?: return
@@ -4150,6 +4252,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         announcementPlayer?.release()
         announcementLoudnessEnhancer?.release()
         previewPlayer?.release()
+        ambiencePlayer?.release()
         controller = null
         super.onCleared()
     }
@@ -4158,6 +4261,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_HISTORY_IDS = "history_ids"
         const val KEY_LAST_SONG_ID = "last_song_id"
         const val KEY_LAST_POSITION_MS = "last_position_ms"
+        const val KEY_AMBIENCE_VOLUME = "ambience_volume"
         const val KEY_FAVORITE_ALBUMS = "favorite_album_keys"
         const val KEY_FAVORITE_SONGS = "favorite_song_ids"
         const val KEY_FAVORITE_ARTISTS = "favorite_artist_keys"

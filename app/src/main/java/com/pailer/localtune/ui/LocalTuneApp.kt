@@ -126,6 +126,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DirectionsBus
+import androidx.compose.material.icons.filled.Air
+import androidx.compose.material.icons.filled.VolumeDown
+import androidx.compose.material.icons.filled.Waves
+import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ArrowBack
@@ -294,6 +299,8 @@ import com.pailer.localtune.player.AppFolderUiState
 import com.pailer.localtune.player.BackupUiState
 import com.pailer.localtune.player.MetadataUiState
 import com.pailer.localtune.player.PlayerUiState
+import com.pailer.localtune.player.RadioAmbience
+import com.pailer.localtune.player.UpcomingTrack
 import com.pailer.localtune.player.RadioBulletinUiState
 import com.pailer.localtune.player.ListeningStatsUiState
 import com.pailer.localtune.player.UpdateUiState
@@ -895,6 +902,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                 nearEnd = radioMockupNearEnd,
                 discSwapImminent = radioMockupDiscSwapImminent,
                 isBulletinPlaying = player.currentNewsHeadline.isNotBlank(),
+                bulletinBreakUpcoming = player.bulletinBreakUpcoming,
                 hasProfilePhoto = player.profilePhotoUri != null,
                 chorusWindowRange = radioMockupChorusWindowRange,
                 scrim = radioMockupScrim,
@@ -1142,6 +1150,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         isFavorite = viewModel.isCurrentSongFavorite(),
                         onToggleFavorite = viewModel::toggleCurrentSongFavorite,
                         onToggleMute = viewModel::toggleRadioMute,
+                        onToggleAmbience = viewModel::toggleAmbience,
+                        onAmbienceVolumeChange = viewModel::setAmbienceVolume,
                         onExitRadio = {
                             viewModel.stopRadio()
                             radioSession = emptyList()
@@ -4009,6 +4019,11 @@ private fun HomeScreen(
         if (liveQueue.isNotEmpty()) {
             liveQueue
         } else {
+            val albumNumbers = homePlaybackContent?.album
+                ?.takeIf { it.isNotBlank() }
+                ?.let { album -> songs.filter { it.album == album } }
+                .orEmpty()
+                .sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
             val currentId = homePlaybackContent?.songId
             val sameAlbum = homePlaybackContent?.album
                 ?.takeIf { it.isNotBlank() }
@@ -4022,7 +4037,10 @@ private fun HomeScreen(
             }
             val fallbackSongs = sameArtist.ifEmpty { homeListenAgain.filter { it.id != currentId } }
             fallbackSongs.take(4).map { song ->
-                listOf(song.title, song.artist).filter { it.isNotBlank() }.joinToString(" - ")
+                UpcomingTrack(
+                    label = listOf(song.title, song.artist).filter { it.isNotBlank() }.joinToString(" - "),
+                    albumTrackNumber = albumNumbers.indexOfFirst { it.id == song.id }.takeIf { it >= 0 }?.plus(1),
+                )
             }
         }
     }
@@ -6143,6 +6161,8 @@ private fun RadioDetailScreen(
     isFavorite: Boolean = false,
     onToggleFavorite: () -> Unit = {},
     onToggleMute: () -> Unit = {},
+    onToggleAmbience: (RadioAmbience) -> Unit = {},
+    onAmbienceVolumeChange: (Float) -> Unit = {},
     onExitRadio: () -> Unit = {},
     onDislike: () -> Unit = {},
     onDeleteRadio: () -> Unit = {},
@@ -6209,6 +6229,8 @@ private fun RadioDetailScreen(
                     onDislike = onDislike,
                     onToggleFavorite = onToggleFavorite,
                     onToggleMute = onToggleMute,
+                    onToggleAmbience = onToggleAmbience,
+                    onAmbienceVolumeChange = onAmbienceVolumeChange,
                     onExitRadio = onExitRadio,
                     modifier = Modifier.padding(horizontal = 18.dp),
                 )
@@ -6460,9 +6482,12 @@ private fun RadioSessionControls(
     onDislike: () -> Unit,
     onToggleFavorite: () -> Unit,
     onToggleMute: () -> Unit,
+    onToggleAmbience: (RadioAmbience) -> Unit,
+    onAmbienceVolumeChange: (Float) -> Unit,
     onExitRadio: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var showAmbienceMenu by remember { mutableStateOf(false) }
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -6491,6 +6516,14 @@ private fun RadioSessionControls(
             contentDescription = if (player.isRadioMuted) "Ativar som" else "Mutar",
             onClick = onToggleMute,
         )
+        // Ambiencia (pedido do usuario 24/09/2026): abre o popup de sons de fundo; verde
+        // enquanto algum som de ambiencia estiver tocando.
+        RadioControlButton(
+            painter = painterResource(R.drawable.ic_ambience_rain),
+            contentDescription = "Ambiencia",
+            tint = if (player.activeAmbience != null) RadioAmbienceActiveGreen else Color.White.copy(alpha = 0.9f),
+            onClick = { showAmbienceMenu = true },
+        )
         RadioControlButton(
             icon = Icons.Filled.PowerSettingsNew,
             contentDescription = "Desligar radio",
@@ -6498,13 +6531,154 @@ private fun RadioSessionControls(
             onClick = onExitRadio,
         )
     }
+
+    if (showAmbienceMenu) {
+        RadioAmbienceDialog(
+            activeAmbience = player.activeAmbience,
+            volume = player.ambienceVolume,
+            onToggleAmbience = onToggleAmbience,
+            onVolumeChange = onAmbienceVolumeChange,
+            onDismiss = { showAmbienceMenu = false },
+        )
+    }
+}
+
+private val RadioAmbienceActiveGreen = Color(0xFF4CD37A)
+
+private val RadioAmbience.label: String
+    get() = when (this) {
+        RadioAmbience.Rain -> "Chuva"
+        RadioAmbience.Fan -> "Ventilador"
+        RadioAmbience.Fireplace -> "Lareira"
+        RadioAmbience.BrownNoise -> "Ruído marrom"
+        RadioAmbience.Bus -> "Ônibus"
+        RadioAmbience.Sea -> "Mar"
+    }
+
+@Composable
+private fun RadioAmbienceIcon(ambience: RadioAmbience, tint: Color, size: androidx.compose.ui.unit.Dp) {
+    val modifier = Modifier.size(size)
+    when (ambience) {
+        RadioAmbience.Rain -> Icon(painterResource(R.drawable.ic_ambience_rain), null, modifier, tint)
+        RadioAmbience.Fan -> Icon(Icons.Filled.Air, null, modifier, tint)
+        RadioAmbience.Fireplace -> Icon(Icons.Filled.LocalFireDepartment, null, modifier, tint)
+        RadioAmbience.BrownNoise -> Icon(Icons.Filled.GraphicEq, null, modifier, tint)
+        RadioAmbience.Bus -> Icon(Icons.Filled.DirectionsBus, null, modifier, tint)
+        RadioAmbience.Sea -> Icon(Icons.Filled.Waves, null, modifier, tint)
+    }
 }
 
 @Composable
+private fun RadioAmbienceDialog(
+    activeAmbience: RadioAmbience?,
+    volume: Float,
+    onToggleAmbience: (RadioAmbience) -> Unit,
+    onVolumeChange: (Float) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .background(PailerSurface)
+                .padding(20.dp),
+        ) {
+            Text(
+                "Ambiencia",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+            Spacer(Modifier.height(16.dp))
+            // Uma ambiencia por vez - tocar em outra troca o som, tocar na ativa desliga.
+            RadioAmbience.entries.chunked(3).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                ) {
+                    row.forEach { ambience ->
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                            RadioAmbienceOption(
+                                label = ambience.label,
+                                active = activeAmbience == ambience,
+                                onClick = { onToggleAmbience(ambience) },
+                            ) { tint -> RadioAmbienceIcon(ambience, tint, 28.dp) }
+                        }
+                    }
+                    repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.VolumeDown,
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = 0.7f),
+                    modifier = Modifier.size(20.dp),
+                )
+                Slider(
+                    value = volume,
+                    onValueChange = onVolumeChange,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                )
+                Icon(
+                    Icons.Filled.VolumeUp,
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = 0.7f),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            Text(
+                "Volume da ambiencia",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RadioAmbienceOption(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    icon: @Composable (tint: Color) -> Unit,
+) {
+    val tint = if (active) RadioAmbienceActiveGreen else Color.White.copy(alpha = 0.9f)
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            modifier = Modifier
+                .size(58.dp)
+                .clip(CircleShape)
+                .background(
+                    if (active) RadioAmbienceActiveGreen.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.24f),
+                )
+                .border(
+                    width = 1.5.dp,
+                    color = if (active) RadioAmbienceActiveGreen else Color.Transparent,
+                    shape = CircleShape,
+                )
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            icon(tint)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = tint,
+        )
+    }
+}
+
+// 42dp/22dp (eram 48/26) - encolhidos pra caber o 5o botao (ambiencia) na mesma linha.
+@Composable
 private fun RadioControlButton(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
     contentDescription: String,
     modifier: Modifier = Modifier,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    painter: androidx.compose.ui.graphics.painter.Painter? = null,
     tint: Color = Color.White.copy(alpha = 0.9f),
     enabled: Boolean = true,
     onClick: () -> Unit,
@@ -6513,16 +6687,16 @@ private fun RadioControlButton(
         onClick = onClick,
         enabled = enabled,
         modifier = modifier
-            .size(48.dp)
+            .size(42.dp)
             .clip(CircleShape)
             .background(Color.Black.copy(alpha = if (enabled) 0.24f else 0.12f)),
     ) {
-        Icon(
-            icon,
-            contentDescription = contentDescription,
-            tint = if (enabled) tint else Color.White.copy(alpha = 0.32f),
-            modifier = Modifier.size(26.dp),
-        )
+        val iconTint = if (enabled) tint else Color.White.copy(alpha = 0.32f)
+        if (painter != null) {
+            Icon(painter, contentDescription = contentDescription, tint = iconTint, modifier = Modifier.size(22.dp))
+        } else if (icon != null) {
+            Icon(icon, contentDescription = contentDescription, tint = iconTint, modifier = Modifier.size(22.dp))
+        }
     }
 }
 
@@ -7229,6 +7403,7 @@ private fun rememberRadioMockupSequencer(
     nearEnd: Boolean,
     discSwapImminent: Boolean,
     isBulletinPlaying: Boolean,
+    bulletinBreakUpcoming: Boolean,
     // true quando o usuario tem foto de perfil salva (UserProfileUiState.photoUri) - so entao o
     // take "quadro de fotos" entra no pool de cenas de ambiente (pedido do usuario 19/09/2026:
     // "esse take só aparece se tiver foto lá"). Muda o pool pra frente (proxima extensao da fila),
@@ -7476,14 +7651,33 @@ private fun rememberRadioMockupSequencer(
     // um loop que NAO reinicia a cada recomposicao (evita reiniciar o timer de hold no meio).
     val currentSongId = rememberUpdatedState(songId)
     val currentDiscSwapImminent = rememberUpdatedState(discSwapImminent)
+    val currentBulletinPlaying = rememberUpdatedState(isBulletinPlaying)
+    val currentBulletinBreakUpcoming = rememberUpdatedState(bulletinBreakUpcoming)
     LaunchedEffect(exoPlayer, environmentPool, coverItem, trocandoDiscoItem) {
         var lastSongId = currentSongId.value
+        var wasBulletinPlaying = currentBulletinPlaying.value
         while (isActive) {
-            if (!isFirstSetup) {
+            val bulletinNow = currentBulletinPlaying.value
+            val bulletinJustEnded = wasBulletinPlaying && !bulletinNow
+            wasBulletinPlaying = bulletinNow
+            if (bulletinNow) {
+                // Boletim no ar: a cena e do take de cima em loop (efeito do boletim abaixo) - a
+                // musica esta pausada nos ultimos segundos, entao discSwapImminent fica true o
+                // boletim inteiro; sem esse guard a troca de disco disparava de novo em loop por
+                // cima do take de cima.
+                lastSongId = currentSongId.value
+            } else if (!isFirstSetup) {
                 val songChanged = currentSongId.value != lastSongId
-                if (currentDiscSwapImminent.value || songChanged) {
+                // Pedido do usuario 24/09/2026: boletim -> take de cima -> fran arrumando a
+                // vitrola -> capa. Musica que termina em boletim NAO troca o disco antes dele
+                // (bulletinBreakUpcoming), so quando o boletim acaba (bulletinJustEnded).
+                val swapBeforeEnd = currentDiscSwapImminent.value && !currentBulletinBreakUpcoming.value
+                if (bulletinJustEnded || swapBeforeEnd || songChanged) {
                     lastSongId = currentSongId.value
-                    discoActiveForSong = null
+                    // Saindo do boletim, a musica antiga ainda esta "perto do fim" ate o
+                    // seekToNextMediaItem chegar - marca ela como ja encerrada pra o efeito do
+                    // disco final nao disparar por cima da troca de disco.
+                    discoActiveForSong = if (bulletinJustEnded) currentSongId.value else null
                     // dynamicCycleEnabled = false enquanto isso pra o watcher de extensao nao
                     // mexer na fila de item unico do trocando-disco.
                     dynamicCycleEnabled = false
@@ -7509,12 +7703,16 @@ private fun rememberRadioMockupSequencer(
                         },
                     )
                     delay(RadioDiscSwapHoldMs)
-                    scrim.transition(
-                        sourceMediaId = trocandoDiscoItem.mediaId,
-                        destMediaId = coverItem.mediaId,
-                        fadeFamily = fadeFamilyMediaIds,
-                        onBlack = startFreshCycle,
-                    )
+                    // Boletim entrou no meio da troca (buffer atrasou o flag de "boletim vindo")
+                    // - o take de cima ja assumiu, nao volta pra capa por cima dele.
+                    if (!currentBulletinPlaying.value) {
+                        scrim.transition(
+                            sourceMediaId = trocandoDiscoItem.mediaId,
+                            destMediaId = coverItem.mediaId,
+                            fadeFamily = fadeFamilyMediaIds,
+                            onBlack = startFreshCycle,
+                        )
+                    }
                     lastSongId = currentSongId.value
                 }
             }
@@ -7546,15 +7744,15 @@ private fun rememberRadioMockupSequencer(
     }
 
     // Boletim ao vivo (pedido do usuario 18/09/2026): enquanto toca, trava so no take de cima em
-    // loop, sem capa. Quando termina, volta pro ciclo normal a partir da capa/disco - SEM a
-    // transicao de trocar o disco (a musica nao mudou de verdade nesse caso raro, so pausou pro
-    // boletim) - o efeito de songId acima ja cobre o caso comum (o boletim quase sempre entrega
-    // numa musica nova).
+    // loop, sem capa. Quando termina, entra a fran arrumando a vitrola e depois a capa (pedido do
+    // usuario 24/09/2026).
     LaunchedEffect(exoPlayer, isBulletinPlaying, takeDeCimaItem, environmentPool, coverItem) {
         if (!hasHandledBulletinOnce) {
             hasHandledBulletinOnce = true
             if (!isBulletinPlaying) return@LaunchedEffect
         }
+        // A SAIDA do boletim (fran arrumando a vitrola -> capa) fica no loop de troca de disco
+        // acima (bulletinJustEnded), que tambem absorve o songId mudando logo em seguida.
         if (isBulletinPlaying) {
             dynamicCycleEnabled = false
             scrim.transition(
@@ -7567,14 +7765,6 @@ private fun rememberRadioMockupSequencer(
                     exoPlayer.prepare()
                     exoPlayer.playWhenReady = true
                 },
-            )
-        } else {
-            discoActiveForSong = null
-            scrim.transition(
-                sourceMediaId = takeDeCimaItem.mediaId,
-                destMediaId = coverItem.mediaId,
-                fadeFamily = fadeFamilyMediaIds,
-                onBlack = startFreshCycle,
             )
         }
     }
@@ -10603,7 +10793,7 @@ private fun AlbumSongsSection(
         )
         otherSongs.forEach { song ->
             AlbumTrackRow(
-                trackNumber = song.trackNumber.takeIf { it > 0 } ?: (songs.indexOf(song) + 1),
+                trackNumber = songs.indexOf(song) + 1,
                 song = song,
                 isFavorite = isFavorite(song),
                 onClick = { onSongClick(song) },
@@ -10651,7 +10841,7 @@ private fun LiveSourceLabel(text: String, isLive: Boolean, modifier: Modifier = 
 // usuario 15/09/2026: fonte pequena e cards estreitos, so pra preencher o vao ate o fim da tela
 // sem competir visualmente com o card do disco em cima.
 @Composable
-private fun HomeUpNextPreview(upcomingTracks: List<String>, modifier: Modifier = Modifier) {
+private fun HomeUpNextPreview(upcomingTracks: List<UpcomingTrack>, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -10673,14 +10863,14 @@ private fun HomeUpNextPreview(upcomingTracks: List<String>, modifier: Modifier =
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    (index + 1).toString().padStart(2, '0'),
+                    (track.albumTrackNumber ?: (index + 1)).toString().padStart(2, '0'),
                     color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.width(20.dp),
                 )
                 Text(
-                    track,
+                    track.label,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelSmall,
                     maxLines = 1,
@@ -10692,7 +10882,7 @@ private fun HomeUpNextPreview(upcomingTracks: List<String>, modifier: Modifier =
 }
 
 @Composable
-private fun RadioUpcomingQueue(upcomingTracks: List<String>) {
+private fun RadioUpcomingQueue(upcomingTracks: List<UpcomingTrack>) {
     if (upcomingTracks.isEmpty()) return
     Spacer(Modifier.height(22.dp))
     Column(
@@ -10712,14 +10902,14 @@ private fun RadioUpcomingQueue(upcomingTracks: List<String>) {
         upcomingTracks.take(5).forEachIndexed { index, track ->
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    (index + 1).toString().padStart(2, '0'),
+                    (track.albumTrackNumber ?: (index + 1)).toString().padStart(2, '0'),
                     modifier = Modifier.width(28.dp),
                     color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    track,
+                    track.label,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
