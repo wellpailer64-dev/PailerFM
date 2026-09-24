@@ -42,6 +42,8 @@ import com.pailer.localtune.data.feedBulletinId
 import com.pailer.localtune.data.newsCallout
 import com.pailer.localtune.data.newsCategoryLabel
 import com.pailer.localtune.data.AlbumMetadataEdit
+import com.pailer.localtune.data.AlbumKind
+import com.pailer.localtune.data.ResolvedUserPlaylist
 import com.pailer.localtune.data.AppFolderRepository
 import com.pailer.localtune.data.ListenerHeartbeat
 import com.pailer.localtune.data.ArtistNewsCard
@@ -110,6 +112,7 @@ data class LibraryContentUiState(
     val listenAgain: List<LocalSong> = emptyList(),
     val suggestedAlbums: List<LocalAlbum> = emptyList(),
     val favoriteAlbums: List<LocalAlbum> = emptyList(),
+    val userPlaylists: List<ResolvedUserPlaylist> = emptyList(),
     val continueSong: LocalSong? = null,
     val isBuilding: Boolean = false,
 )
@@ -1167,6 +1170,12 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             val genreRadiosList = repository.allGenreRadios(visibleSongs)
             val radiosList = repository.radiosFrom(visibleSongs, precomputedGenreRadios = genreRadiosList)
             val availableGenresList = repository.availableGenres(visibleSongs)
+            val artistsByKey = artistsList.associateBy { it.key }
+            val albumsByKey = albums.associateBy { it.key }
+            val genresByName = genreRadiosList.associateBy { it.name }
+            val userPlaylistsList = repository.userPlaylists().map { playlist ->
+                repository.resolveUserPlaylist(playlist, songsById, artistsByKey, albumsByKey, genresByName)
+            }
             val content = LibraryContentUiState(
                 songs = visibleSongs,
                 albums = albums,
@@ -1185,6 +1194,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                 favoriteAlbums = albums
                     .filter { it.key in state.favoriteAlbumKeys }
                     .sortedBy { it.title.lowercase() },
+                userPlaylists = userPlaylistsList,
                 continueSong = visibleSongs.firstOrNull { it.id == state.lastSongId }
                     ?: historyIds.firstNotNullOfOrNull { id -> songsById[id] },
                 isBuilding = false,
@@ -1439,6 +1449,45 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun isAlbumHidden(album: LocalAlbum): Boolean = album.key in repository.hiddenAlbumKeys()
+
+    // Playlists montadas pelo usuario (ver UserPlaylist) - chamadas direto do clique, na main
+    // thread (showToast quebra fora dela).
+    fun createUserPlaylist(name: String, sources: List<String>): String {
+        val playlist = repository.createUserPlaylist(name, sources)
+        rebuildLibraryContent()
+        showToast("Playlist \"${playlist.name}\" criada.")
+        return playlist.id
+    }
+
+    fun addToUserPlaylist(id: String, sources: List<String>) {
+        if (sources.isEmpty()) return
+        repository.addSourcesToUserPlaylist(id, sources)
+        rebuildLibraryContent()
+    }
+
+    fun removeSongFromUserPlaylist(id: String, song: LocalSong) {
+        repository.removeSongFromUserPlaylist(id, song.id)
+        rebuildLibraryContent()
+    }
+
+    fun renameUserPlaylist(id: String, name: String) {
+        repository.renameUserPlaylist(id, name)
+        rebuildLibraryContent()
+    }
+
+    fun deleteUserPlaylist(id: String, name: String) {
+        repository.deleteUserPlaylist(id)
+        rebuildLibraryContent()
+        showToast("Playlist \"$name\" excluída.")
+    }
+
+    // null = volta pra deteccao automatica.
+    fun setAlbumKind(album: LocalAlbum, kind: AlbumKind?) {
+        repository.setAlbumKindOverride(album, kind)
+        rebuildLibraryContent()
+        val resulting = kind ?: album.autoKind
+        showToast("\"${album.title}\" agora é ${resulting.label}${if (kind == null) " (automático)" else ""}.")
+    }
 
     fun hideAlbum(album: LocalAlbum) {
         repository.hideAlbum(album)

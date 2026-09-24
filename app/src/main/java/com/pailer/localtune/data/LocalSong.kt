@@ -52,6 +52,13 @@ data class LocalAlbum(
     val artist: String,
     val artworkUri: Uri?,
     val songs: List<LocalSong>,
+    // Tipo escolhido a mao pelo usuario (null = automatico, ver autoKind) - ver
+    // MusicLibraryRepository.setAlbumKindOverride.
+    val kindOverride: AlbumKind? = null,
+    // Total de faixas do lancamento lido da tag do arquivo ("3/12" -> 12), 0 = desconhecido.
+    // So preenchido pros candidatos a EP/single (ver albumKindNeedsTrackTotal) - o MediaStore
+    // guarda so o numero da faixa e descarta o total.
+    val trackTotal: Int = 0,
 ) {
     // So id+title (sem o artist agregado) - albumsFrom ja agrupa por "$albumId:$album", entao
     // esse par ja identifica o album sozinho. Incluir o artist aqui quebrava ocultar/favoritar
@@ -70,6 +77,75 @@ data class LocalAlbum(
     // pra todas as faixas mesmo elas tendo capas embutidas diferentes de verdade no arquivo.
     // Usado pra decidir mosaico (em vez de 1 capa so) e extracao por-faixa via MediaMetadataRetriever.
     val isVariousArtists: Boolean = songs.map { it.artist }.distinct().size > 1
+
+    val autoKind: AlbumKind = detectAlbumKind(title, songs, isVariousArtists, trackTotal)
+    val kind: AlbumKind = kindOverride ?: autoKind
+
+    // Pasta tratada como PLAYLIST (ex.: baixada de uma playlist do YouTube) em vez de album:
+    // aparece na secao "Playlists" da Biblioteca (fora de "Albuns"), mostra a capa embutida de
+    // cada faixa em vez de uma capa unica, e a radio criada a partir dela toca embaralhada.
+    val isPlaylist: Boolean = kind == AlbumKind.Playlist
+}
+
+enum class AlbumKind(val label: String) {
+    Album("Álbum"),
+    EP("EP"),
+    Single("Single"),
+    Playlist("Playlist"),
+}
+
+// Deteccao automatica do tipo (pedido do usuario 24/09/2026). Ordem importa:
+// 1. Varios artistas -> Playlist SEMPRE primeiro: faixa solta dentro de pasta de playlist nunca
+//    pode virar "single" (cada faixa ali e de um artista/lancamento diferente).
+// 2. Marcacao explicita no nome ("... - Single", "... EP", "(E.P.)").
+// 3. Total de faixas da tag (trackTotal): ate 3 = Single, 4 a 6 = EP, mais que isso = Album -
+//    mesmo que a pasta so tenha parte das faixas.
+// 4. Sem total na tag, fica conservador: a pasta pode ser um album INCOMPLETO (testado na
+//    biblioteca real 24/09/2026: "Heathen Chemistry" so com as faixas 1-6 virava EP, "Kid A" com 1
+//    faixa virava single). Entao so vira Single quando o nome do album e igual ao de uma das
+//    faixas (jeito tipico de single vir tageado) e nunca vira EP sem marcacao/total.
+// Na duvida fica Album; o usuario corrige pelo menu (Tipo).
+private val SINGLE_MARKER = Regex("""(?i)[\s(\[-]single[)\]]?\s*$""")
+private val EP_MARKER = Regex("""(?:^|[\s(\[-])(EP|E\.P\.|ep)[)\]]?\s*$""")
+private const val SHORT_RELEASE_MAX_MS = 30 * 60 * 1000L
+
+private fun normalizeReleaseTitle(value: String): String =
+    value.lowercase()
+        .replace(Regex("""\(.*?\)|\[.*?]"""), " ")
+        .replace(Regex("""\s(feat\.?|ft\.?)\s.*$"""), " ")
+        .replace(Regex("""[^\p{L}\p{N}]+"""), " ")
+        .trim()
+
+// So vale a pena ler o total de faixas do arquivo (MediaMetadataRetriever, caro) quando o
+// resultado pode mudar o tipo: album curto de um artista so, sem marcacao no nome.
+internal fun albumKindNeedsTrackTotal(title: String, songs: List<LocalSong>): Boolean =
+    songs.isNotEmpty() &&
+        songs.size <= 6 &&
+        songs.map { it.artist }.distinct().size == 1 &&
+        !SINGLE_MARKER.containsMatchIn(title) &&
+        !EP_MARKER.containsMatchIn(title)
+
+internal fun detectAlbumKind(
+    title: String,
+    songs: List<LocalSong>,
+    isVariousArtists: Boolean,
+    trackTotal: Int = 0,
+): AlbumKind {
+    if (isVariousArtists) return AlbumKind.Playlist
+    if (SINGLE_MARKER.containsMatchIn(title)) return AlbumKind.Single
+    if (EP_MARKER.containsMatchIn(title)) return AlbumKind.EP
+    if (songs.isEmpty()) return AlbumKind.Album
+    if (trackTotal > 0) {
+        return when {
+            trackTotal <= 3 -> AlbumKind.Single
+            trackTotal <= 6 -> AlbumKind.EP
+            else -> AlbumKind.Album
+        }
+    }
+    if (songs.size > 3 || songs.sumOf { it.durationMs } >= SHORT_RELEASE_MAX_MS) return AlbumKind.Album
+    val albumName = normalizeReleaseTitle(title)
+    val titleMatchesTrack = albumName.isNotBlank() && songs.any { normalizeReleaseTitle(it.title) == albumName }
+    return if (titleMatchesTrack) AlbumKind.Single else AlbumKind.Album
 }
 
 data class LocalArtist(
@@ -150,3 +226,23 @@ data class LocalRadio(
     // do resto, independente de ordenacao alfabetica/uso).
     val isPinned: Boolean = false,
 )
+
+// Playlist montada pelo usuario (Biblioteca > Playlists > "Nova playlist", pedido 24/09/2026).
+// Guarda FONTES, nao so faixas: "song:<id>", "artist:<LocalArtist.key>", "album:<LocalAlbum.key>"
+// (album, EP ou single), "genre:<nome da categoria>". Artista/album/categoria sao resolvidos toda
+// vez (ver MusicLibraryRepository.resolveUserPlaylist), entao musica nova daquele artista entra
+// sozinha. Tirar uma faixa que veio de artista/album/categoria vai pra excludedSongIds.
+data class UserPlaylist(
+    val id: String,
+    val name: String,
+    val sources: List<String>,
+    val excludedSongIds: Set<Long> = emptySet(),
+)
+
+data class ResolvedUserPlaylist(
+    val playlist: UserPlaylist,
+    val songs: List<LocalSong>,
+) {
+    val id: String get() = playlist.id
+    val name: String get() = playlist.name
+}

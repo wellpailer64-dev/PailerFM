@@ -4,6 +4,7 @@ import android.app.PendingIntent
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -264,8 +265,8 @@ class MusicLibraryRepository(private val context: Context) {
             }
             .sortedBy { it.name.lowercase() }
 
-    fun albumsFrom(songs: List<LocalSong>): List<LocalAlbum> =
-        songs.groupBy { "${it.albumId}:${it.album}" }
+    fun albumsFrom(songs: List<LocalSong>): List<LocalAlbum> {
+        return songs.groupBy { "${it.albumId}:${it.album}" }
             .map { (_, albumSongs) ->
                 val sortedSongs = albumSongs.sortedWith(compareBy<LocalSong> { it.trackNumber }.thenBy { it.title.lowercase() })
                 val first = sortedSongs.first()
@@ -275,9 +276,59 @@ class MusicLibraryRepository(private val context: Context) {
                     artist = sortedSongs.map { it.artist }.distinct().take(2).joinToString(),
                     artworkUri = first.artworkUri,
                     songs = sortedSongs,
+                    kindOverride = albumKindOverride("${first.albumId}:${first.album}"),
+                    trackTotal = if (albumKindNeedsTrackTotal(first.album, sortedSongs)) {
+                        trackTotalFor("${first.albumId}:${first.album}", sortedSongs.first())
+                    } else {
+                        0
+                    },
                 )
             }
             .sortedBy { it.title.lowercase() }
+    }
+
+    // Tipo escolhido a mao no menu do album (Biblioteca > segurar o album > "Tipo") - null
+    // volta pra deteccao automatica (ver detectAlbumKind em LocalSong.kt).
+    private fun albumKindOverride(albumKey: String): AlbumKind? =
+        metadataPrefs.getString(albumKindOverrideKey(albumKey), null)
+            ?.let { name -> AlbumKind.entries.firstOrNull { it.name == name } }
+
+    fun setAlbumKindOverride(album: LocalAlbum, kind: AlbumKind?) {
+        metadataPrefs.edit().apply {
+            if (kind == null) remove(albumKindOverrideKey(album.key)) else putString(albumKindOverrideKey(album.key), kind.name)
+        }.apply()
+    }
+
+    private fun albumKindOverrideKey(albumKey: String): String = "album_kind:$albumKey"
+
+    // Total de faixas ("3/12" na tag de numero da faixa) lido 1 vez por album candidato a
+    // EP/single e guardado (memoria + prefs) - a leitura abre o arquivo, entao so roda na
+    // primeira montagem da biblioteca depois do album aparecer. 0 = tag sem total.
+    private val trackTotalCache = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    private fun trackTotalFor(albumKey: String, song: LocalSong): Int {
+        trackTotalCache[albumKey]?.let { return it }
+        val prefKey = "track_total:$albumKey"
+        if (metadataPrefs.contains(prefKey)) {
+            return metadataPrefs.getInt(prefKey, 0).also { trackTotalCache[albumKey] = it }
+        }
+        val total = runCatching {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, song.contentUri)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
+                    ?.substringAfter('/', "")
+                    ?.trim()
+                    ?.toIntOrNull()
+                    ?: 0
+            } finally {
+                retriever.release()
+            }
+        }.getOrDefault(0)
+        trackTotalCache[albumKey] = total
+        metadataPrefs.edit().putInt(prefKey, total).apply()
+        return total
+    }
 
     fun radiosFrom(songs: List<LocalSong>, precomputedGenreRadios: List<LocalRadio>? = null): List<LocalRadio> {
         if (songs.isEmpty()) return emptyList()
@@ -477,6 +528,100 @@ class MusicLibraryRepository(private val context: Context) {
 
     fun sourceIdForAlbum(album: LocalAlbum): String = "album:${album.id}"
     fun sourceIdForArtist(artist: LocalArtist): String = "artist:${artist.key}"
+
+    fun userPlaylists(): List<UserPlaylist> {
+        val json = metadataPrefs.getString(KEY_USER_PLAYLISTS, null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(json)
+            (0 until array.length()).mapNotNull { index ->
+                val obj = array.optJSONObject(index) ?: return@mapNotNull null
+                val id = obj.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val sources = obj.optJSONArray("sources")
+                val excluded = obj.optJSONArray("excluded")
+                UserPlaylist(
+                    id = id,
+                    name = obj.optString("name"),
+                    sources = if (sources == null) emptyList() else {
+                        (0 until sources.length()).mapNotNull { sources.optString(it).takeIf(String::isNotBlank) }
+                    },
+                    excludedSongIds = if (excluded == null) emptySet() else {
+                        (0 until excluded.length()).mapTo(mutableSetOf()) { excluded.optLong(it) }
+                    },
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveUserPlaylists(playlists: List<UserPlaylist>) {
+        val array = JSONArray()
+        playlists.forEach { playlist ->
+            array.put(
+                JSONObject()
+                    .put("id", playlist.id)
+                    .put("name", playlist.name)
+                    .put("sources", JSONArray().apply { playlist.sources.forEach { put(it) } })
+                    .put("excluded", JSONArray().apply { playlist.excludedSongIds.forEach { put(it) } })
+            )
+        }
+        metadataPrefs.edit().putString(KEY_USER_PLAYLISTS, array.toString()).apply()
+    }
+
+    private fun updateUserPlaylist(id: String, transform: (UserPlaylist) -> UserPlaylist?) {
+        saveUserPlaylists(userPlaylists().mapNotNull { if (it.id == id) transform(it) else it })
+    }
+
+    fun createUserPlaylist(name: String, sources: List<String>): UserPlaylist {
+        val playlist = UserPlaylist(id = "up_${System.currentTimeMillis()}", name = name.trim(), sources = sources.distinct())
+        saveUserPlaylists(userPlaylists() + playlist)
+        return playlist
+    }
+
+    fun addSourcesToUserPlaylist(id: String, sources: List<String>) = updateUserPlaylist(id) { playlist ->
+        // Readicionar uma faixa que tinha sido tirada (excludedSongIds) tambem a traz de volta.
+        val readdedSongIds = sources.filter { it.startsWith("song:") }
+            .mapNotNull { it.removePrefix("song:").toLongOrNull() }
+            .toSet()
+        playlist.copy(
+            sources = (playlist.sources + sources).distinct(),
+            excludedSongIds = playlist.excludedSongIds - readdedSongIds,
+        )
+    }
+
+    fun removeSongFromUserPlaylist(id: String, songId: Long) = updateUserPlaylist(id) { playlist ->
+        playlist.copy(
+            sources = playlist.sources - "song:$songId",
+            excludedSongIds = playlist.excludedSongIds + songId,
+        )
+    }
+
+    fun renameUserPlaylist(id: String, name: String) = updateUserPlaylist(id) { it.copy(name = name.trim()) }
+
+    fun deleteUserPlaylist(id: String) = updateUserPlaylist(id) { null }
+
+    // Fontes na ordem em que foram adicionadas; album em ordem de faixa, artista/categoria na
+    // ordem ja usada pelas telas deles. Faixa repetida (ex.: veio pelo artista E pelo album) so
+    // entra na primeira vez.
+    fun resolveUserPlaylist(
+        playlist: UserPlaylist,
+        songsById: Map<Long, LocalSong>,
+        artistsByKey: Map<String, LocalArtist>,
+        albumsByKey: Map<String, LocalAlbum>,
+        genresByName: Map<String, LocalRadio>,
+    ): ResolvedUserPlaylist {
+        val resolved = playlist.sources.flatMap { source ->
+            val value = source.substringAfter(':')
+            when (source.substringBefore(':')) {
+                "song" -> listOfNotNull(value.toLongOrNull()?.let { songsById[it] })
+                "artist" -> artistsByKey[value]?.songs.orEmpty()
+                "album" -> albumsByKey[value]?.songs.orEmpty()
+                "genre" -> genresByName[value]?.songs.orEmpty()
+                else -> emptyList()
+            }
+        }
+            .distinctBy { it.id }
+            .filterNot { it.id in playlist.excludedSongIds }
+        return ResolvedUserPlaylist(playlist, resolved)
+    }
 
     fun customRadioDefinitions(): List<CustomRadioDefinition> {
         val json = metadataPrefs.getString(KEY_CUSTOM_RADIOS, null) ?: return emptyList()
@@ -687,8 +832,9 @@ class MusicLibraryRepository(private val context: Context) {
         // radio de categoria - "ordem de album" ou "so esse artista sem diversidade" deixam de
         // fazer sentido quando ha mais de uma fonte.
         if (radio.isCustom && !radio.hasMultipleSources && radio.customId?.startsWith("album:") == true) {
-            val isVariousArtists = radio.songs.map { it.artist }.distinct().size > 1
-            if (!isVariousArtists) return radio.songs
+            // Playlist (deteccao automatica de varios artistas ou marcada a mao - ver
+            // LocalAlbum.isPlaylist) embaralha; album de verdade toca em ordem de faixa.
+            if (albumsFrom(radio.songs).none { it.isPlaylist }) return radio.songs
             return shuffledRadioSession(radio)
         }
         if (radio.isCustom && !radio.hasMultipleSources && radio.customId?.startsWith("artist:") == true) {
@@ -1961,6 +2107,7 @@ class MusicLibraryRepository(private val context: Context) {
         const val KEY_HIDDEN_RADIOS = "hidden_radio_keys"
         const val KEY_HIDDEN_ARTISTS = "hidden_artist_keys"
         const val KEY_HIDDEN_ALBUMS = "hidden_album_keys"
+        const val KEY_USER_PLAYLISTS = "user_playlists"
         const val KEY_RADIO_DISLIKED_SONGS = "radio_disliked_song_ids"
         const val KEY_RADIO_PLAY_THROUGH_COUNTS = "radio_play_through_counts"
         // Mesma chave de KEY_FAVORITE_SONGS em LocalTuneViewModel - ver comentario em

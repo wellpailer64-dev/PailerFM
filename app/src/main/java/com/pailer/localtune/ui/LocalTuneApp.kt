@@ -196,6 +196,10 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.RadioButton
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -282,6 +286,8 @@ import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
 import com.pailer.localtune.data.DuplicateArtistGroup
 import com.pailer.localtune.data.LocalAlbum
+import com.pailer.localtune.data.AlbumKind
+import com.pailer.localtune.data.ResolvedUserPlaylist
 import com.pailer.localtune.data.LocalArtist
 import com.pailer.localtune.data.LocalRadio
 import com.pailer.localtune.data.LocalSong
@@ -344,7 +350,10 @@ private enum class MainTab(val label: String) {
     Library("Biblioteca"),
 }
 
+// Playlists em primeiro (pedido do usuario 24/09/2026) - e tambem a secao padrao ao abrir a
+// Biblioteca e a secao pra onde o "voltar" retorna (LibrarySection.entries.first()).
 private enum class LibrarySection(val label: String) {
+    Playlists("Playlists"),
     Artists("Artistas"),
     Albums("Álbuns"),
     Songs("Músicas"),
@@ -488,7 +497,11 @@ private fun PermissionGate(onGrant: () -> Unit) {
 @Composable
 private fun LibraryShell(viewModel: LocalTuneViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(MainTab.Home) }
-    var librarySection by rememberSaveable { mutableStateOf(LibrarySection.Artists) }
+    var librarySection by rememberSaveable { mutableStateOf(LibrarySection.entries.first()) }
+    var selectedUserPlaylistId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showCreatePlaylist by remember { mutableStateOf(false) }
+    var showAddToUserPlaylist by remember { mutableStateOf(false) }
+    var albumKindTarget by remember { mutableStateOf<LocalAlbum?>(null) }
     var showFullPlayer by rememberSaveable { mutableStateOf(false) }
     var showTrackEditor by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
@@ -528,6 +541,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // mas preservar quando volta pra mesma (ex.: abriu um album de dentro do artista e voltou).
     val artistsScrollState = rememberLazyGridState()
     val albumsScrollState = rememberLazyGridState()
+    val playlistsScrollState = rememberLazyGridState()
     val songsListState = rememberLazyGridState()
     val genresListState = rememberLazyGridState()
     val radiosListState = rememberLazyGridState()
@@ -743,6 +757,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val radioBulletins = viewModel.radioBulletinState.value
     val songs = content.songs
     val albums = content.albums
+    // Pastas tratadas como playlist (LocalAlbum.isPlaylist) saem da secao Albuns e ganham a
+    // propria secao "Playlists" na Biblioteca (pedido do usuario 24/09/2026).
+    val regularAlbums = remember(albums) { albums.filterNot { it.isPlaylist } }
+    val playlistAlbums = remember(albums) { albums.filter { it.isPlaylist } }
+    val userPlaylists = content.userPlaylists
+    val openedUserPlaylist = selectedUserPlaylistId?.let { id -> userPlaylists.firstOrNull { it.id == id } }
     val artists = content.artists
     val radios = content.radios
     val genreRadios = content.genreRadios
@@ -799,7 +819,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     // precisar da normalizacao de primaryArtistKey que so existe dentro do repository).
     val openedAlbumOtherAlbums = remember(selectedAlbum) {
         val current = selectedAlbum
-        if (current == null || current.isVariousArtists) {
+        if (current == null || current.isPlaylist) {
             emptyList()
         } else {
             viewModel.albums(songs.filter { it.artist == current.artist }).filterNot { it.key == current.key }
@@ -812,6 +832,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         showSettings ||
         showNewsDrawer ||
         selectedAlbum != null ||
+        selectedUserPlaylistId != null ||
         selectedArtist != null ||
         selectedRadio != null ||
         selectedGenre != null ||
@@ -836,6 +857,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             }
             showNewsDrawer -> showNewsDrawer = false
             selectedAlbum != null -> selectedAlbum = null
+            selectedUserPlaylistId != null -> selectedUserPlaylistId = null
             selectedRadio != null -> selectedRadio = null
             selectedArtist != null -> selectedArtist = null
             selectedGenre != null -> selectedGenre = null
@@ -843,8 +865,8 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             // Dentro da Biblioteca com um filtro diferente do padrao, o back volta o filtro pro
             // padrao primeiro (mesma logica de "fechar 1 nivel por vez" dos casos acima) antes de
             // sair pra Inicio no proximo back.
-            selectedTab == MainTab.Library && librarySection != LibrarySection.Artists ->
-                librarySection = LibrarySection.Artists
+            selectedTab == MainTab.Library && librarySection != LibrarySection.entries.first() ->
+                librarySection = LibrarySection.entries.first()
             selectedTab != MainTab.Home -> selectedTab = MainTab.Home
         }
     }
@@ -1097,6 +1119,25 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         onOpenAlbum = { selectedAlbum = it },
                         onAutoFetchMetadata = { viewModel.maybeAutoTagAlbumMetadata(openedAlbum) },
                     )
+                    openedUserPlaylist != null -> UserPlaylistDetailScreen(
+                        playlist = openedUserPlaylist,
+                        isSongFavorite = viewModel::isSongFavorite,
+                        onToggleSongFavorite = viewModel::toggleSongFavorite,
+                        currentlyPlayingSongId = player.songId,
+                        onPlay = { index ->
+                            viewModel.playSongs(openedUserPlaylist.songs, index, source = "Playlist ${openedUserPlaylist.name}")
+                        },
+                        onShuffle = {
+                            viewModel.playSongs(openedUserPlaylist.songs, shuffle = true, source = "Playlist ${openedUserPlaylist.name}")
+                        },
+                        onAdd = { showAddToUserPlaylist = true },
+                        onRename = { viewModel.renameUserPlaylist(openedUserPlaylist.id, it) },
+                        onDelete = {
+                            selectedUserPlaylistId = null
+                            viewModel.deleteUserPlaylist(openedUserPlaylist.id, openedUserPlaylist.name)
+                        },
+                        onRemoveSong = { viewModel.removeSongFromUserPlaylist(openedUserPlaylist.id, it) },
+                    )
                     openedArtist != null -> ArtistDetailScreen(
                         artist = openedArtist,
                         albums = openedArtistAlbums,
@@ -1281,8 +1322,12 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                             initialPage = librarySection.ordinal,
                             pageCount = { LibrarySection.entries.size },
                         )
-                        LaunchedEffect(libraryPagerState.currentPage) {
-                            librarySection = LibrarySection.entries[libraryPagerState.currentPage]
+                        // settledPage (nao currentPage): tocar numa pilula 2+ secoes longe passa
+                        // pelas intermediarias no meio da animacao, e currentPage reescrevia
+                        // librarySection com a do meio, cancelando a animacao e deixando o pager
+                        // parado entre 2 paginas (visto ao adicionar a 5a secao, Playlists).
+                        LaunchedEffect(libraryPagerState.settledPage) {
+                            librarySection = LibrarySection.entries[libraryPagerState.settledPage]
                         }
                         LaunchedEffect(librarySection) {
                             if (libraryPagerState.currentPage != librarySection.ordinal) {
@@ -1292,6 +1337,9 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                         HorizontalPager(
                             state = libraryPagerState,
                             modifier = Modifier.fillMaxSize(),
+                            // Topo, nao centro (padrao do pager) - secao com poucos itens ficava
+                            // flutuando no meio da tela (pedido do usuario 24/09/2026).
+                            verticalAlignment = Alignment.Top,
                         ) { page ->
                             when (LibrarySection.entries[page]) {
                                 LibrarySection.Artists -> ArtistsScreen(
@@ -1302,10 +1350,19 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                                     scrollState = artistsScrollState,
                                 )
                                 LibrarySection.Albums -> AlbumsScreen(
-                                    albums = albums,
+                                    albums = regularAlbums,
                                     onOpenAlbum = { selectedAlbum = it },
                                     onLongPressAlbum = { albumActionsTarget = it },
                                     scrollState = albumsScrollState,
+                                )
+                                LibrarySection.Playlists -> PlaylistsLibraryScreen(
+                                    userPlaylists = userPlaylists,
+                                    folderPlaylists = playlistAlbums,
+                                    onCreatePlaylist = { showCreatePlaylist = true },
+                                    onOpenUserPlaylist = { selectedUserPlaylistId = it.id },
+                                    onOpenAlbum = { selectedAlbum = it },
+                                    onLongPressAlbum = { albumActionsTarget = it },
+                                    scrollState = playlistsScrollState,
                                 )
                                 LibrarySection.Songs -> SongsScreen(
                                     songs = songs,
@@ -1464,6 +1521,11 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
             LibraryItemActionsSheet(
                 title = album.title,
                 subtitle = album.artist,
+                kindLabel = "Tipo: ${album.kind.label}${if (album.kindOverride == null) " (automático)" else ""}",
+                onChangeKind = {
+                    albumActionsTarget = null
+                    albumKindTarget = album
+                },
                 isFavorite = viewModel.isAlbumFavorite(album),
                 onOpen = {
                     albumActionsTarget = null
@@ -1479,6 +1541,48 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
                     pendingDeleteAlbum = album
                 },
                 onDismiss = { albumActionsTarget = null },
+            )
+        }
+        albumKindTarget?.let { album ->
+            AlbumKindDialog(
+                album = album,
+                onSelect = { kind ->
+                    albumKindTarget = null
+                    viewModel.setAlbumKind(album, kind)
+                },
+                onDismiss = { albumKindTarget = null },
+            )
+        }
+        if (showCreatePlaylist) {
+            PlaylistSourcePickerDialog(
+                title = "Nova playlist",
+                askName = true,
+                confirmLabel = "Criar",
+                songs = songs,
+                artists = artists,
+                albums = albums,
+                genres = genreRadios,
+                onConfirm = { name, sources ->
+                    showCreatePlaylist = false
+                    selectedUserPlaylistId = viewModel.createUserPlaylist(name, sources)
+                },
+                onDismiss = { showCreatePlaylist = false },
+            )
+        }
+        if (showAddToUserPlaylist && openedUserPlaylist != null) {
+            PlaylistSourcePickerDialog(
+                title = "Adicionar a \"${openedUserPlaylist.name}\"",
+                askName = false,
+                confirmLabel = "Adicionar",
+                songs = songs,
+                artists = artists,
+                albums = albums,
+                genres = genreRadios,
+                onConfirm = { _, sources ->
+                    showAddToUserPlaylist = false
+                    viewModel.addToUserPlaylist(openedUserPlaylist.id, sources)
+                },
+                onDismiss = { showAddToUserPlaylist = false },
             )
         }
         artistActionsTarget?.let { artist ->
@@ -4472,6 +4576,7 @@ private fun ArtistsScreen(
     LazyVerticalGrid(
         columns = GridCells.Fixed(columns),
         state = scrollState,
+        modifier = Modifier.fillMaxSize(),
         flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(
             horizontal = if (isLandscape) 14.dp else 18.dp,
@@ -4759,19 +4864,31 @@ private fun ArtistDetailScreen(
                     }
                 }
             }
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                SectionTitle("Albuns")
-            }
-            gridItems(sortedAlbums, key = { it.key }) { album ->
-                AlbumGridCard(
-                    album = album,
-                    onClick = { onOpenAlbum(album) },
-                    subtitle = album.year.takeIf { it > 0 }?.toString(),
-                    // Nome um pouco menor e ano ainda menor (pedido do usuario 15/09/2026) - so
-                    // nesta tela, o grid geral (Biblioteca/Genero) mantem o tamanho padrao.
-                    titleStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                    subtitleStyle = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                )
+            // Separado por tipo (pedido do usuario 24/09/2026) - Albuns, EPs, Singles e Playlists
+            // em secoes proprias, cada uma so aparece se tiver algo.
+            listOf(
+                AlbumKind.Album to "Álbuns",
+                AlbumKind.EP to "EPs",
+                AlbumKind.Single to "Singles",
+                AlbumKind.Playlist to "Playlists",
+            ).forEach { (kind, sectionLabel) ->
+                val group = sortedAlbums.filter { it.kind == kind }
+                if (group.isNotEmpty()) {
+                    item(key = "section:${kind.name}", span = { GridItemSpan(maxLineSpan) }) {
+                        SectionTitle(sectionLabel)
+                    }
+                    gridItems(group, key = { it.key }) { album ->
+                        AlbumGridCard(
+                            album = album,
+                            onClick = { onOpenAlbum(album) },
+                            subtitle = album.year.takeIf { it > 0 }?.toString(),
+                            // Nome um pouco menor e ano ainda menor (pedido do usuario 15/09/2026) - so
+                            // nesta tela, o grid geral (Biblioteca/Genero) mantem o tamanho padrao.
+                            titleStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            subtitleStyle = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                        )
+                    }
+                }
             }
         }
 
@@ -5313,6 +5430,504 @@ private fun GenreTagField(
     }
 }
 
+// Selo "EP"/"SINGLE" no canto da capa (AlbumGridCard) - ver detectAlbumKind em LocalSong.kt.
+@Composable
+private fun AlbumKindBadge(kind: AlbumKind, modifier: Modifier = Modifier) {
+    Text(
+        kind.label.uppercase(),
+        modifier = modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(Color.Black.copy(alpha = 0.68f))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        color = Color.White,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 0.6.sp,
+    )
+}
+
+// "Tipo" no menu de segurar o album: automatico ou forcar Album/EP/Single/Playlist
+// (MusicLibraryRepository.setAlbumKindOverride).
+@Composable
+private fun AlbumKindDialog(
+    album: LocalAlbum,
+    onSelect: (AlbumKind?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val options: List<Pair<AlbumKind?, String>> =
+        listOf<Pair<AlbumKind?, String>>(null to "Automático (${album.autoKind.label})") +
+            AlbumKind.entries.map { it to it.label }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Tipo de \"${album.title}\"", maxLines = 2, overflow = TextOverflow.Ellipsis) },
+        text = {
+            Column {
+                options.forEach { (kind, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onSelect(kind) }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = album.kindOverride == kind, onClick = { onSelect(kind) })
+                        Spacer(Modifier.width(6.dp))
+                        Text(label, style = MaterialTheme.typography.bodyLarge)
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Playlists aparecem na aba Playlists com a capa de cada faixa. " +
+                        "EPs e singles ganham um selo e uma seção própria na página do artista.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Fechar") }
+        },
+    )
+}
+
+// Secao "Playlists" da Biblioteca (primeira, pedido do usuario 24/09/2026): botao de criar,
+// playlists montadas pelo usuario (UserPlaylist) e pastas detectadas/marcadas como playlist
+// (LocalAlbum.isPlaylist).
+@Composable
+private fun PlaylistsLibraryScreen(
+    userPlaylists: List<ResolvedUserPlaylist>,
+    folderPlaylists: List<LocalAlbum>,
+    onCreatePlaylist: () -> Unit,
+    onOpenUserPlaylist: (ResolvedUserPlaylist) -> Unit,
+    onOpenAlbum: (LocalAlbum) -> Unit,
+    onLongPressAlbum: (LocalAlbum) -> Unit,
+    scrollState: LazyGridState = rememberLazyGridState(),
+) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(if (isLandscape) 4 else 3),
+        state = scrollState,
+        modifier = Modifier.fillMaxSize(),
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(
+            horizontal = if (isLandscape) 14.dp else 18.dp,
+            vertical = if (isLandscape) 8.dp else 12.dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(if (isLandscape) 10.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 14.dp else 18.dp),
+    ) {
+        item(key = "create", span = { GridItemSpan(maxLineSpan) }) {
+            Button(
+                onClick = onCreatePlaylist,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Nova playlist")
+            }
+        }
+        if (userPlaylists.isNotEmpty()) {
+            item(key = "title:mine", span = { GridItemSpan(maxLineSpan) }) {
+                SectionTitle("Minhas playlists")
+            }
+            gridItems(userPlaylists, key = { "user:${it.id}" }) { playlist ->
+                UserPlaylistGridCard(playlist = playlist, onClick = { onOpenUserPlaylist(playlist) })
+            }
+        }
+        if (folderPlaylists.isNotEmpty()) {
+            item(key = "title:folders", span = { GridItemSpan(maxLineSpan) }) {
+                SectionTitle("Pastas de playlist")
+            }
+            gridItems(folderPlaylists, key = { it.key }) { album ->
+                AlbumGridCard(
+                    album = album,
+                    onClick = { onOpenAlbum(album) },
+                    onLongClick = { onLongPressAlbum(album) },
+                    compact = isLandscape,
+                )
+            }
+        }
+        if (userPlaylists.isEmpty() && folderPlaylists.isEmpty()) {
+            item(key = "empty", span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    "Nenhuma playlist ainda. Crie uma no botão acima. Pastas com vários artistas " +
+                        "(tipo playlist baixada do YouTube) aparecem aqui sozinhas.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(vertical = 24.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun UserPlaylistGridCard(playlist: ResolvedUserPlaylist, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick),
+    ) {
+        if (playlist.songs.isEmpty()) {
+            ArtworkPlaceholder(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                iconModifier = Modifier.size(38.dp),
+            )
+        } else {
+            AlbumCoverMosaic(
+                songs = playlist.songs,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+            )
+        }
+        Spacer(Modifier.height(7.dp))
+        Text(
+            playlist.name,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "${playlist.songs.size} faixas",
+            maxLines = 1,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
+}
+
+@Composable
+private fun UserPlaylistDetailScreen(
+    playlist: ResolvedUserPlaylist,
+    isSongFavorite: (LocalSong) -> Boolean,
+    onToggleSongFavorite: (LocalSong) -> Unit,
+    currentlyPlayingSongId: Long?,
+    onPlay: (Int) -> Unit,
+    onShuffle: () -> Unit,
+    onAdd: () -> Unit,
+    onRename: (String) -> Unit,
+    onDelete: () -> Unit,
+    onRemoveSong: (LocalSong) -> Unit,
+) {
+    var showRename by rememberSaveable(playlist.id) { mutableStateOf(false) }
+    var showDeleteConfirm by rememberSaveable(playlist.id) { mutableStateOf(false) }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        flingBehavior = rememberSoftFlingBehavior(),
+        contentPadding = PaddingValues(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.72f)
+                        .aspectRatio(1f),
+                ) {
+                    if (playlist.songs.isEmpty()) {
+                        ArtworkPlaceholder(modifier = Modifier.fillMaxSize(), iconModifier = Modifier.size(64.dp))
+                    } else {
+                        AlbumCoverMosaic(songs = playlist.songs, modifier = Modifier.fillMaxSize())
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    playlist.name,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Black,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 18.dp),
+                )
+                Text(
+                    "Playlist • ${playlist.songs.size} faixas",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(
+                    onClick = { if (playlist.songs.isNotEmpty()) onPlay(0) },
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                ) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = "Tocar playlist", tint = MaterialTheme.colorScheme.onPrimary)
+                }
+                listOf(
+                    Triple(Icons.Filled.Shuffle, "Misturar playlist") { if (playlist.songs.isNotEmpty()) onShuffle() },
+                    Triple(Icons.Filled.Add, "Adicionar músicas", onAdd),
+                    Triple(Icons.Filled.Edit, "Renomear playlist") { showRename = true },
+                    Triple(Icons.Filled.Delete, "Excluir playlist") { showDeleteConfirm = true },
+                ).forEach { (icon, description, action) ->
+                    Spacer(Modifier.width(18.dp))
+                    IconButton(
+                        onClick = action,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(PailerGunmetal.copy(alpha = 0.5f)),
+                    ) {
+                        Icon(icon, contentDescription = description, tint = MaterialTheme.colorScheme.onBackground)
+                    }
+                }
+            }
+        }
+        if (playlist.songs.isEmpty()) {
+            item {
+                Text(
+                    "Playlist vazia. Toque no + pra adicionar músicas, artistas, álbuns, singles ou categorias.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 32.dp, vertical = 16.dp),
+                )
+            }
+        }
+        itemsIndexed(playlist.songs, key = { _, song -> song.id }) { index, song ->
+            Row(
+                modifier = Modifier.padding(start = 18.dp, end = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.weight(1f)) {
+                    AlbumTrackRow(
+                        trackNumber = index + 1,
+                        song = song,
+                        isFavorite = isSongFavorite(song),
+                        onClick = { onPlay(index) },
+                        onToggleFavorite = { onToggleSongFavorite(song) },
+                        isPlaying = song.id == currentlyPlayingSongId,
+                        showArtwork = true,
+                    )
+                }
+                IconButton(onClick = { onRemoveSong(song) }) {
+                    Icon(
+                        Icons.Filled.Remove,
+                        contentDescription = "Tirar ${song.title} da playlist",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+    if (showRename) {
+        var name by rememberSaveable(playlist.id) { mutableStateOf(playlist.name) }
+        AlertDialog(
+            onDismissRequest = { showRename = false },
+            title = { Text("Renomear playlist") },
+            text = { MetadataTextField(value = name, onValueChange = { name = it }, label = "Nome") },
+            confirmButton = {
+                TextButton(
+                    onClick = { showRename = false; onRename(name) },
+                    enabled = name.isNotBlank(),
+                ) { Text("Salvar") }
+            },
+            dismissButton = { TextButton(onClick = { showRename = false }) { Text("Cancelar") } },
+        )
+    }
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+            title = { Text("Excluir playlist") },
+            text = { Text("Excluir a playlist \"${playlist.name}\"? As músicas continuam no celular, só a playlist some.") },
+            confirmButton = {
+                TextButton(onClick = { showDeleteConfirm = false; onDelete() }) { Text("Excluir") }
+            },
+            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancelar") } },
+        )
+    }
+}
+
+private enum class PlaylistPickerCategory(val label: String) {
+    Songs("Músicas"),
+    Artists("Artistas"),
+    Albums("Álbuns"),
+    Singles("Singles e EPs"),
+    Genres("Categorias"),
+}
+
+// Tela cheia de escolher o que entra na playlist (criar ou adicionar) - marca varios itens de
+// varias categorias antes de confirmar. Devolve ids de fonte no formato de UserPlaylist.sources.
+@Composable
+private fun PlaylistSourcePickerDialog(
+    title: String,
+    askName: Boolean,
+    confirmLabel: String,
+    songs: List<LocalSong>,
+    artists: List<LocalArtist>,
+    albums: List<LocalAlbum>,
+    genres: List<LocalRadio>,
+    onConfirm: (name: String, sources: List<String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by rememberSaveable { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
+    var category by rememberSaveable { mutableStateOf(PlaylistPickerCategory.Songs) }
+    var selected by remember { mutableStateOf(listOf<String>()) }
+    val toggle: (String) -> Unit = { id -> selected = if (id in selected) selected - id else selected + id }
+    val q = query.trim()
+    val fullAlbums = remember(albums) { albums.filter { it.kind == AlbumKind.Album || it.kind == AlbumKind.Playlist } }
+    val shortReleases = remember(albums) { albums.filter { it.kind == AlbumKind.EP || it.kind == AlbumKind.Single } }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = PailerSurface,
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Filled.Close, contentDescription = "Fechar")
+                    }
+                }
+                if (askName) {
+                    MetadataTextField(value = name, onValueChange = { name = it }, label = "Nome da playlist")
+                    Spacer(Modifier.height(10.dp))
+                }
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(PlaylistPickerCategory.entries.toList()) { option ->
+                        val isSelected = option == category
+                        Surface(
+                            onClick = { category = option },
+                            shape = RoundedCornerShape(50),
+                            color = if (isSelected) MaterialTheme.colorScheme.primary else PailerSurfaceHigh,
+                        ) {
+                            Text(
+                                option.label,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                fontSize = 12.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                MetadataTextField(value = query, onValueChange = { query = it }, label = "Buscar")
+                Spacer(Modifier.height(6.dp))
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    flingBehavior = rememberSoftFlingBehavior(),
+                ) {
+                    when (category) {
+                        PlaylistPickerCategory.Songs -> {
+                            val list = if (q.isEmpty()) songs else songs.filter {
+                                it.title.contains(q, ignoreCase = true) || it.artist.contains(q, ignoreCase = true)
+                            }
+                            items(list, key = { "song:${it.id}" }) { song ->
+                                val id = "song:${song.id}"
+                                RowItem(
+                                    title = song.title,
+                                    subtitle = "${song.artist} · ${song.album}",
+                                    icon = { ArtworkBox(uri = song.artworkUri, modifier = Modifier.size(44.dp), embeddedSourceUri = song.contentUri) },
+                                    onClick = { toggle(id) },
+                                    trailing = { Checkbox(checked = id in selected, onCheckedChange = { toggle(id) }) },
+                                )
+                            }
+                        }
+                        PlaylistPickerCategory.Artists -> {
+                            val list = if (q.isEmpty()) artists else artists.filter { it.name.contains(q, ignoreCase = true) }
+                            items(list, key = { "artist:${it.key}" }) { artist ->
+                                val id = "artist:${artist.key}"
+                                RowItem(
+                                    title = artist.name,
+                                    subtitle = "${artist.songs.size} faixas",
+                                    icon = { ArtworkBox(artist.songs.firstOrNull { it.artworkUri != null }?.artworkUri, Modifier.size(44.dp)) },
+                                    onClick = { toggle(id) },
+                                    trailing = { Checkbox(checked = id in selected, onCheckedChange = { toggle(id) }) },
+                                )
+                            }
+                        }
+                        PlaylistPickerCategory.Albums, PlaylistPickerCategory.Singles -> {
+                            val source = if (category == PlaylistPickerCategory.Albums) fullAlbums else shortReleases
+                            val list = if (q.isEmpty()) source else source.filter {
+                                it.title.contains(q, ignoreCase = true) || it.artist.contains(q, ignoreCase = true)
+                            }
+                            items(list, key = { "album:${it.key}" }) { album ->
+                                val id = "album:${album.key}"
+                                RowItem(
+                                    title = album.title,
+                                    subtitle = "${album.kind.label} · ${album.artist} · ${album.songs.size} faixas",
+                                    icon = {
+                                        if (album.isPlaylist) {
+                                            AlbumCoverMosaic(songs = album.songs, modifier = Modifier.size(44.dp))
+                                        } else {
+                                            ArtworkBox(album.artworkUri, Modifier.size(44.dp))
+                                        }
+                                    },
+                                    onClick = { toggle(id) },
+                                    trailing = { Checkbox(checked = id in selected, onCheckedChange = { toggle(id) }) },
+                                )
+                            }
+                        }
+                        PlaylistPickerCategory.Genres -> {
+                            val list = if (q.isEmpty()) genres else genres.filter { it.name.contains(q, ignoreCase = true) }
+                            items(list, key = { "genre:${it.name}" }) { genre ->
+                                val id = "genre:${genre.name}"
+                                RowItem(
+                                    title = genre.name,
+                                    subtitle = "${genre.songs.size} faixas",
+                                    icon = { AlbumCoverMosaic(songs = genre.coverSongs, modifier = Modifier.size(44.dp)) },
+                                    onClick = { toggle(id) },
+                                    trailing = { Checkbox(checked = id in selected, onCheckedChange = { toggle(id) }) },
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (selected.isEmpty()) "Nada marcado" else "${selected.size} marcado(s)",
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Button(
+                        onClick = { onConfirm(name, selected) },
+                        enabled = if (askName) name.isNotBlank() else selected.isNotEmpty(),
+                    ) {
+                        Text(confirmLabel)
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun AlbumsScreen(
     albums: List<LocalAlbum>,
@@ -5326,6 +5941,7 @@ private fun AlbumsScreen(
     LazyVerticalGrid(
         columns = GridCells.Fixed(columns),
         state = scrollState,
+        modifier = Modifier.fillMaxSize(),
         flingBehavior = rememberSoftFlingBehavior(),
         contentPadding = PaddingValues(
             horizontal = if (isLandscape) 14.dp else 18.dp,
@@ -5604,7 +6220,7 @@ private fun AlbumDetailScreen(
     var showEditor by rememberSaveable(album.key) { mutableStateOf(false) }
     var showCreateRadioConfirm by rememberSaveable(album.key) { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
-        if (!album.isVariousArtists) {
+        if (!album.isPlaylist) {
             AlbumArtBackdrop(uri = album.artworkUri)
         }
         LazyColumn(
@@ -5623,7 +6239,7 @@ private fun AlbumDetailScreen(
                             .fillMaxWidth()
                             .aspectRatio(1f),
                     ) {
-                        if (album.isVariousArtists) {
+                        if (album.isPlaylist) {
                             AlbumCoverMosaic(
                                 songs = album.songs,
                                 modifier = Modifier.fillMaxSize(),
@@ -5769,7 +6385,7 @@ private fun AlbumDetailScreen(
                         onClick = { onPlaySong(index) },
                         onToggleFavorite = { onToggleSongFavorite(song) },
                         isPlaying = song.id == currentlyPlayingSongId,
-                        showArtwork = album.isVariousArtists,
+                        showArtwork = album.isPlaylist,
                     )
                 }
             }
@@ -6311,11 +6927,14 @@ private fun RadioDetailScreen(
                         modifier = Modifier.padding(bottom = 18.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        val radioAlbumSongs = remember(radio.songs) {
-                            radio.songs.distinctBy { it.albumId }.filter { it.albumId > 0 }
-                        }
+                        val radioAlbumSongs = remember(radio.songs) { radioCoverSongs(radio.songs) }
                         val radioAlbumNames = remember(radioAlbumSongs) {
-                            radioAlbumSongs.map { "${it.artist} – ${it.album}" }
+                            val variousAlbumIds = radio.songs.groupBy { it.albumId }
+                                .filterValues { group -> group.map { it.artist }.distinct().size > 1 }
+                                .keys
+                            radioAlbumSongs.map {
+                                if (it.albumId in variousAlbumIds) "${it.artist} – ${it.title}" else "${it.artist} – ${it.album}"
+                            }
                         }
                         RadioCoverTicker(songs = radio.songs, itemSize = 132.dp, spacing = 0.dp, cornerRadius = 0.dp)
                         RadioCoverTicker(
@@ -8702,7 +9321,7 @@ private fun AlbumRow(album: LocalAlbum, onClick: () -> Unit) {
         title = album.title,
         subtitle = "${album.artist} • ${album.songs.size} musicas",
         icon = {
-            if (album.isVariousArtists) {
+            if (album.isPlaylist) {
                 AlbumCoverMosaic(songs = album.songs, modifier = Modifier.size(58.dp))
             } else {
                 ArtworkBox(album.artworkUri, Modifier.size(58.dp))
@@ -8783,21 +9402,26 @@ private fun AlbumGridCard(
             .clip(RoundedCornerShape(8.dp))
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
-        if (album.isVariousArtists) {
-            AlbumCoverMosaic(
-                songs = album.songs,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(if (compact) 16f / 9f else 1f),
-            )
-        } else {
-            ArtworkBox(
-                uri = album.artworkUri,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(if (compact) 16f / 9f else 1f),
-                iconModifier = Modifier.size(if (compact) 30.dp else 38.dp),
-            )
+        Box {
+            if (album.isPlaylist) {
+                AlbumCoverMosaic(
+                    songs = album.songs,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(if (compact) 16f / 9f else 1f),
+                )
+            } else {
+                ArtworkBox(
+                    uri = album.artworkUri,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(if (compact) 16f / 9f else 1f),
+                    iconModifier = Modifier.size(if (compact) 30.dp else 38.dp),
+                )
+            }
+            if (album.kind == AlbumKind.EP || album.kind == AlbumKind.Single) {
+                AlbumKindBadge(album.kind, Modifier.align(Alignment.TopStart).padding(5.dp))
+            }
         }
         Spacer(Modifier.height(if (compact) 4.dp else 7.dp))
         Text(
@@ -8924,6 +9548,9 @@ private fun LibraryItemActionsSheet(
     onHide: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
+    // So pro menu de album (null no de artista) - abre AlbumKindDialog (album/EP/single/playlist).
+    kindLabel: String? = null,
+    onChangeKind: () -> Unit = {},
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -8959,6 +9586,13 @@ private fun LibraryItemActionsSheet(
                 tint = if (isFavorite) PailerRed else null,
                 onClick = onToggleFavorite,
             )
+            if (kindLabel != null) {
+                ActionSheetRow(
+                    icon = Icons.Filled.PlaylistPlay,
+                    label = kindLabel,
+                    onClick = onChangeKind,
+                )
+            }
             ActionSheetRow(
                 icon = Icons.Filled.VisibilityOff,
                 label = "Ocultar",
@@ -9324,6 +9958,18 @@ private fun loadEmbeddedArtworkBatch(context: Context, songs: List<LocalSong>): 
     }
 }
 
+// Uma faixa por capa pro ticker/letreiro da tela da radio. Normalmente 1 por album (ALBUM_ID), mas
+// album "various artists" (ex.: pasta baixada de playlist do YouTube - todas as faixas com o mesmo
+// ALBUM_ID, cada uma com a sua capa embutida, ver LocalAlbum.isVariousArtists) vira 1 por artista,
+// senao a radio inteira colapsava na capa da 1a faixa repetida (bug reportado 24/09/2026).
+private fun radioCoverSongs(songs: List<LocalSong>): List<LocalSong> =
+    songs.filter { it.albumId > 0 }
+        .groupBy { it.albumId }
+        .values
+        .flatMap { group ->
+            if (group.map { it.artist }.distinct().size > 1) group.distinctBy { it.artist } else group.take(1)
+        }
+
 // Usa LazyRow (virtualizada) em vez de uma Row gigante com N copias lado a lado. Uma Row comum
 // com muitas capas de 156dp (radios com muitos albuns) chegava a dezenas de milhares de pixels de
 // largura total - isso estourava o limite de textura da GPU do aparelho, corrompendo o desenho de
@@ -9346,7 +9992,7 @@ private fun RadioCoverTicker(
     cornerRadius: androidx.compose.ui.unit.Dp = 8.dp,
 ) {
     val covers = remember(songs, phase) {
-        val distinct = songs.distinctBy { it.albumId }.filter { it.albumId > 0 }
+        val distinct = radioCoverSongs(songs)
         if (distinct.isEmpty()) {
             distinct
         } else {
@@ -10300,7 +10946,7 @@ private fun AlbumCoverCard(album: LocalAlbum, onClick: () -> Unit) {
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick),
     ) {
-        if (album.isVariousArtists) {
+        if (album.isPlaylist) {
             AlbumCoverMosaic(
                 songs = album.songs,
                 modifier = Modifier
