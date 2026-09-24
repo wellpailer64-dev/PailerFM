@@ -38,6 +38,8 @@ import com.pailer.localtune.dlna.DlnaPlaybackBridge
 import com.pailer.localtune.dlna.SsdpDiscovery
 import com.pailer.localtune.player.cast.CastPlaybackBridge
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
+import com.pailer.localtune.data.newsCallout
+import com.pailer.localtune.data.newsCategoryLabel
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.AppFolderRepository
 import com.pailer.localtune.data.ListenerHeartbeat
@@ -136,6 +138,10 @@ data class PlayerUiState(
     val playbackSource: String = "",
     val activeRadioName: String = "",
     val currentNewsHeadline: String = "",
+    // Tarja "Noticia da vez" da cena da radio (pedido do usuario 24/09/2026): categoria ja
+    // traduzida e a chamada completa do boletim tocando agora - vazios fora de boletim.
+    val currentNewsCategoryLabel: String = "",
+    val currentNewsCallout: String = "",
     // true quando a musica atual vai terminar num boletim (ver checkForEarlyNewsBreak) - a cena
     // da radio usa isso pra NAO tocar a troca de disco antes do boletim, so depois dele (pedido
     // do usuario 24/09/2026: boletim -> take de cima em loop -> fran arrumando a vitrola -> capa).
@@ -504,6 +510,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     }
     private var speakingNews = false
     private var currentNewsHeadline = ""
+    private var currentNewsCategoryLabel = ""
+    private var currentNewsCallout = ""
     private var resumeAfterNews = false
     // Guardas do gatilho antecipado do boletim (ver checkForEarlyNewsBreak/fadeOutRadioVolume):
     // newsBreakFadeInProgress cobre a janela do fade (antes de speakingNews existir de verdade,
@@ -2959,6 +2967,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         newsBreakEnding = false
         currentNewsHeadline = ""
+        currentNewsCategoryLabel = ""
+        currentNewsCallout = ""
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = radioName
@@ -2978,6 +2988,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         speakingNews = false
         newsBreakEnding = false
         currentNewsHeadline = ""
+        currentNewsCategoryLabel = ""
+        currentNewsCallout = ""
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = ""
@@ -3297,6 +3309,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         put("title", item.script.story.title)
                         put("source", item.script.story.source)
                         put("summary", item.script.story.summary)
+                        put("headline", item.script.story.headline)
+                        put("category", item.script.story.category)
                         put("scriptSource", item.script.source.name)
                         put("duration", item.script.duration.name)
                         put("special", item.script.isSpecial)
@@ -3361,6 +3375,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
                         title = json.getString("title"),
                         source = json.getString("source"),
                         summary = json.optString("summary"),
+                        headline = json.optString("headline"),
+                        category = json.optString("category"),
                     )
                     val linesJson = json.getJSONArray("lines")
                     val lines = (0 until linesJson.length()).map { lineIndex ->
@@ -3652,6 +3668,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
         speakingNews = true
         currentNewsHeadline = bulletin.displayText
+        currentNewsCategoryLabel = bulletin.newsCategoryLabel()
+        currentNewsCallout = bulletin.newsCallout()
         controller?.let { updatePlayerState(it) }
         resumeAfterNews = player.isPlaying
         if (resumeAfterNews) player.pause()
@@ -3709,6 +3727,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         if (!speakingNews || newsBreakEnding) return
         newsBreakEnding = true
         currentNewsHeadline = ""
+        currentNewsCategoryLabel = ""
+        currentNewsCallout = ""
         // Sem passagem depois do boletim (pedido do usuario 16/09/2026, mesmo motivo do
         // lado de entrada em speakNextNewsBreak) - retoma a musica direto assim que o audio
         // do boletim termina.
@@ -4103,6 +4123,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             playbackSource = playbackSource,
             activeRadioName = activeRadioName,
             currentNewsHeadline = currentNewsHeadline,
+            currentNewsCategoryLabel = currentNewsCategoryLabel,
+            currentNewsCallout = currentNewsCallout,
             bulletinBreakUpcoming = radioNewsEnabled && !speakingNews && (
                 newsBreakFadeInProgress ||
                     (completedRadioSongs + 1) %

@@ -2524,3 +2524,72 @@ antes do fluxo normal de permissões/biblioteca.
 - `broadcast_core.write_cloudflare_wrangler_config()` agora preserva chaves extras do
   `wrangler.jsonc` (`main`, `d1_databases`) — antes reescrevia do zero e o "Publicar
   Cloudflare" tiraria o Worker do ar.
+
+## ADR-047 — Cena da rádio presa no `disco_final` em loop: flashes do scrim se cancelando matavam o loop de troca de disco
+
+**Data:** 24/09/2026
+
+**Sintoma (visto ao vivo, `adb screencap` a cada ~4s + logcat):** a cena ficou mais de 70s só
+na "capa" no meio de "Over Your Shoulder" (nenhuma cena de ambiente). A música virou a
+seguinte sem a Fran trocando o disco, e a tela continuou presa na música nova. O logcat mostrou
+o decoder de vídeo reiniciando **a cada 12,00s exatos**. A capa normal
+(`radio_album_mockup_scene`) dura 10s e o `radio_scene_disco_final` dura 12s. Visualmente os
+dois são idênticos, então só o período denunciou que era o take de encerramento em
+`REPEAT_MODE_ONE` no meio da música.
+
+**Causa:** `Animatable.animateTo` interrompe qualquer animação em andamento e joga
+`CancellationException` em quem a começou. Todas as transições (refrão, disco final, troca de
+disco, boletim, cortes naturais) passam pelo mesmo `RadioTransitionScrimState`. Quando duas
+se sobrepunham, a exceção subia pelo `while (isActive)` de quem perdeu e encerrava o
+`LaunchedEffect` em silêncio. As chaves desses efeitos nunca mudam durante a sessão de rádio,
+então o loop de troca de disco (que também é o fallback de `songChanged`) morria até a
+rádio reiniciar. Daí em diante, todo fim de música entrava no `disco_final` e nada tirava.
+
+Achados junto, no loop do refrão:
+- `nearEnd` era lido direto dentro do `LaunchedEffect` (sem `rememberUpdatedState`), congelado
+  no valor da 1ª composição. O guard "não entrar céu perto do fim" nunca funcionou.
+- O hold do céu (até 45s) era um `delay` cego. Ao terminar, chamava `startFreshCycle` por cima
+  do que tivesse assumido nesse meio-tempo (disco final, boletim, troca de disco). Um refrão no
+  fim da música é o cenário mais provável da sobreposição que matou o loop.
+
+**Correção (`LocalTuneApp.kt`):**
+- `RadioTransitionScrimState` tem um `Mutex`: `flashThroughBlack` enfileira em vez de
+  cancelar. Os cortes naturais (`RadioNaturalTransitionWatcher`) usam `flashThroughBlackIfIdle`:
+  se outra transição está no ar, o flash não acontece (a tela já está coberta) em vez de piscar
+  atrasado. Cancelamento no meio do flash (efeito com chave nova) faz `snapTo(0f)`, pra cena
+  não ficar meio escura.
+- Refrão: `currentNearEnd` via `rememberUpdatedState`. O hold vira polling que sai na hora com
+  fim de música, boletim ou troca de música. Só volta pra capa se o céu (`ceu_*`) ainda está
+  na tela.
+- Rede de segurança: `disco_final` em loop fora de `nearEnd`, sem boletim e sem boletim vindo,
+  por mais de `RadioStuckDiscoRecoverMs` (3s) → volta pro ciclo normal.
+
+**Não verificado ao vivo** no momento do commit: o usuário preferiu receber pela
+auto-atualização em vez de `adb install`.
+
+## ADR-048 — Tarja "Notícia da vez" durante o boletim
+
+**Data:** 24/09/2026
+
+**Pedido:** quando um boletim começa, mostrar embaixo, por cima do take de cima, um retângulo
+vermelho "Notícia da vez - *categoria*" e, colado embaixo, um retângulo branco maior com a
+chamada da notícia, puxando os dados do feed do Cloudflare.
+
+**Dados:** o manifest já tinha tudo. `title` é a primeira fala cortada com "…", e
+`headline` é a chamada completa (até ~190 caracteres), que é a usada. `NewsStory` ganhou
+`headline` e `category` (preenchidos em `BroadcastFeedRepository`, persistidos no
+`manifest.json` do buffer local). Boletins que já estavam no buffer antes disso caem pro
+`title` e tiram a categoria do `source` ("Pailer FM Broadcast · culture").
+`RadioScript.newsCategoryLabel()` traduz o slug em inglês pra português (`culture` → Cultura,
+`geopolitics` → Geopolítica…). Especial (`content_type == "especial"`) mostra "Especial".
+`PlayerUiState` ganhou `currentNewsCategoryLabel`/`currentNewsCallout`, que ficam vazios fora
+de boletim.
+
+**UI:** `RadioNewsLowerThird` entra no lugar da legenda da música, na coluna de baixo de
+`RadioAlbumMockupScene`. A música está pausada, a legenda dela não diz nada nessa hora. Só nas
+telas de rádio em tela cheia (`cinematicIdle != null`): no card pequeno da Home não cabe.
+Chamada com até 5 linhas; entrada com fade + subida.
+
+**Falso alarme registrado:** lendo o manifest via Python no console do Windows, os acentos
+apareceram quebrados ("Rodr�guez"). Decodificando o arquivo como UTF-8 de verdade, o
+manifest está correto. Não precisa de conserto no app nem na central.

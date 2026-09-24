@@ -316,9 +316,12 @@ import com.pailer.localtune.ui.theme.PailerSurfaceHighest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
@@ -7115,6 +7118,17 @@ private fun RadioAlbumMockupScene(
             // lyrics da musica atual nao fazem sentido nenhum numa cena que e sobre o ouvinte, nao
             // sobre a faixa. Fora dos dois casos e a legenda de sempre.
             when {
+                // Tarja do boletim (pedido do usuario 24/09/2026) - no lugar da legenda enquanto o
+                // boletim toca (a musica esta pausada, a legenda dela nao diz nada nessa hora). So
+                // nas telas de radio em tela cheia (cinematicIdle != null): no card pequeno da Home
+                // nao cabe uma chamada de ate ~190 caracteres.
+                cinematicIdle != null && player.currentNewsCallout.isNotBlank() -> {
+                    RadioNewsLowerThird(
+                        categoryLabel = player.currentNewsCategoryLabel,
+                        callout = player.currentNewsCallout,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 sequencer.showProfilePhotoBoard -> {
                     // "bem mais pra baixo" (pedido do usuario 22/09/2026) - empurra o bloco pra
                     // perto do rodape de verdade em vez de nascer logo no topo dessa area (onde a
@@ -7178,6 +7192,53 @@ private fun RadioAlbumMockupScene(
         // RadioCtrOverlayTest acima. Pra voltar ao VHS: trocar essa linha de volta por
         // RadioVhsFilterOverlay(Modifier.matchParentSize()).
         RadioCtrOverlayTest(Modifier.matchParentSize())
+    }
+}
+
+// Tarja "Noticia da vez" (pedido do usuario 24/09/2026): retangulo vermelho com a categoria e,
+// colado embaixo, um branco maior com a chamada do boletim - estilo lower third de telejornal.
+// Entra subindo/aparecendo de novo a cada boletim (key = callout).
+private val RadioNewsTagRed = Color(0xFFC62828)
+
+@Composable
+private fun RadioNewsLowerThird(
+    categoryLabel: String,
+    callout: String,
+    modifier: Modifier = Modifier,
+) {
+    var visible by remember(callout) { mutableStateOf(false) }
+    LaunchedEffect(callout) { visible = true }
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(tween(420)) + slideInVertically(tween(420)) { it / 3 },
+        exit = fadeOut(tween(200)),
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Text(
+                text = "Notícia da vez - $categoryLabel",
+                color = Color.White,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Black,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .background(RadioNewsTagRed)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            )
+            Text(
+                text = callout,
+                color = Color(0xFF141414),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 5,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
+        }
     }
 }
 
@@ -7392,6 +7453,10 @@ private fun skyPoolForNow(
 // UMA vez, do inicio ao fim (REPEAT_MODE_OFF, ver abaixo), e some exatamente quando termina -
 // antes (5s fixos pra um clipe de 6.5s) ele era cortado no meio, no talho errado.
 private const val RadioDiscSwapHoldMs = RadioDiscSwapClipDurationMs
+
+// Quanto tempo o disco_final pode ficar em loop fora do fim da musica antes da rede de seguranca
+// devolver a cena pro ciclo normal (ver LaunchedEffect de "stuckSince").
+private const val RadioStuckDiscoRecoverMs = 3_000L
 
 // Sequencia de takes da radio (pedido do usuario 18/09/2026, refinado no mesmo dia): capa do
 // disco em loop 2x, depois 1-2 cenas de ambiente aleatorias, volta pra capa - ciclo continuo com
@@ -7658,6 +7723,9 @@ private fun rememberRadioMockupSequencer(
     val currentDiscSwapImminent = rememberUpdatedState(discSwapImminent)
     val currentBulletinPlaying = rememberUpdatedState(isBulletinPlaying)
     val currentBulletinBreakUpcoming = rememberUpdatedState(bulletinBreakUpcoming)
+    // nearEnd lido direto dentro de um loop de LaunchedEffect fica congelado no valor da 1a
+    // composicao (o efeito nao reinicia com ele) - o guard !nearEnd do refrao nunca valia.
+    val currentNearEnd = rememberUpdatedState(nearEnd)
     LaunchedEffect(exoPlayer, environmentPool, coverItem, trocandoDiscoItem) {
         var lastSongId = currentSongId.value
         var wasBulletinPlaying = currentBulletinPlaying.value
@@ -7748,6 +7816,36 @@ private fun rememberRadioMockupSequencer(
         }
     }
 
+    // Rede de seguranca (bug real 24/09/2026): o disco_final so faz sentido nos ultimos segundos
+    // da musica (ou parado atras de um boletim). Preso nele fora disso por mais de
+    // RadioStuckDiscoRecoverMs (musica nova ja rolando, seek pra tras, algum caminho de transicao
+    // que falhou) - devolve pro ciclo normal em vez de repetir o take de encerramento pra sempre.
+    LaunchedEffect(exoPlayer, discoItem, coverItem) {
+        var stuckSince: Long? = null
+        while (isActive) {
+            val stuck = !dynamicCycleEnabled &&
+                currentMediaId == discoItem.mediaId &&
+                !currentNearEnd.value &&
+                !currentBulletinPlaying.value &&
+                !currentBulletinBreakUpcoming.value
+            val now = System.currentTimeMillis()
+            if (!stuck) {
+                stuckSince = null
+            } else if (stuckSince == null) {
+                stuckSince = now
+            } else if (now - stuckSince >= RadioStuckDiscoRecoverMs) {
+                stuckSince = null
+                scrim.transition(
+                    sourceMediaId = discoItem.mediaId,
+                    destMediaId = coverItem.mediaId,
+                    fadeFamily = fadeFamilyMediaIds,
+                    onBlack = startFreshCycle,
+                )
+            }
+            delay(250)
+        }
+    }
+
     // Boletim ao vivo (pedido do usuario 18/09/2026): enquanto toca, trava so no take de cima em
     // loop, sem capa. Quando termina, entra a fran arrumando a vitrola e depois a capa (pedido do
     // usuario 24/09/2026).
@@ -7796,7 +7894,7 @@ private fun rememberRadioMockupSequencer(
                 chorusShownWindowStart = null
             }
             val alreadyShownThisOccurrence = window != null && window.first == chorusShownWindowStart
-            if (!isFirstSetup && dynamicCycleEnabled && !nearEnd && window != null && !alreadyShownThisOccurrence) {
+            if (!isFirstSetup && dynamicCycleEnabled && !currentNearEnd.value && window != null && !alreadyShownThisOccurrence) {
                 chorusShownWindowStart = window.first
                 val skyPool = skyPoolForNow(skyMadrugadaPool, skyManhaPool, skyTardePool, skyNoitePool)
                 val shuffledSkyPool = skyPool.shuffled()
@@ -7820,13 +7918,28 @@ private fun rememberRadioMockupSequencer(
                         exoPlayer.playWhenReady = true
                     },
                 )
-                delay(holdMsForChorusWindow(window))
-                scrim.transition(
-                    sourceMediaId = currentMediaId,
-                    destMediaId = coverItem.mediaId,
-                    fadeFamily = fadeFamilyMediaIds,
-                    onBlack = startFreshCycle,
-                )
+                // Hold interrompivel: fim de musica (disco final), boletim ou troca de musica
+                // assumem a cena na hora - antes o hold cego de ate 45s voltava pra capa por cima
+                // deles (startFreshCycle ligando o ciclo de novo no meio do disco final/boletim).
+                val holdUntil = System.currentTimeMillis() + holdMsForChorusWindow(window)
+                while (
+                    System.currentTimeMillis() < holdUntil &&
+                    currentSongId.value == songNow &&
+                    !currentNearEnd.value &&
+                    !currentBulletinPlaying.value
+                ) {
+                    delay(100)
+                }
+                // So devolve pra capa se o ceu ainda e o que esta na tela; se outro estado
+                // (disco/boletim/troca de disco) ja assumiu, a saida e dele.
+                if (currentMediaId.startsWith("ceu_") && !currentBulletinPlaying.value && !currentNearEnd.value) {
+                    scrim.transition(
+                        sourceMediaId = currentMediaId,
+                        destMediaId = coverItem.mediaId,
+                        fadeFamily = fadeFamilyMediaIds,
+                        onBlack = startFreshCycle,
+                    )
+                }
             }
             delay(150)
         }
@@ -7863,11 +7976,43 @@ private const val RadioSceneTransitionRearmMarginMs = 500L
 private class RadioTransitionScrimState(private val alpha: Animatable<Float, *>) {
     val alphaValue: Float get() = alpha.value
 
+    // Bug real 24/09/2026 (radio presa no take disco_final em loop no meio da musica seguinte):
+    // Animatable.animateTo INTERROMPE qualquer animacao em andamento e joga CancellationException
+    // em quem a tinha comecado. Dois flashes sobrepostos (ex.: fim do hold do refrao batendo com o
+    // inicio da troca de disco, ou o boletim entrando no meio dela) matavam em silencio o
+    // while(isActive) de quem perdeu - e como esses LaunchedEffect nunca trocam de chave, o loop
+    // de troca de disco nao voltava mais ate a radio reiniciar. O Mutex enfileira os flashes em
+    // vez de um cancelar o outro.
+    private val mutex = Mutex()
+
     suspend fun flashThroughBlack(onBlack: (suspend () -> Unit)? = null) {
-        alpha.animateTo(1f, tween(RadioSceneTransitionFadeInMs))
-        onBlack?.invoke()
-        delay(RadioSceneTransitionHoldMs)
-        alpha.animateTo(0f, tween(RadioSceneTransitionFadeOutMs))
+        mutex.withLock { flashLocked(onBlack) }
+    }
+
+    // Cortes naturais do playlist (RadioNaturalTransitionWatcher): o flash so faz sentido colado
+    // no corte previsto, entao se outra transicao ja esta no ar ele simplesmente nao acontece (a
+    // tela ja esta coberta) em vez de esperar e piscar fora de hora.
+    suspend fun flashThroughBlackIfIdle() {
+        if (!mutex.tryLock()) return
+        try {
+            flashLocked(null)
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    private suspend fun flashLocked(onBlack: (suspend () -> Unit)?) {
+        try {
+            alpha.animateTo(1f, tween(RadioSceneTransitionFadeInMs))
+            onBlack?.invoke()
+            delay(RadioSceneTransitionHoldMs)
+            alpha.animateTo(0f, tween(RadioSceneTransitionFadeOutMs))
+        } catch (e: CancellationException) {
+            // LaunchedEffect com chave nova cancelando no meio do flash: nao deixa a cena
+            // travada meio escura ate o proximo flash.
+            withContext(NonCancellable) { alpha.snapTo(0f) }
+            throw e
+        }
     }
 
     // Decide fade vs corte seco pela FAMILIA da cena de origem/destino (pedido do usuario
@@ -7935,7 +8080,7 @@ private fun RadioNaturalTransitionWatcher(exoPlayer: ExoPlayer, scrim: RadioTran
                         val sourceId = exoPlayer.getMediaItemAt(currentIndex).mediaId
                         val destId = exoPlayer.getMediaItemAt(nextIndex).mediaId
                         if (sourceId in fadeFamily || destId in fadeFamily) {
-                            scrim.flashThroughBlack()
+                            scrim.flashThroughBlackIfIdle()
                         }
                     }
                     remaining > RadioSceneTransitionLeadMs + RadioSceneTransitionRearmMarginMs -> {

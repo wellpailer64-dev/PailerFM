@@ -21,6 +21,11 @@ data class NewsStory(
     val title: String,
     val source: String,
     val summary: String = "",
+    // Chamada completa e categoria crua do manifest do feed de broadcast ("headline"/"category",
+    // ver BroadcastFeedRepository) - usadas so na tarja "Noticia da vez" da cena da radio.
+    // title continua sendo a versao curta (chave de reserva/anti-repeticao depende dela).
+    val headline: String = "",
+    val category: String = "",
 )
 
 data class RadioScriptLine(
@@ -63,3 +68,31 @@ enum class RadioScriptSource {
     BroadcastFeed,
     Fallback,
 }
+
+// Tarja "Noticia da vez" da cena da radio (pedido do usuario 24/09/2026). Categoria vem crua do
+// manifest (slug em ingles, ver docs/BROADCAST_METADATA.md); boletins salvos no buffer antes
+// desse campo existir so tem ela embutida no source ("Pailer FM Broadcast · culture").
+fun RadioScript.newsCategoryLabel(): String {
+    if (isSpecial) return "Especial"
+    val raw = story.category.ifBlank { story.source.substringAfter("·", "").trim() }.lowercase()
+    return when (raw) {
+        "", "general", "geral" -> "Geral"
+        "culture" -> "Cultura"
+        "curiosities" -> "Curiosidades"
+        "geopolitics" -> "Geopolítica"
+        "health" -> "Saúde"
+        "science" -> "Ciência"
+        "technology" -> "Tecnologia"
+        "space" -> "Espaço"
+        "history" -> "História"
+        "music" -> "Música"
+        "cinema" -> "Cinema"
+        "games" -> "Games"
+        "human" -> "Humano"
+        else -> raw.replaceFirstChar { it.uppercase() }
+    }
+}
+
+// Chamada completa (headline do manifest), caindo pro title curto em boletins antigos do buffer.
+fun RadioScript.newsCallout(): String =
+    story.headline.ifBlank { story.title }.trim()

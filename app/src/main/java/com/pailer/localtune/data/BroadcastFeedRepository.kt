@@ -186,6 +186,8 @@ class BroadcastFeedRepository(private val context: Context) {
                 title = title,
                 source = "Pailer FM Broadcast · $category",
                 summary = "Boletim aprovado no feed remoto. ID: $id.",
+                headline = item.optString("headline").trim(),
+                category = category,
             ),
             lines = lines,
             source = RadioScriptSource.BroadcastFeed,
