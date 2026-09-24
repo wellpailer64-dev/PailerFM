@@ -294,6 +294,13 @@ data class UpdateUiState(
     val isDownloading: Boolean = false,
     val downloadProgress: Float = 0f,
     val downloadedApkFile: File? = null,
+    // Incrementa a cada pedido de abrir o instalador (download terminou ou toque em "Instalar").
+    // Bug real 24/09/2026: a UI disparava o instalador com LaunchedEffect(downloadedApkFile), mas
+    // o APK sempre vai pro MESMO caminho (cache/app_update/PailerFM-update.apk) e File compara
+    // por caminho - da 2a tentativa em diante a chave nao mudava e o instalador nunca abria. Se a
+    // 1a tentativa falhasse (ex.: download terminou com o app em segundo plano, Android bloqueia
+    // abrir tela a partir do fundo), o usuario ficava preso no popup sem jeito de instalar.
+    val installRequest: Int = 0,
     val dismissed: Boolean = false,
     val message: String? = null,
     // Resultado da checagem MANUAL (botao "Buscar atualizacoes" em Configuracoes, pedido do
@@ -1743,9 +1750,30 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             updateState.value = updateState.value.copy(
                 isDownloading = false,
                 downloadedApkFile = file,
+                installRequest = updateState.value.installRequest + if (file != null) 1 else 0,
                 message = if (file == null) "Não consegui baixar a atualização. Tenta de novo." else null,
             )
         }
+    }
+
+    // Botao "Instalar" do popup quando o APK ja esta baixado - abre o instalador de novo sem
+    // baixar tudo outra vez (toque do usuario = app em primeiro plano, o Android sempre deixa).
+    fun requestUpdateInstall() {
+        if (updateState.value.downloadedApkFile?.exists() != true) {
+            updateState.value = updateState.value.copy(downloadedApkFile = null)
+            downloadUpdate()
+            return
+        }
+        updateState.value = updateState.value.copy(
+            installRequest = updateState.value.installRequest + 1,
+            message = null,
+        )
+    }
+
+    fun reportUpdateInstallFailed() {
+        updateState.value = updateState.value.copy(
+            message = "Não consegui abrir o instalador. Toque em Instalar de novo.",
+        )
     }
 
     fun openArtworkSearch(album: LocalAlbum) {

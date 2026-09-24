@@ -20,6 +20,7 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.graphics.Shader
 import android.net.Uri
+import android.util.Log
 import android.os.Build
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -649,8 +650,10 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
     val updateContext = LocalContext.current
     val updateState = viewModel.updateState.value
     LaunchedEffect(Unit) { viewModel.checkForUpdate() }
-    LaunchedEffect(updateState.downloadedApkFile) {
-        updateState.downloadedApkFile?.let { installApkUpdate(updateContext, it) }
+    LaunchedEffect(updateState.installRequest) {
+        if (updateState.installRequest == 0) return@LaunchedEffect
+        val apk = updateState.downloadedApkFile ?: return@LaunchedEffect
+        if (!installApkUpdate(updateContext, apk)) viewModel.reportUpdateInstallFailed()
     }
     LaunchedEffect(updateState.manualCheckMessage) {
         updateState.manualCheckMessage?.let {
@@ -662,6 +665,7 @@ private fun LibraryShell(viewModel: LocalTuneViewModel) {
         UpdateAvailableDialog(
             state = updateState,
             onDownload = viewModel::downloadUpdate,
+            onInstall = viewModel::requestUpdateInstall,
             onDismiss = viewModel::dismissUpdatePrompt,
         )
     }
@@ -5454,16 +5458,19 @@ private fun shareAlbumAsZip(context: Context, scope: CoroutineScope, songs: List
 // cru de cache nao pode virar Uri content:// pra outro "app" - aqui o proprio PackageInstaller -
 // sem passar pelo FileProvider). REQUEST_INSTALL_PACKAGES no manifesto faz o Android pedir
 // "permitir que o Pailer FM instale outros apps?" sozinho na primeira vez, antes de prosseguir.
-private fun installApkUpdate(context: Context, apkFile: File) {
+private fun installApkUpdate(context: Context, apkFile: File): Boolean {
+    if (!apkFile.exists()) return false
     val uri = runCatching {
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apkFile)
-    }.getOrNull() ?: return
+    }.getOrNull() ?: return false
     val intent = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(uri, "application/vnd.android.package-archive")
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    runCatching { context.startActivity(intent) }
+    return runCatching { context.startActivity(intent) }
+        .onFailure { Log.w("PailerUpdate", "instalador nao abriu", it) }
+        .isSuccess
 }
 
 // Popup "Nova versao disponivel" (pedido do usuario 15/09/2026) - substitui ter que mandar o APK
@@ -5474,9 +5481,13 @@ private fun installApkUpdate(context: Context, apkFile: File) {
 private fun UpdateAvailableDialog(
     state: UpdateUiState,
     onDownload: () -> Unit,
+    onInstall: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val release = state.latestRelease ?: return
+    // APK desta release ja baixado: o botao vira "Instalar" (abre o instalador direto). Se o
+    // instalador abriu por cima e o usuario voltou sem instalar, da pra tentar de novo daqui.
+    val downloaded = state.downloadedApkFile != null && !state.isDownloading
     AlertDialog(
         onDismissRequest = { if (!state.isDownloading) onDismiss() },
         icon = { Icon(Icons.Filled.CloudUpload, contentDescription = null) },
@@ -5506,8 +5517,17 @@ private fun UpdateAvailableDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDownload, enabled = !state.isDownloading) {
-                Text(if (state.isDownloading) "Baixando..." else "Baixar e instalar")
+            TextButton(
+                onClick = if (downloaded) onInstall else onDownload,
+                enabled = !state.isDownloading,
+            ) {
+                Text(
+                    when {
+                        state.isDownloading -> "Baixando..."
+                        downloaded -> "Instalar"
+                        else -> "Baixar e instalar"
+                    },
+                )
             }
         },
         dismissButton = {

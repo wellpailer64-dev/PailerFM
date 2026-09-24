@@ -2635,3 +2635,29 @@ ouvinte ao clicar no card dele.
 boletim repetido não conta 2x; reação inválida recusada; painel, pop-up e página de boletins
 conferidos no navegador. Obs.: no `wrangler dev` local, o `ADMIN_TOKEN` do `.dev.vars`
 chegou `undefined` no Worker; `--var ADMIN_TOKEN:...` funcionou.
+
+## ADR-050 — Atualizador: "Baixar e instalar" não abria o instalador depois da 1ª tentativa
+
+**Data:** 24/09/2026
+
+**Sintoma:** o popup da v2026.09.24-58 baixava, mas o instalador do Android não aparecia, e
+tocar de novo também não fazia nada. A permissão "instalar apps desconhecidos" estava
+liberada (`appops ... REQUEST_INSTALL_PACKAGES: allow`), e a -57 tinha entrado pelo mesmo
+atualizador às 14:22.
+
+**Causa:** o instalador era aberto por `LaunchedEffect(updateState.downloadedApkFile)`, mas o
+APK sempre vai pro mesmo caminho (`cache/app_update/PailerFM-update.apk`) e `File.equals`
+compara por caminho. Da 2ª tentativa em diante, na mesma execução do app, a chave não mudava e
+o instalador nunca abria. Se a 1ª tentativa falhasse (hipótese mais provável: o download de
+~70MB terminou com o app em segundo plano, e o Android bloqueia abrir tela a partir do fundo;
+não confirmado porque o log da hora já tinha rodado), não havia como sair disso. Além disso,
+`startActivity` estava num `runCatching` que engolia qualquer erro.
+
+**Correção:** `UpdateUiState.installRequest` (contador) vira a chave do efeito e sobe a cada
+download concluído e a cada toque. Com o APK já baixado, o botão do popup vira "Instalar"
+(`requestUpdateInstall`, abre direto sem baixar de novo; se o arquivo sumiu, baixa de novo).
+`installApkUpdate` devolve se conseguiu, e a falha aparece como mensagem no popup.
+
+**Limite:** quem já está numa versão com o bug (até a -58) instala a próxima pelo caminho
+antigo. É preciso fechar o app nos recentes, abrir de novo, tocar uma vez e esperar na tela até
+o instalador abrir.
