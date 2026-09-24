@@ -26,6 +26,9 @@ data class NewsStory(
     // title continua sendo a versao curta (chave de reserva/anti-repeticao depende dela).
     val headline: String = "",
     val category: String = "",
+    // id do boletim no manifest (ex. "blt_5dd78c17") - painel de ouvintes no Cloudflare registra
+    // quem ouviu e quem reagiu por esse id (pedido do usuario 24/09/2026).
+    val bulletinId: String = "",
 )
 
 data class RadioScriptLine(
@@ -92,6 +95,13 @@ fun RadioScript.newsCategoryLabel(): String {
         else -> raw.replaceFirstChar { it.uppercase() }
     }
 }
+
+// id do boletim no feed. Boletins salvos no buffer antes do campo existir so tem ele no summary
+// ("Boletim aprovado no feed remoto. ID: blt_xxx.").
+fun RadioScript.feedBulletinId(): String =
+    story.bulletinId.ifBlank {
+        Regex("ID: ([A-Za-z0-9_-]+)").find(story.summary)?.groupValues?.get(1).orEmpty()
+    }
 
 // Chamada completa (headline do manifest), caindo pro title curto em boletins antigos do buffer.
 fun RadioScript.newsCallout(): String =

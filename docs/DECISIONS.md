@@ -2593,3 +2593,45 @@ Chamada com até 5 linhas; entrada com fade + subida.
 **Falso alarme registrado:** lendo o manifest via Python no console do Windows, os acentos
 apareceram quebrados ("Rodr�guez"). Decodificando o arquivo como UTF-8 de verdade, o
 manifest está correto. Não precisa de conserto no app nem na central.
+
+## ADR-049 — Engajamento por ouvinte, boletins ouvidos e reações (painel + página de boletins)
+
+**Data:** 24/09/2026
+
+**Pedido:** antes de decidir por um lançamento na Play Store (plano em standby), medir uso real
+com a galera: cidade do ouvinte, quantas vezes ouve por dia/semana/mês, por quanto tempo,
+quais boletins ouviu. Mais reações às notícias (❤️ 😮 😂 😢), com quem reagiu aparecendo na
+caixinha de cada boletim, navegação entre boletins e painel, e um pop-up com os detalhes do
+ouvinte ao clicar no card dele.
+
+**App:**
+- `NewsStory.bulletinId` (id do manifest, persistido no buffer; boletins antigos tiram do
+  `summary` via `RadioScript.feedBulletinId()`).
+- `ListenerHeartbeat.sendBulletinPlayed` (no início de cada boletim, em
+  `speakNextNewsBreak`) e `sendReaction` (`POST /api/reaction`, `""` remove).
+- Tarja do boletim (ADR-048) ganhou 4 emojis embaixo. Tocar reage, tocar de novo no mesmo
+  desfaz, outro troca. `LocalTuneViewModel.reactToCurrentBulletin` chega na cena por
+  `LocalOnRadioNewsReaction` (CompositionLocal provido em `LocalTuneApp`), sem passar callback
+  por LibraryShell → telas da rádio → LiveNowRadioCard.
+
+**Cloudflare** (`_broadcast-boletins-local/distribuicao-app/`, fora deste git):
+- Migração `0002_engajamento_reacoes.sql`, só aditiva: `listeners` ganha
+  `city/region/country` (do `request.cf`, geolocalização por IP, sem permissão no app; em
+  rede móvel costuma dar a cidade do provedor), `last_playing_at`, `last_total_ms`.
+  `daily_activity` ganha `sessions`/`listening_ms`. Tabelas novas `bulletin_plays` e
+  `bulletin_reactions`.
+- Sessão = heartbeat tocando depois de mais de 10 min sem tocar. Minutos/dia = diferença do
+  `total_listening_ms` pro heartbeat anterior, com teto no tempo real decorrido.
+  **Métricas só existem a partir do deploy**, sem retroativo.
+- `/painel`: botão "📻 Boletins", cartões de engajamento (vezes/dia, min/dia, dias/semana,
+  média 7 dias), colunas "Ouviu (hoje/7d/30d)" e "Cidade". Clicar na linha abre o pop-up
+  (`GET /api/admin/listener`).
+- Página de boletins (gerada por `broadcast_core.distribution_index_html`): botão "👥 Painel
+  de ouvintes". **Só logado com o token do painel** (mesma chave no localStorage, mesma
+  origem) mostra 👂 ouvintes + contagem de reações no card e, na caixinha, quem reagiu e
+  quem ouviu (`GET /api/admin/bulletins`). A página é pública; sem token fica como antes.
+
+**Testado localmente** (`wrangler dev` + D1 local): 3 heartbeats → 1 sessão e 1,5 min;
+boletim repetido não conta 2x; reação inválida recusada; painel, pop-up e página de boletins
+conferidos no navegador. Obs.: no `wrangler dev` local, o `ADMIN_TOKEN` do `.dev.vars`
+chegou `undefined` no Worker; `--var ADMIN_TOKEN:...` funcionou.

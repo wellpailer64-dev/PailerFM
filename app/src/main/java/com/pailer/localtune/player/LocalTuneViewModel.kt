@@ -38,6 +38,7 @@ import com.pailer.localtune.dlna.DlnaPlaybackBridge
 import com.pailer.localtune.dlna.SsdpDiscovery
 import com.pailer.localtune.player.cast.CastPlaybackBridge
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
+import com.pailer.localtune.data.feedBulletinId
 import com.pailer.localtune.data.newsCallout
 import com.pailer.localtune.data.newsCategoryLabel
 import com.pailer.localtune.data.AlbumMetadataEdit
@@ -142,6 +143,8 @@ data class PlayerUiState(
     // traduzida e a chamada completa do boletim tocando agora - vazios fora de boletim.
     val currentNewsCategoryLabel: String = "",
     val currentNewsCallout: String = "",
+    // Reacao do ouvinte ao boletim tocando agora (ListenerHeartbeat.REACTION_*), "" = nenhuma.
+    val currentNewsReaction: String = "",
     // true quando a musica atual vai terminar num boletim (ver checkForEarlyNewsBreak) - a cena
     // da radio usa isso pra NAO tocar a troca de disco antes do boletim, so depois dele (pedido
     // do usuario 24/09/2026: boletim -> take de cima em loop -> fran arrumando a vitrola -> capa).
@@ -512,6 +515,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     private var currentNewsHeadline = ""
     private var currentNewsCategoryLabel = ""
     private var currentNewsCallout = ""
+    private var currentNewsBulletinId = ""
+    private var currentNewsReaction = ""
     private var resumeAfterNews = false
     // Guardas do gatilho antecipado do boletim (ver checkForEarlyNewsBreak/fadeOutRadioVolume):
     // newsBreakFadeInProgress cobre a janela do fade (antes de speakingNews existir de verdade,
@@ -707,6 +712,20 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         var boundary = now.withHour(5).withMinute(0).withSecond(0).withNano(0)
         if (now.isBefore(boundary)) boundary = boundary.minusDays(1)
         return loadedAtMillis < boundary.toInstant().toEpochMilli()
+    }
+
+    // Toque num emoji da tarja do boletim (pedido do usuario 24/09/2026). Tocar de novo no
+    // mesmo emoji desfaz; outro emoji troca. So vale enquanto o boletim esta tocando.
+    fun reactToCurrentBulletin(reaction: String) {
+        if (currentNewsBulletinId.isBlank()) return
+        currentNewsReaction = if (currentNewsReaction == reaction) "" else reaction
+        ListenerHeartbeat.sendReaction(
+            getApplication(),
+            currentNewsBulletinId,
+            currentNewsReaction,
+            currentNewsCallout,
+        )
+        controller?.let { updatePlayerState(it) }
     }
 
     fun saveUserProfile(name: String, birthday: String) {
@@ -2969,6 +2988,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         currentNewsHeadline = ""
         currentNewsCategoryLabel = ""
         currentNewsCallout = ""
+        currentNewsBulletinId = ""
+        currentNewsReaction = ""
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = radioName
@@ -2990,6 +3011,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         currentNewsHeadline = ""
         currentNewsCategoryLabel = ""
         currentNewsCallout = ""
+        currentNewsBulletinId = ""
+        currentNewsReaction = ""
         resumeAfterNews = false
         pendingVinheta = false
         activeRadioName = ""
@@ -3670,6 +3693,14 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         currentNewsHeadline = bulletin.displayText
         currentNewsCategoryLabel = bulletin.newsCategoryLabel()
         currentNewsCallout = bulletin.newsCallout()
+        currentNewsBulletinId = bulletin.feedBulletinId()
+        currentNewsReaction = ""
+        ListenerHeartbeat.sendBulletinPlayed(
+            getApplication(),
+            currentNewsBulletinId,
+            currentNewsCallout,
+            bulletin.story.category,
+        )
         controller?.let { updatePlayerState(it) }
         resumeAfterNews = player.isPlaying
         if (resumeAfterNews) player.pause()
@@ -3729,6 +3760,8 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         currentNewsHeadline = ""
         currentNewsCategoryLabel = ""
         currentNewsCallout = ""
+        currentNewsBulletinId = ""
+        currentNewsReaction = ""
         // Sem passagem depois do boletim (pedido do usuario 16/09/2026, mesmo motivo do
         // lado de entrada em speakNextNewsBreak) - retoma a musica direto assim que o audio
         // do boletim termina.
@@ -4125,6 +4158,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             currentNewsHeadline = currentNewsHeadline,
             currentNewsCategoryLabel = currentNewsCategoryLabel,
             currentNewsCallout = currentNewsCallout,
+            currentNewsReaction = currentNewsReaction,
             bulletinBreakUpcoming = radioNewsEnabled && !speakingNews && (
                 newsBreakFadeInProgress ||
                     (completedRadioSongs + 1) %

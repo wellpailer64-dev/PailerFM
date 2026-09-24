@@ -210,6 +210,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -274,6 +276,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import com.pailer.localtune.BuildConfig
 import com.pailer.localtune.R
+import com.pailer.localtune.data.ListenerHeartbeat
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.ArtistNewsCard
 import com.pailer.localtune.data.DuplicateArtistGroup
@@ -427,7 +430,9 @@ fun LocalTuneApp(viewModel: LocalTuneViewModel = viewModel()) {
         if (viewModel.needsOnboarding.value) {
             OnboardingFlow(viewModel)
         } else if (hasAudioPermission) {
-            LibraryShell(viewModel = viewModel)
+            CompositionLocalProvider(LocalOnRadioNewsReaction provides viewModel::reactToCurrentBulletin) {
+                LibraryShell(viewModel = viewModel)
+            }
         } else {
             PermissionGate(onGrant = { permissionLauncher.launch(requestedPermissions.toTypedArray()) })
         }
@@ -7126,6 +7131,8 @@ private fun RadioAlbumMockupScene(
                     RadioNewsLowerThird(
                         categoryLabel = player.currentNewsCategoryLabel,
                         callout = player.currentNewsCallout,
+                        selectedReaction = player.currentNewsReaction,
+                        onReact = LocalOnRadioNewsReaction.current,
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -7200,10 +7207,24 @@ private fun RadioAlbumMockupScene(
 // Entra subindo/aparecendo de novo a cada boletim (key = callout).
 private val RadioNewsTagRed = Color(0xFFC62828)
 
+// Reacao ao boletim (pedido do usuario 24/09/2026) - provido uma vez em LocalTuneApp em vez de
+// passar o callback por LibraryShell -> telas da radio/FullPlayer -> LiveNowRadioCard -> cena.
+private val LocalOnRadioNewsReaction = staticCompositionLocalOf<(String) -> Unit> { {} }
+
+// Ordem pedida pelo usuario: coracao > impressionado > chorando de rir > triste.
+private val RadioNewsReactions = listOf(
+    ListenerHeartbeat.REACTION_HEART to "❤️",
+    ListenerHeartbeat.REACTION_WOW to "😮",
+    ListenerHeartbeat.REACTION_LAUGH to "😂",
+    ListenerHeartbeat.REACTION_SAD to "😢",
+)
+
 @Composable
 private fun RadioNewsLowerThird(
     categoryLabel: String,
     callout: String,
+    selectedReaction: String,
+    onReact: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var visible by remember(callout) { mutableStateOf(false) }
@@ -7238,6 +7259,35 @@ private fun RadioNewsLowerThird(
                     .background(Color.White)
                     .padding(horizontal = 12.dp, vertical = 10.dp),
             )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                RadioNewsReactions.forEach { (key, emoji) ->
+                    val selected = key == selectedReaction
+                    val scale by animateFloatAsState(
+                        targetValue = if (selected) 1.18f else 1f,
+                        animationSpec = tween(180),
+                        label = "radioNewsReactionScale",
+                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .scale(scale)
+                            .clip(CircleShape)
+                            .background(
+                                if (selected) Color.White else Color.Black.copy(alpha = 0.45f),
+                            )
+                            .border(
+                                width = 1.dp,
+                                color = if (selected) RadioNewsTagRed else Color.White.copy(alpha = 0.35f),
+                                shape = CircleShape,
+                            )
+                            .clickable { onReact(key) },
+                    ) {
+                        Text(emoji, fontSize = 22.sp)
+                    }
+                }
+            }
         }
     }
 }

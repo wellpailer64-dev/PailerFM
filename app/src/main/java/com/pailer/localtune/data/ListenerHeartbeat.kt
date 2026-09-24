@@ -31,7 +31,16 @@ import java.util.UUID
 object ListenerHeartbeat {
     const val HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000L
 
-    private const val ENDPOINT = "https://pailer-fm-boletins.well-pailer64.workers.dev/api/heartbeat"
+    private const val BASE_URL = "https://pailer-fm-boletins.well-pailer64.workers.dev"
+    private const val ENDPOINT = "$BASE_URL/api/heartbeat"
+    private const val BULLETIN_PLAYED_ENDPOINT = "$BASE_URL/api/bulletin-played"
+    private const val REACTION_ENDPOINT = "$BASE_URL/api/reaction"
+
+    // Valores aceitos pelo Worker em /api/reaction ("" remove a reacao).
+    const val REACTION_HEART = "heart"
+    const val REACTION_WOW = "wow"
+    const val REACTION_LAUGH = "laugh"
+    const val REACTION_SAD = "sad"
     private const val TAG = "PailerHeartbeat"
     private const val PREFS = "listener_heartbeat"
     private const val KEY_INSTALL_ID = "install_id"
@@ -56,8 +65,45 @@ object ListenerHeartbeat {
         val snapshot = lastNowPlaying
         val appContext = context.applicationContext
         scope.launch {
-            runCatching { post(buildPayload(appContext, snapshot)) }
+            runCatching { post(ENDPOINT, buildPayload(appContext, snapshot)) }
                 .onFailure { Log.w(TAG, "heartbeat falhou: ${it.message}") }
+        }
+    }
+
+    // Painel de ouvintes/boletins (pedido do usuario 24/09/2026): quais boletins cada ouvinte
+    // ouviu. Mandado quando o boletim COMECA a tocar (ver LocalTuneViewModel.speakNextNewsBreak).
+    fun sendBulletinPlayed(context: Context, bulletinId: String, title: String, category: String) {
+        if (bulletinId.isBlank()) return
+        val appContext = context.applicationContext
+        scope.launch {
+            runCatching {
+                post(
+                    BULLETIN_PLAYED_ENDPOINT,
+                    JSONObject()
+                        .put("install_id", installId(appContext))
+                        .put("bulletin_id", bulletinId)
+                        .put("title", title)
+                        .put("category", category),
+                )
+            }.onFailure { Log.w(TAG, "bulletin-played falhou: ${it.message}") }
+        }
+    }
+
+    // Reacao ao boletim tocando (coracao/impressionado/rindo/triste - ver REACTION_*); "" remove.
+    fun sendReaction(context: Context, bulletinId: String, reaction: String, title: String) {
+        if (bulletinId.isBlank()) return
+        val appContext = context.applicationContext
+        scope.launch {
+            runCatching {
+                post(
+                    REACTION_ENDPOINT,
+                    JSONObject()
+                        .put("install_id", installId(appContext))
+                        .put("bulletin_id", bulletinId)
+                        .put("reaction", reaction)
+                        .put("title", title),
+                )
+            }.onFailure { Log.w(TAG, "reaction falhou: ${it.message}") }
         }
     }
 
@@ -97,8 +143,8 @@ object ListenerHeartbeat {
             .put("radio_listening_ms", stats.getLong("radio_listening_ms", 0L))
     }
 
-    private fun post(payload: JSONObject) {
-        val connection = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
+    private fun post(endpoint: String, payload: JSONObject) {
+        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
             readTimeout = 10_000
@@ -108,7 +154,7 @@ object ListenerHeartbeat {
         try {
             connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
             val code = connection.responseCode
-            if (code !in 200..299) Log.w(TAG, "heartbeat HTTP $code")
+            if (code !in 200..299) Log.w(TAG, "$endpoint HTTP $code")
         } finally {
             connection.disconnect()
         }
