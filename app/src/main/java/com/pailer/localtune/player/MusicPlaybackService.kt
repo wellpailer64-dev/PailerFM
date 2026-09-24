@@ -2,6 +2,8 @@ package com.pailer.localtune.player
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -11,11 +13,43 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.pailer.localtune.MainActivity
+import com.pailer.localtune.data.ListenerHeartbeat
 import com.pailer.localtune.widget.PlayerWidgetActions
 import com.pailer.localtune.widget.PlayerWidgetRenderer
 
 class MusicPlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+
+    // Heartbeat pro painel de ouvintes (ver ListenerHeartbeat): manda na hora que play/pause
+    // muda e repete a cada HEARTBEAT_INTERVAL_MS enquanto estiver tocando. Pausado nao repete -
+    // o painel considera o ouvinte fora depois de 5 min sem sinal.
+    private val heartbeatHandler = Handler(Looper.getMainLooper())
+    private val heartbeatTick = object : Runnable {
+        override fun run() {
+            val player = mediaSession?.player ?: return
+            sendHeartbeat(player)
+            if (player.isPlaying) heartbeatHandler.postDelayed(this, ListenerHeartbeat.HEARTBEAT_INTERVAL_MS)
+        }
+    }
+    private val heartbeatListener = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            heartbeatHandler.removeCallbacks(heartbeatTick)
+            heartbeatTick.run()
+        }
+    }
+
+    private fun sendHeartbeat(player: Player) {
+        val metadata = player.currentMediaItem?.mediaMetadata
+        ListenerHeartbeat.send(
+            this,
+            ListenerHeartbeat.NowPlaying(
+                isPlaying = player.isPlaying,
+                title = metadata?.title?.toString().orEmpty(),
+                artist = metadata?.artist?.toString().orEmpty(),
+                station = metadata?.station?.toString().orEmpty(),
+            ),
+        )
+    }
     private val widgetListener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             if (player.mediaItemCount > 0) {
@@ -63,6 +97,7 @@ class MusicPlaybackService : MediaSessionService() {
                 setHandleAudioBecomingNoisy(true)
                 addListener(widgetListener)
                 addListener(diagnosticListener)
+                addListener(heartbeatListener)
             }
 
         val launchIntent = Intent(this, MainActivity::class.java)
@@ -105,7 +140,10 @@ class MusicPlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         Log.w(TAG_DIAG, "onDestroy isPlaying=${mediaSession?.player?.isPlaying}")
+        heartbeatHandler.removeCallbacks(heartbeatTick)
         mediaSession?.run {
+            if (player.isPlaying) ListenerHeartbeat.send(this@MusicPlaybackService, ListenerHeartbeat.NowPlaying(isPlaying = false))
+            player.removeListener(heartbeatListener)
             player.removeListener(widgetListener)
             player.removeListener(diagnosticListener)
             player.release()

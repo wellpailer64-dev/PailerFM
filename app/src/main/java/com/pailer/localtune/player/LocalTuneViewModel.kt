@@ -40,6 +40,7 @@ import com.pailer.localtune.player.cast.CastPlaybackBridge
 import com.pailer.localtune.data.AlbumGenreSuggestionRepository
 import com.pailer.localtune.data.AlbumMetadataEdit
 import com.pailer.localtune.data.AppFolderRepository
+import com.pailer.localtune.data.ListenerHeartbeat
 import com.pailer.localtune.data.ArtistNewsCard
 import com.pailer.localtune.data.ArtistNewsRepository
 import com.pailer.localtune.data.BackupRepository
@@ -636,6 +637,29 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
     var listeningStatsState = androidx.compose.runtime.mutableStateOf(loadListeningStats())
         private set
 
+    // Boas-vindas do primeiro uso (pedido do usuario 24/09/2026): nome (obrigatorio), foto e
+    // aniversario (opcionais) ANTES do pedido de permissao/leitura da biblioteca - ver
+    // OnboardingFlow. Quem ja tinha nome salvo de uma versao anterior nao ve de novo.
+    var needsOnboarding = androidx.compose.runtime.mutableStateOf(
+        !profilePrefs.getBoolean(KEY_ONBOARDING_DONE, false) && profileState.value.name.isBlank(),
+    )
+        private set
+
+    fun saveOnboardingName(name: String) {
+        profilePrefs.edit().putString(KEY_PROFILE_NAME, name.trim()).apply()
+        profileState.value = loadProfile(profileState.value.appliedVersion)
+    }
+
+    fun finishOnboarding(birthday: String) {
+        profilePrefs.edit()
+            .putString(KEY_PROFILE_BIRTHDAY, birthday.trim())
+            .putBoolean(KEY_ONBOARDING_DONE, true)
+            .apply()
+        profileState.value = loadProfile(profileState.value.appliedVersion)
+        needsOnboarding.value = false
+        ListenerHeartbeat.send(getApplication())
+    }
+
     var artistNewsState = androidx.compose.runtime.mutableStateOf(ArtistNewsUiState())
         private set
 
@@ -683,6 +707,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
             .putString(KEY_PROFILE_BIRTHDAY, birthday.trim())
             .apply()
         profileState.value = loadProfile(profileState.value.appliedVersion).copy(message = "Perfil salvo.")
+        ListenerHeartbeat.send(getApplication())
     }
 
     fun importProfilePhoto(uri: Uri) {
@@ -817,6 +842,9 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         connectToPlaybackService()
+        // "App aberto" no painel de ouvintes - o resto dos sinais vem do MusicPlaybackService.
+        // Primeiro uso espera o onboarding terminar (finishOnboarding) pra ja chegar com nome.
+        if (!needsOnboarding.value) ListenerHeartbeat.send(application)
         runCatching {
             CastContext.getSharedInstance(application).sessionManager
                 .addSessionManagerListener(castSessionManagerListener, CastSession::class.java)
@@ -4268,6 +4296,7 @@ class LocalTuneViewModel(application: Application) : AndroidViewModel(applicatio
         const val KEY_PROFILE_NAME = "profile_name"
         const val KEY_PROFILE_BIRTHDAY = "profile_birthday"
         const val KEY_PROFILE_PHOTO_PATH = "profile_photo_path"
+        const val KEY_ONBOARDING_DONE = "onboarding_done"
         const val PROFILE_PHOTO_FILE_NAME = "profile.jpg"
         const val KEY_TOTAL_LISTENING_MS = "total_listening_ms"
         const val KEY_RADIO_LISTENING_MS = "radio_listening_ms"

@@ -418,7 +418,12 @@ fun LocalTuneApp(viewModel: LocalTuneViewModel = viewModel()) {
             if (hasAudioPermission) viewModel.loadLibrary()
         }
 
-        if (hasAudioPermission) {
+        // Primeiro uso: boas-vindas (nome/foto/aniversario) antes de pedir permissao - ver
+        // OnboardingFlow. Se a permissao ja estiver concedida (ex.: app atualizado), a biblioteca
+        // ja vai carregando por baixo enquanto o usuario preenche.
+        if (viewModel.needsOnboarding.value) {
+            OnboardingFlow(viewModel)
+        } else if (hasAudioPermission) {
             LibraryShell(viewModel = viewModel)
         } else {
             PermissionGate(onGrant = { permissionLauncher.launch(requestedPermissions.toTypedArray()) })
@@ -2459,7 +2464,7 @@ private fun ProfileFooter(
 }
 
 @Composable
-private fun ProfileAvatar(photoUri: Uri?, modifier: Modifier = Modifier) {
+internal fun ProfileAvatar(photoUri: Uri?, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .clip(CircleShape)
@@ -11321,7 +11326,7 @@ private fun MainTab.icon() = when (this) {
 }
 
 @Composable
-private fun appBackgroundBrush(): Brush = Brush.verticalGradient(
+internal fun appBackgroundBrush(): Brush = Brush.verticalGradient(
     colors = listOf(
         lerp(PailerSurfaceHigh, PailerRed, 0.07f),
         lerp(PailerSurface, PailerRed, 0.04f),

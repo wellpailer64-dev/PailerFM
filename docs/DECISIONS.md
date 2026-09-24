@@ -2493,3 +2493,34 @@ impede alguém (inclusive outra IA) de "otimizar" uma decisão que tinha motivo.
   comportamento esperado; não foi possível capturar um ciclo completo de fallback ao
   vivo via `adb logcat` durante a sessão de correção (o gatilho depende de uma vaga de
   boletim abrir, o que não aconteceu dentro da janela de observação).
+
+## ADR-046 — Boas-vindas no primeiro uso + heartbeat de ouvintes pro painel no Cloudflare
+
+**Data:** 24/09/2026
+
+**Pedido:** saber quantos ouvintes estão usando a rádio (e quem são) e, no primeiro uso,
+perguntar nome (obrigatório), foto (opcional, "fazer depois") e aniversário (opcional)
+antes do fluxo normal de permissões/biblioteca.
+
+**App:**
+- `ui/OnboardingFlow.kt` — 3 passos, aparece antes do `PermissionGate` quando
+  `onboarding_done` é falso E não há nome salvo (quem já tinha nome de versão anterior não vê).
+  Salva nas mesmas prefs `user_profile` do "Meu perfil"; aniversário no mesmo formato `dd/mm`.
+- `data/ListenerHeartbeat.kt` — `POST /api/heartbeat` com install_id (UUID aleatório, não é
+  ID do aparelho), nome, aniversário, se tem foto (a foto em si NÃO sobe), versão, aparelho,
+  o que está tocando/rádio, level e horas ouvidas.
+- Quem envia: `MusicPlaybackService` (a cada play/pause e a cada 2 min tocando — o serviço
+  continua vivo com o app fora dos recentes, o ViewModel não) e o ViewModel (abertura do app,
+  fim do onboarding, salvar perfil).
+
+**Cloudflare** (fora do git, em `_broadcast-boletins-local/distribuicao-app/`):
+- `src/index.js` virou o `main` do mesmo Worker `pailer-fm-boletins`; os arquivos de `public/`
+  (manifest/áudios) continuam servidos antes do código, sem mudança pro feed.
+- D1 `pailer-fm-ouvintes` (binding `DB`, `migrations/0001_ouvintes.sql`): tabela `listeners`
+  (1 linha por instalação) + `daily_activity` (ativos por dia, fuso America/Sao_Paulo).
+- `/painel` mostra ouvindo agora (sinal < 5 min e tocando), app aberto, ativos hoje/7/30 dias,
+  gráfico 30 dias, rádios no ar, versões, aniversariantes do dia e lista de ouvintes.
+  Protegido por `ADMIN_TOKEN` (secret do Worker, `npx wrangler secret put ADMIN_TOKEN`).
+- `broadcast_core.write_cloudflare_wrangler_config()` agora preserva chaves extras do
+  `wrangler.jsonc` (`main`, `d1_databases`) — antes reescrevia do zero e o "Publicar
+  Cloudflare" tiraria o Worker do ar.
